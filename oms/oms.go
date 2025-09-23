@@ -25,6 +25,8 @@ import (
     "log"
     "os"
     "strconv"
+	"fmt"
+	"math"
     "sync"
     "time"
 )
@@ -47,6 +49,159 @@ type cssRule struct {
 // isWhiteHex returns true if the color equals #ffffff (case-insensitive).
 func isWhiteHex(hex string) bool {
     return strings.EqualFold(strings.TrimSpace(hex), "#ffffff")
+}
+
+
+func hexBrightness(hex string) int {
+    hex = strings.TrimPrefix(strings.TrimSpace(hex), "#")
+    if len(hex) != 6 { return 255 }
+    r, _ := strconv.ParseInt(hex[0:2], 16, 64)
+    g, _ := strconv.ParseInt(hex[2:4], 16, 64)
+    b, _ := strconv.ParseInt(hex[4:6], 16, 64)
+    return int(0.299*float64(r) + 0.587*float64(g) + 0.114*float64(b))
+}
+
+func isDarkHex(hex string) bool { return hexBrightness(hex) < 60 }
+
+func relLuma(hex string) float64 {
+    hex = strings.TrimPrefix(strings.TrimSpace(hex), "#")
+    if len(hex) != 6 { return 1.0 }
+    toLin := func(c int64) float64 {
+        v := float64(c) / 255.0
+        if v <= 0.03928 { return v / 12.92 }
+        return math.Pow((v+0.055)/1.055, 2.4)
+    }
+    r, _ := strconv.ParseInt(hex[0:2], 16, 64)
+    g, _ := strconv.ParseInt(hex[2:4], 16, 64)
+    b, _ := strconv.ParseInt(hex[4:6], 16, 64)
+    return 0.2126*toLin(r) + 0.7152*toLin(g) + 0.0722*toLin(b)
+}
+
+func contrastRatio(a, b string) float64 {
+    la := relLuma(a)
+    lb := relLuma(b)
+    if la < lb { la, lb = lb, la }
+    return (la + 0.05) / (lb + 0.05)
+}
+
+func lightenHex(hex string, percent int) string {
+    hex = strings.TrimPrefix(strings.TrimSpace(hex), "#")
+    if len(hex) != 6 { return "#" + hex }
+    r, _ := strconv.ParseInt(hex[0:2], 16, 64)
+    g, _ := strconv.ParseInt(hex[2:4], 16, 64)
+    b, _ := strconv.ParseInt(hex[4:6], 16, 64)
+    lighten := func(c int64) int64 {
+        c = c + (255-c)*int64(percent)/100
+        if c > 255 { c = 255 }
+        return c
+    }
+    r = lighten(r); g = lighten(g); b = lighten(b)
+    return fmt.Sprintf("#%02x%02x%02x", r, g, b)
+}
+
+func ensureMinForRGB565(hex string) string {
+    hex = strings.TrimPrefix(strings.TrimSpace(hex), "#")
+    if len(hex) != 6 { return "#" + hex }
+    r, _ := strconv.ParseInt(hex[0:2], 16, 64)
+    g, _ := strconv.ParseInt(hex[2:4], 16, 64)
+    b, _ := strconv.ParseInt(hex[4:6], 16, 64)
+
+    const minR = 16
+    const minG = 16
+    const minB = 16
+
+    if r < minR { r = minR }
+    if g < minG { g = minG }
+    if b < minB { b = minB }
+
+    return fmt.Sprintf("#%02x%02x%02x", r, g, b)
+}
+
+func normalizeBgForBlackText(bg string) string {
+    bgHex := cssToHex(bg)
+    if bgHex == "" { return "" }
+    const targetCR = 4.5
+    const step = 12
+    const maxLoops = 8
+
+    if contrastRatio(bgHex, "#000000") >= targetCR {
+        return bgHex
+    }
+    cur := bgHex
+    for i := 0; i < maxLoops; i++ {
+        cur = lightenHex(cur, step)
+        if contrastRatio(cur, "#000000") >= targetCR {
+            break
+        }
+    }
+    cur = ensureMinForRGB565(cur)
+    return cur
+}
+
+func effectiveTextColor(n *html.Node, st *walkState) string {
+	a := n.Parent
+	for a != nil && a.Type != html.ElementNode {
+		a = a.Parent
+	}
+	for cur := a; cur != nil; cur = cur.Parent {
+		if cur.Type != html.ElementNode {
+			continue
+		}
+		if stl := getAttr(cur, "style"); stl != "" {
+			if col := parseCssColor(stl, "color"); col != "" {
+				return col
+			}
+		}
+		if strings.EqualFold(cur.Data, "font") {
+			if col := cssToHex(getAttr(cur, "color")); col != "" {
+				return col
+			}
+		}
+		if st.css != nil {
+			if props := computeStyleFor(cur, st.css); props != nil {
+				if v := cssToHex(props["color"]); v != "" {
+					return v
+				}
+			}
+		}
+		if strings.EqualFold(cur.Data, "body") {
+			if col := cssToHex(getAttr(cur, "text")); col != "" {
+				return col
+			}
+			if stl := getAttr(cur, "style"); stl != "" {
+				if col := parseCssColor(stl, "color"); col != "" {
+					return col
+				}
+			}
+		}
+	}
+	return ""
+}
+
+func addTextWithColor(p *Page, st *walkState, n *html.Node, text string) {
+	if text == "" {
+		return
+	}
+	if !st.pre {
+		text = condenseSpaces(text)
+	}
+	if text == "" {
+		return
+	}
+
+	want := effectiveTextColor(n, st)
+	if want != "" && want != st.curColor {
+		prev := st.curColor
+		p.AddTextcolor(want)
+		p.AddText(text)
+		if prev != "" {
+			p.AddTextcolor(prev)
+		} else {
+			p.AddTextcolor("#000000")
+		}
+		return
+	}
+	p.AddText(text)
 }
 
 // cssToHex normalizes common CSS color syntaxes into #rrggbb.
@@ -334,15 +489,23 @@ func computeStyleFor(n *html.Node, ss *Stylesheet) map[string]string {
         return false
     }
 
-    apply := func(k, v string, spec, ord int) {
-        if k == "" || v == "" { return }
-        // NEW: если это заливка/фон и цвет белый — пропускаем
-        if shouldSkipWhiteFill(k, v) { return }
-
-        if cur, ok := props[k]; !ok || spec > cur.spec || (spec == cur.spec && ord >= cur.order) {
-            props[k] = pv{spec: spec, order: ord, val: v}
-        }
-    }
+	apply := func(k, v string, spec, ord int) {
+		if k == "" || v == "" { return }
+	
+		switch k {
+		case "background-color", "background", "fill":
+			if hex := cssToHex(v); hex != "" {
+				v = normalizeBgForBlackText(hex)
+				v = ensureMinForRGB565(v)
+			}
+		}
+	
+		if shouldSkipWhiteFill(k, v) { return }
+	
+		if cur, ok := props[k]; !ok || spec > cur.spec || (spec == cur.spec && ord >= cur.order) {
+			props[k] = pv{spec: spec, order: ord, val: v}
+		}
+	}
 
     for _, r := range ss.rules {
         needAnc := r.ancType >= 0 && r.anc != ""
@@ -613,13 +776,14 @@ func (p *Page) AddLink(url, text string) {
 
 // AddBgcolor sets the page background color.
 func (p *Page) AddBgcolor(color string) {
-	if color == "" {
-		return
-	}
-	p.addTag('D')
-	var buf [2]byte
-	binary.BigEndian.PutUint16(buf[:], calcColor(color))
-	p.addData(buf[:])
+    if color == "" { return }
+    safe := normalizeBgForBlackText(color)
+    if safe == "" { safe = "#1a1a1a" }
+    safe = ensureMinForRGB565(safe)
+    p.addTag('D')
+    var buf [2]byte
+    binary.BigEndian.PutUint16(buf[:], calcColor(safe))
+    p.addData(buf[:])
 }
 
 // AddHr writes a horizontal line (tag 'R') with optional color.
@@ -1874,20 +2038,22 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 					p.AddBreak()
 				}
 			case "body":
-				if l := getAttr(c, "bgcolor"); l != "" {
-					p.AddBgcolor(l)
-				}
-				if l := getAttr(c, "text"); l != "" {
-					p.AddTextcolor(l)
-				}
-				if stl := getAttr(c, "style"); stl != "" {
-					if col := parseCssColor(stl, "background-color"); col != "" {
-						p.AddBgcolor(col)
+					if l := getAttr(c, "bgcolor"); l != "" {
+						p.AddBgcolor(l)
 					}
-					if col := parseCssColor(stl, "color"); col != "" {
-						p.AddTextcolor(col)
+					if l := cssToHex(getAttr(c, "text")); l != "" {
+						p.AddTextcolor(l)
+						st.curColor = l
 					}
-				}
+					if stl := getAttr(c, "style"); stl != "" {
+						if col := parseCssColor(stl, "background-color"); col != "" {
+							p.AddBgcolor(col)
+						}
+						if col := parseCssColor(stl, "color"); col != "" {
+							p.AddTextcolor(col)
+							st.curColor = col
+						}
+					}
 			case "br":
 				p.AddBreak()
 			case "hr":
@@ -2410,7 +2576,11 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 						txt = condenseSpaces(c.Data)
 					}
 					if txt != "" {
-						p.AddText(txt)
+						if !visited[c] {
+							visited[c] = true
+							txt := c.Data
+							addTextWithColor(p, st, c, txt)
+						}
 					}
 				}
 			}
@@ -2626,29 +2796,6 @@ func findFirstByTag(n *html.Node, name string) *html.Node {
         return nil
     }
     return dfs(n)
-}
-
-// isDarkHex returns true if the given #rgb or #rrggbb color is visually dark.
-func isDarkHex(hex string) bool {
-    if len(hex) == 0 || hex[0] != '#' { return false }
-    var r8, g8, b8 int
-    if len(hex) == 4 { // #rgb
-        r := ch(hex[1])
-        g := ch(hex[2])
-        b := ch(hex[3])
-        r8 = int(r*16 + r)
-        g8 = int(g*16 + g)
-        b8 = int(b*16 + b)
-    } else if len(hex) == 7 { // #rrggbb
-        r8 = int((ch(hex[1])<<4 | ch(hex[2])))
-        g8 = int((ch(hex[3])<<4 | ch(hex[4])))
-        b8 = int((ch(hex[5])<<4 | ch(hex[6])))
-    } else {
-        return false
-    }
-    // relative luminance (simple sRGB approximation)
-    y := 0.2126*float64(r8)/255.0 + 0.7152*float64(g8)/255.0 + 0.0722*float64(b8)/255.0
-    return y < 0.4
 }
 
 // parseCssHas returns true if inline style contains prop with a value including val substring.
