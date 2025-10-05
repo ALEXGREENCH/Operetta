@@ -19,7 +19,7 @@ foreach ($t in $Targets) {
   $ext = if ($goos -eq "windows") { ".exe" } else { "" }
   $out = Join-Path dist "$app-$goos-$goarch$ext"
   Write-Host "Building $out"
-  go build -trimpath -ldflags "-a -s -w" -o $out .
+  go build -trimpath -ldflags "-a -s -w" -o $out ./cmd/operetta
 }
 
 Write-Host "Binaries are in .\dist"

@@ -1,5 +1,5 @@
 APP := operetta-server
-PKG := .
+PKG := ./cmd/operetta
 DIST := dist
 LDFLAGS := -s -w
 BUILD_FLAGS := -trimpath -ldflags "$(LDFLAGS)"

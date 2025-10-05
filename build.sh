@@ -9,7 +9,7 @@ cd "$(dirname "$0")"
 mkdir -p dist
 
 APP="operetta-server"
-PKG="."
+PKG="./cmd/operetta"
 PLATFORMS=("windows/amd64" "linux/amd64" "windows/arm64" "linux/arm64")
 if [ "$#" -gt 0 ]; then
   PLATFORMS=("$@")

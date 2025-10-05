@@ -1,141 +1,153 @@
-﻿package oms
+package oms
 
 import (
-    "bytes"
-    "compress/flate"
-    "compress/gzip"
-    "compress/zlib"
-    "encoding/base64"
-    "encoding/binary"
-    "crypto/sha1"
-    _ "golang.org/x/image/webp"
-    "image"
-    _ "image/gif"
-    "image/jpeg"
-    "image/png"
-    "io"
-    "io/fs"
-    "net/http"
-    "net/url"
-    "path/filepath"
-    "sort"
-    "strings"
+	"bytes"
+	"compress/flate"
+	"compress/gzip"
+	"compress/zlib"
+	"crypto/sha1"
+	"encoding/base64"
+	"encoding/binary"
+	_ "golang.org/x/image/webp"
+	"image"
+	_ "image/gif"
+	"image/jpeg"
+	"image/png"
+	"io"
+	"io/fs"
+	"net/http"
+	"net/url"
+	"path/filepath"
+	"sort"
+	"strings"
 
-    "golang.org/x/net/html"
-    "log"
-    "os"
-    "strconv"
 	"fmt"
+	"golang.org/x/net/html"
+	"log"
 	"math"
-    "sync"
-    "time"
+	"os"
+	"strconv"
+	"sync"
+	"time"
 )
+
+const defaultUpstreamUA = "Mozilla/5.0 (Linux; Android 9; OMS Test) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
 
 // ---------------------- Minimal CSS support ----------------------
 
-type cssRule struct {
-    selType int    // 0=tag,1=class,2=id
-    sel     string
-    props   map[string]string
-    order   int
-    spec    int    // specificity weight
-    // optional single ancestor requirement for descendant selector A B or child selector A > B
-    ancType   int    // -1 = none; 0=tag,1=class,2=id
-    anc       string
-    ancSpec   int
-    ancDirect bool
-}
-
 // isWhiteHex returns true if the color equals #ffffff (case-insensitive).
 func isWhiteHex(hex string) bool {
-    return strings.EqualFold(strings.TrimSpace(hex), "#ffffff")
+	return strings.EqualFold(strings.TrimSpace(hex), "#ffffff")
 }
 
-
 func hexBrightness(hex string) int {
-    hex = strings.TrimPrefix(strings.TrimSpace(hex), "#")
-    if len(hex) != 6 { return 255 }
-    r, _ := strconv.ParseInt(hex[0:2], 16, 64)
-    g, _ := strconv.ParseInt(hex[2:4], 16, 64)
-    b, _ := strconv.ParseInt(hex[4:6], 16, 64)
-    return int(0.299*float64(r) + 0.587*float64(g) + 0.114*float64(b))
+	hex = strings.TrimPrefix(strings.TrimSpace(hex), "#")
+	if len(hex) != 6 {
+		return 255
+	}
+	r, _ := strconv.ParseInt(hex[0:2], 16, 64)
+	g, _ := strconv.ParseInt(hex[2:4], 16, 64)
+	b, _ := strconv.ParseInt(hex[4:6], 16, 64)
+	return int(0.299*float64(r) + 0.587*float64(g) + 0.114*float64(b))
 }
 
 func isDarkHex(hex string) bool { return hexBrightness(hex) < 60 }
 
 func relLuma(hex string) float64 {
-    hex = strings.TrimPrefix(strings.TrimSpace(hex), "#")
-    if len(hex) != 6 { return 1.0 }
-    toLin := func(c int64) float64 {
-        v := float64(c) / 255.0
-        if v <= 0.03928 { return v / 12.92 }
-        return math.Pow((v+0.055)/1.055, 2.4)
-    }
-    r, _ := strconv.ParseInt(hex[0:2], 16, 64)
-    g, _ := strconv.ParseInt(hex[2:4], 16, 64)
-    b, _ := strconv.ParseInt(hex[4:6], 16, 64)
-    return 0.2126*toLin(r) + 0.7152*toLin(g) + 0.0722*toLin(b)
+	hex = strings.TrimPrefix(strings.TrimSpace(hex), "#")
+	if len(hex) != 6 {
+		return 1.0
+	}
+	toLin := func(c int64) float64 {
+		v := float64(c) / 255.0
+		if v <= 0.03928 {
+			return v / 12.92
+		}
+		return math.Pow((v+0.055)/1.055, 2.4)
+	}
+	r, _ := strconv.ParseInt(hex[0:2], 16, 64)
+	g, _ := strconv.ParseInt(hex[2:4], 16, 64)
+	b, _ := strconv.ParseInt(hex[4:6], 16, 64)
+	return 0.2126*toLin(r) + 0.7152*toLin(g) + 0.0722*toLin(b)
 }
 
 func contrastRatio(a, b string) float64 {
-    la := relLuma(a)
-    lb := relLuma(b)
-    if la < lb { la, lb = lb, la }
-    return (la + 0.05) / (lb + 0.05)
+	la := relLuma(a)
+	lb := relLuma(b)
+	if la < lb {
+		la, lb = lb, la
+	}
+	return (la + 0.05) / (lb + 0.05)
 }
 
 func lightenHex(hex string, percent int) string {
-    hex = strings.TrimPrefix(strings.TrimSpace(hex), "#")
-    if len(hex) != 6 { return "#" + hex }
-    r, _ := strconv.ParseInt(hex[0:2], 16, 64)
-    g, _ := strconv.ParseInt(hex[2:4], 16, 64)
-    b, _ := strconv.ParseInt(hex[4:6], 16, 64)
-    lighten := func(c int64) int64 {
-        c = c + (255-c)*int64(percent)/100
-        if c > 255 { c = 255 }
-        return c
-    }
-    r = lighten(r); g = lighten(g); b = lighten(b)
-    return fmt.Sprintf("#%02x%02x%02x", r, g, b)
+	hex = strings.TrimPrefix(strings.TrimSpace(hex), "#")
+	if len(hex) != 6 {
+		return "#" + hex
+	}
+	r, _ := strconv.ParseInt(hex[0:2], 16, 64)
+	g, _ := strconv.ParseInt(hex[2:4], 16, 64)
+	b, _ := strconv.ParseInt(hex[4:6], 16, 64)
+	lighten := func(c int64) int64 {
+		c = c + (255-c)*int64(percent)/100
+		if c > 255 {
+			c = 255
+		}
+		return c
+	}
+	r = lighten(r)
+	g = lighten(g)
+	b = lighten(b)
+	return fmt.Sprintf("#%02x%02x%02x", r, g, b)
 }
 
 func ensureMinForRGB565(hex string) string {
-    hex = strings.TrimPrefix(strings.TrimSpace(hex), "#")
-    if len(hex) != 6 { return "#" + hex }
-    r, _ := strconv.ParseInt(hex[0:2], 16, 64)
-    g, _ := strconv.ParseInt(hex[2:4], 16, 64)
-    b, _ := strconv.ParseInt(hex[4:6], 16, 64)
+	hex = strings.TrimPrefix(strings.TrimSpace(hex), "#")
+	if len(hex) != 6 {
+		return "#" + hex
+	}
+	r, _ := strconv.ParseInt(hex[0:2], 16, 64)
+	g, _ := strconv.ParseInt(hex[2:4], 16, 64)
+	b, _ := strconv.ParseInt(hex[4:6], 16, 64)
 
-    const minR = 16
-    const minG = 16
-    const minB = 16
+	const minR = 16
+	const minG = 16
+	const minB = 16
 
-    if r < minR { r = minR }
-    if g < minG { g = minG }
-    if b < minB { b = minB }
+	if r < minR {
+		r = minR
+	}
+	if g < minG {
+		g = minG
+	}
+	if b < minB {
+		b = minB
+	}
 
-    return fmt.Sprintf("#%02x%02x%02x", r, g, b)
+	return fmt.Sprintf("#%02x%02x%02x", r, g, b)
 }
 
 func normalizeBgForBlackText(bg string) string {
-    bgHex := cssToHex(bg)
-    if bgHex == "" { return "" }
-    const targetCR = 4.5
-    const step = 12
-    const maxLoops = 8
+	bgHex := cssToHex(bg)
+	if bgHex == "" {
+		return ""
+	}
+	const targetCR = 4.5
+	const step = 12
+	const maxLoops = 8
 
-    if contrastRatio(bgHex, "#000000") >= targetCR {
-        return bgHex
-    }
-    cur := bgHex
-    for i := 0; i < maxLoops; i++ {
-        cur = lightenHex(cur, step)
-        if contrastRatio(cur, "#000000") >= targetCR {
-            break
-        }
-    }
-    cur = ensureMinForRGB565(cur)
-    return cur
+	if contrastRatio(bgHex, "#000000") >= targetCR {
+		return bgHex
+	}
+	cur := bgHex
+	for i := 0; i < maxLoops; i++ {
+		cur = lightenHex(cur, step)
+		if contrastRatio(cur, "#000000") >= targetCR {
+			break
+		}
+	}
+	cur = ensureMinForRGB565(cur)
+	return cur
 }
 
 func effectiveTextColor(n *html.Node, st *walkState) string {
@@ -207,457 +219,208 @@ func addTextWithColor(p *Page, st *walkState, n *html.Node, text string) {
 // cssToHex normalizes common CSS color syntaxes into #rrggbb.
 // Supports: #rgb/#rrggbb, black/white, rgb()/rgba() with 0-255 or % values.
 func cssToHex(v string) string {
-    s := strings.ToLower(strings.TrimSpace(v))
-    if s == "" { return "" }
-    if strings.HasPrefix(s, "#") {
-        if len(s) == 4 { // #rgb -> #rrggbb
-            r := string([]byte{s[1], s[1]})
-            g := string([]byte{s[2], s[2]})
-            b := string([]byte{s[3], s[3]})
-            return "#" + r + g + b
-        }
-        if len(s) >= 7 { return s[:7] }
-        return ""
-    }
-    switch s {
-    case "black":
-        return "#000000"
-    case "white":
-        return "#ffffff"
-    case "transparent":
-        return ""
-    }
-    if strings.HasPrefix(s, "rgb(") || strings.HasPrefix(s, "rgba(") {
-        open := strings.IndexByte(s, '(')
-        close := strings.IndexByte(s, ')')
-        if open != -1 && close != -1 && close > open+1 {
-            inner := s[open+1 : close]
-            parts := strings.Split(inner, ",")
-            if len(parts) < 3 { parts = strings.Fields(inner) }
-            if len(parts) >= 3 {
-                toByte := func(x string) int {
-                    x = strings.TrimSpace(x)
-                    if strings.HasSuffix(x, "%") {
-                        x = strings.TrimSuffix(x, "%")
-                        if p, err := strconv.Atoi(x); err == nil {
-                            if p < 0 { p = 0 } else if p > 100 { p = 100 }
-                            return int(float64(p) * 255.0 / 100.0)
-                        }
-                        return 0
-                    }
-                    if n, err := strconv.Atoi(x); err == nil {
-                        if n < 0 { n = 0 } else if n > 255 { n = 255 }
-                        return n
-                    }
-                    return 0
-                }
-                r := toByte(parts[0])
-                g := toByte(parts[1])
-                b := toByte(parts[2])
-                hexd := "0123456789abcdef"
-                out := make([]byte, 7)
-                out[0] = '#'
-                out[1] = hexd[r>>4]; out[2] = hexd[r&0xF]
-                out[3] = hexd[g>>4]; out[4] = hexd[g&0xF]
-                out[5] = hexd[b>>4]; out[6] = hexd[b&0xF]
-                return string(out)
-            }
-        }
-    }
-    return ""
-}
-
-type Stylesheet struct { rules []cssRule }
-
-func parseCSSText(txt string, startOrder int) ([]cssRule, int) {
-    rules := make([]cssRule, 0, 16)
-    s := txt
-    i := 0
-    order := startOrder
-
-    for i < len(s) {
-        // find selector
-        bs := strings.IndexByte(s[i:], '{')
-        if bs == -1 { break }
-        sel := strings.TrimSpace(s[i : i+bs])
-        i += bs + 1
-
-        be := strings.IndexByte(s[i:], '}')
-        if be == -1 { break }
-        body := s[i : i+be]
-        i += be + 1
-
-        // split selectors by comma
-        sels := strings.Split(sel, ",")
-
-        // parse body into props
-        props := map[string]string{}
-        for _, part := range strings.Split(body, ";") {
-            kv := strings.SplitN(part, ":", 2)
-            if len(kv) != 2 { continue }
-            k := strings.TrimSpace(strings.ToLower(kv[0]))
-            v := strings.TrimSpace(strings.ToLower(kv[1]))
-            if k != "" && v != "" { props[k] = v }
-        }
-
-        for _, one := range sels {
-            t := strings.TrimSpace(one)
-
-            // ancestor helpers
-            __SET_ANCESTOR__ := ""
-            __ANC_DIRECT__ := false // зарезервировано на случай поддержки '>' позже
-
-            // strip simple pseudo-classes like :link, :visited, :hover, :active, :focus
-            if idx := strings.IndexByte(t, ':'); idx != -1 {
-                t = strings.TrimSpace(t[:idx])
-            }
-
-            // detect simple descendant selector "A B" (single space, no >)
-            if strings.Contains(t, " ") && !strings.Contains(t, ">") {
-                sp := strings.Fields(t)
-                if len(sp) == 2 {
-                    ancTok := strings.TrimSpace(sp[0])
-                    t = strings.TrimSpace(sp[1])
-                    // normalize anc token tag.class -> .class
-                    if strings.Contains(ancTok, ".") && !strings.HasPrefix(ancTok, ".") && !strings.HasPrefix(ancTok, "#") {
-                        parts := strings.Split(ancTok, ".")
-                        if len(parts) > 1 { ancTok = "." + parts[len(parts)-1] }
-                    }
-                    __SET_ANCESTOR__ = ancTok
-                }
-            }
-
-            // reduce tag.class to .class when possible
-            if strings.Contains(t, ".") && !strings.HasPrefix(t, ".") && !strings.HasPrefix(t, "#") {
-                parts := strings.Split(t, ".")
-                if len(parts) > 1 { t = "." + parts[len(parts)-1] }
-            }
-
-            if t == "" || len(props) == 0 { continue }
-
-            r := cssRule{
-                props:     map[string]string{},
-                order:     order,
-                ancType:   -1,
-                ancDirect: false,
-            }
-            for k, v := range props { r.props[k] = v }
-
-            if __SET_ANCESTOR__ != "" {
-                if strings.HasPrefix(__SET_ANCESTOR__, ".") {
-                    r.ancType = 1
-                    r.anc = strings.TrimPrefix(__SET_ANCESTOR__, ".")
-                    r.ancSpec = 10
-                } else if strings.HasPrefix(__SET_ANCESTOR__, "#") {
-                    r.ancType = 2
-                    r.anc = strings.TrimPrefix(__SET_ANCESTOR__, "#")
-                    r.ancSpec = 100
-                } else {
-                    r.ancType = 0
-                    r.anc = strings.ToLower(__SET_ANCESTOR__)
-                    r.ancSpec = 1
-                }
-                r.ancDirect = __ANC_DIRECT__
-            }
-
-            switch {
-            case strings.HasPrefix(t, "."):
-                r.selType = 1; r.sel = strings.TrimPrefix(t, "."); r.spec = 10
-            case strings.HasPrefix(t, "#"):
-                r.selType = 2; r.sel = strings.TrimPrefix(t, "#"); r.spec = 100
-            default:
-                r.selType = 0; r.sel = strings.ToLower(t); r.spec = 1
-            }
-
-            rules = append(rules, r)
-            order++
-        }
-    }
-    return rules, order
-}
-
-func buildStylesheet(doc *html.Node, base string, hdr http.Header, jar http.CookieJar) *Stylesheet {
-    ss := &Stylesheet{}
-    order := 0
-    // inline <style>
-    var walk func(*html.Node)
-    walk = func(n *html.Node) {
-        if n.Type == html.ElementNode && strings.EqualFold(n.Data, "style") {
-            if n.FirstChild != nil && n.FirstChild.Type == html.TextNode {
-                if rs, ord := parseCSSText(n.FirstChild.Data, order); len(rs) > 0 { ss.rules = append(ss.rules, rs...); order = ord }
-            }
-        }
-        for c := n.FirstChild; c != nil; c = c.NextSibling { walk(c) }
-    }
-    walk(doc)
-    // linked <link rel=stylesheet>
-    var collect func(*html.Node)
-    links := []string{}
-    collect = func(n *html.Node) {
-        if n.Type == html.ElementNode && strings.EqualFold(n.Data, "link") {
-            rel := strings.ToLower(strings.TrimSpace(getAttr(n, "rel")))
-            if rel == "stylesheet" {
-                if href := strings.TrimSpace(getAttr(n, "href")); href != "" {
-                    abs := resolveAbsURL(base, href)
-                    if abs != "" { links = append(links, abs) }
-                }
-            }
-        }
-        for c := n.FirstChild; c != nil; c = c.NextSibling { collect(c) }
-    }
-    collect(doc)
-    // fetch a few small css files
-    maxFiles := 5
-    for i, u := range links {
-        if i >= maxFiles { break }
-        if b, ok := fetchText(u, hdr, jar, "text/css"); ok {
-            if rs, ord := parseCSSText(string(b), order); len(rs) > 0 { ss.rules = append(ss.rules, rs...); order = ord }
-        }
-    }
-    return ss
-}
-
-func resolveAbsURL(base, href string) string {
-    bu, err := url.Parse(base)
-    if err != nil { return "" }
-    hu, err := url.Parse(href)
-    if err != nil { return "" }
-    return bu.ResolveReference(hu).String()
-}
-
-func fetchText(absURL string, hdr http.Header, jar http.CookieJar, accept string) ([]byte, bool) {
-    req, err := http.NewRequest(http.MethodGet, absURL, nil)
-    if err != nil { return nil, false }
-    if accept == "" { accept = "text/*" }
-    req.Header.Set("Accept", accept)
-    if hdr != nil {
-        if ua := hdr.Get("User-Agent"); ua != "" { req.Header.Set("User-Agent", ua) }
-        if al := hdr.Get("Accept-Language"); al != "" { req.Header.Set("Accept-Language", al) }
-        if ck := hdr.Get("Cookie"); ck != "" { req.Header.Set("Cookie", ck) }
-        if ref := hdr.Get("Referer"); ref != "" { req.Header.Set("Referer", ref) }
-    }
-    hc := &http.Client{Timeout: 8 * time.Second}
-    if jar != nil { hc.Jar = jar }
-    resp, err := hc.Do(req)
-    if err != nil { return nil, false }
-    defer resp.Body.Close()
-    var rc io.ReadCloser = resp.Body
-    switch strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Encoding"))) {
-    case "gzip":
-        if gr, e := gzip.NewReader(resp.Body); e == nil { rc = gr; defer gr.Close() }
-    case "deflate":
-        if zr, e := zlib.NewReader(resp.Body); e == nil { rc = zr; defer zr.Close() } else if fr := flate.NewReader(resp.Body); fr != nil { rc = io.NopCloser(fr); defer fr.Close() }
-    }
-    b, err := io.ReadAll(rc)
-    if err != nil { return nil, false }
-    return b, true
-}
-
-func shouldSkipWhiteFill(prop, val string) bool {
-    p := strings.ToLower(strings.TrimSpace(prop))
-    switch p {
-    case "fill", "background-color":
-        if isWhiteHex(cssToHex(val)) { return true }
-    case "background":
-        if isWhiteHex(cssToHex(val)) { return true }
-    }
-    return false
-}
-
-func computeStyleFor(n *html.Node, ss *Stylesheet) map[string]string {
-    if ss == nil || n == nil || n.Type != html.ElementNode { return nil }
-    type pv struct{ spec, order int; val string }
-    props := map[string]pv{}
-
-    tag := strings.ToLower(n.Data)
-    classes := strings.Fields(strings.ToLower(strings.TrimSpace(getAttr(n, "class"))))
-    id := strings.ToLower(strings.TrimSpace(getAttr(n, "id")))
-
-    // match helper for node against simple selector
-    matchNode := func(nd *html.Node, st int, sel string) bool {
-        if nd == nil || nd.Type != html.ElementNode || st < 0 { return false }
-        switch st {
-        case 0: // tag
-            return strings.ToLower(nd.Data) == sel
-        case 1: // class
-            cls := strings.Fields(strings.ToLower(strings.TrimSpace(getAttr(nd, "class"))))
-            for _, c := range cls { if c == sel { return true } }
-            return false
-        case 2: // id
-            return strings.ToLower(strings.TrimSpace(getAttr(nd, "id"))) == sel
-        }
-        return false
-    }
-
-	apply := func(k, v string, spec, ord int) {
-		if k == "" || v == "" { return }
-	
-		switch k {
-		case "background-color", "background", "fill":
-			if hex := cssToHex(v); hex != "" {
-				v = normalizeBgForBlackText(hex)
-				v = ensureMinForRGB565(v)
+	s := strings.ToLower(strings.TrimSpace(v))
+	if s == "" {
+		return ""
+	}
+	if strings.HasPrefix(s, "#") {
+		if len(s) == 4 { // #rgb -> #rrggbb
+			r := string([]byte{s[1], s[1]})
+			g := string([]byte{s[2], s[2]})
+			b := string([]byte{s[3], s[3]})
+			return "#" + r + g + b
+		}
+		if len(s) >= 7 {
+			return s[:7]
+		}
+		return ""
+	}
+	switch s {
+	case "black":
+		return "#000000"
+	case "white":
+		return "#ffffff"
+	case "transparent":
+		return ""
+	}
+	if strings.HasPrefix(s, "rgb(") || strings.HasPrefix(s, "rgba(") {
+		open := strings.IndexByte(s, '(')
+		close := strings.IndexByte(s, ')')
+		if open != -1 && close != -1 && close > open+1 {
+			inner := s[open+1 : close]
+			parts := strings.Split(inner, ",")
+			if len(parts) < 3 {
+				parts = strings.Fields(inner)
+			}
+			if len(parts) >= 3 {
+				toByte := func(x string) int {
+					x = strings.TrimSpace(x)
+					if strings.HasSuffix(x, "%") {
+						x = strings.TrimSuffix(x, "%")
+						if p, err := strconv.Atoi(x); err == nil {
+							if p < 0 {
+								p = 0
+							} else if p > 100 {
+								p = 100
+							}
+							return int(float64(p) * 255.0 / 100.0)
+						}
+						return 0
+					}
+					if n, err := strconv.Atoi(x); err == nil {
+						if n < 0 {
+							n = 0
+						} else if n > 255 {
+							n = 255
+						}
+						return n
+					}
+					return 0
+				}
+				r := toByte(parts[0])
+				g := toByte(parts[1])
+				b := toByte(parts[2])
+				hexd := "0123456789abcdef"
+				out := make([]byte, 7)
+				out[0] = '#'
+				out[1] = hexd[r>>4]
+				out[2] = hexd[r&0xF]
+				out[3] = hexd[g>>4]
+				out[4] = hexd[g&0xF]
+				out[5] = hexd[b>>4]
+				out[6] = hexd[b&0xF]
+				return string(out)
 			}
 		}
-	
-		if shouldSkipWhiteFill(k, v) { return }
-	
-		if cur, ok := props[k]; !ok || spec > cur.spec || (spec == cur.spec && ord >= cur.order) {
-			props[k] = pv{spec: spec, order: ord, val: v}
-		}
 	}
-
-    for _, r := range ss.rules {
-        needAnc := r.ancType >= 0 && r.anc != ""
-        switch r.selType {
-        case 0:
-            if r.sel == tag {
-                if !needAnc { for k, v := range r.props { apply(k, v, r.spec, r.order) } } else {
-                    if r.ancDirect {
-                        if matchNode(n.Parent, r.ancType, r.anc) { for k, v := range r.props { apply(k, v, r.spec+r.ancSpec, r.order) } }
-                    } else {
-                        for a := n.Parent; a != nil; a = a.Parent {
-                            if matchNode(a, r.ancType, r.anc) { for k, v := range r.props { apply(k, v, r.spec+r.ancSpec, r.order) }; break }
-                        }
-                    }
-                }
-            }
-        case 1:
-            for _, c := range classes {
-                if r.sel == c {
-                    if !needAnc { for k, v := range r.props { apply(k, v, r.spec, r.order) } } else {
-                        for a := n.Parent; a != nil; a = a.Parent {
-                            if matchNode(a, r.ancType, r.anc) { for k, v := range r.props { apply(k, v, r.spec+r.ancSpec, r.order) }; break }
-                        }
-                    }
-                }
-            }
-        case 2:
-            if id != "" && r.sel == id {
-                if !needAnc { for k, v := range r.props { apply(k, v, r.spec, r.order) } } else {
-                    if r.ancDirect {
-                        if matchNode(n.Parent, r.ancType, r.anc) { for k, v := range r.props { apply(k, v, r.spec+r.ancSpec, r.order) } }
-                    } else {
-                        for a := n.Parent; a != nil; a = a.Parent {
-                            if matchNode(a, r.ancType, r.anc) { for k, v := range r.props { apply(k, v, r.spec+r.ancSpec, r.order) }; break }
-                        }
-                    }
-                }
-            }
-        }
-    }
-
-    // inline style overrides all
-    if st := strings.TrimSpace(getAttr(n, "style")); st != "" {
-        for _, part := range strings.Split(st, ";") {
-            kv := strings.SplitN(part, ":", 2)
-            if len(kv) != 2 { continue }
-            k := strings.TrimSpace(strings.ToLower(kv[0]))
-            v := strings.TrimSpace(strings.ToLower(kv[1]))
-            if k == "" || v == "" { continue }
-
-            // NEW: пропускаем белую заливку и для inline
-            if shouldSkipWhiteFill(k, v) { continue }
-
-            props[k] = pv{spec: 1000, order: 1<<30, val: v}
-        }
-    }
-
-    if len(props) == 0 { return nil }
-    out := map[string]string{}
-    for k, vv := range props { out[k] = vv.val }
-    return out
+	return ""
 }
 
 // ---------------------- Disk image cache ----------------------
 
 var (
-    diskCacheOnce sync.Once
-    diskCacheDir  string
-    diskCacheMax  int64
-    diskCacheMu   sync.Mutex
+	diskCacheOnce sync.Once
+	diskCacheDir  string
+	diskCacheMax  int64
+	diskCacheMu   sync.Mutex
 )
 
 func initDiskCache() {
-    diskCacheDir = os.Getenv("OMS_IMG_CACHE_DIR")
-    if diskCacheDir == "" { diskCacheDir = filepath.Join("cache", "img") }
-    if err := os.MkdirAll(diskCacheDir, 0o755); err != nil { /* ignore */ }
-    mb := 200
-    if s := os.Getenv("OMS_IMG_CACHE_MB"); s != "" {
-        if v, err := strconv.Atoi(strings.TrimSpace(s)); err == nil && v >= 0 { mb = v }
-    }
-    diskCacheMax = int64(mb) * 1024 * 1024
+	diskCacheDir = os.Getenv("OMS_IMG_CACHE_DIR")
+	if diskCacheDir == "" {
+		diskCacheDir = filepath.Join("cache", "img")
+	}
+	if err := os.MkdirAll(diskCacheDir, 0o755); err != nil { /* ignore */
+	}
+	mb := 200
+	if s := os.Getenv("OMS_IMG_CACHE_MB"); s != "" {
+		if v, err := strconv.Atoi(strings.TrimSpace(s)); err == nil && v >= 0 {
+			mb = v
+		}
+	}
+	diskCacheMax = int64(mb) * 1024 * 1024
 }
 
 func diskKey(format string, quality int, url string) (string, string) {
-    h := sha1.Sum([]byte(format + "|q=" + strconv.Itoa(quality) + "|" + url))
-    hex := make([]byte, 40)
-    const hexd = "0123456789abcdef"
-    for i, b := range h[:] { hex[i*2] = hexd[b>>4]; hex[i*2+1] = hexd[b&0xF] }
-    dir := filepath.Join(diskCacheDir, string(hex[0]), string(hex[1]))
-    return dir, filepath.Join(dir, string(hex)+".bin")
+	h := sha1.Sum([]byte(format + "|q=" + strconv.Itoa(quality) + "|" + url))
+	hex := make([]byte, 40)
+	const hexd = "0123456789abcdef"
+	for i, b := range h[:] {
+		hex[i*2] = hexd[b>>4]
+		hex[i*2+1] = hexd[b&0xF]
+	}
+	dir := filepath.Join(diskCacheDir, string(hex[0]), string(hex[1]))
+	return dir, filepath.Join(dir, string(hex)+".bin")
 }
 
 func diskCacheGet(format string, quality int, url string) ([]byte, int, int, bool) {
-    diskCacheOnce.Do(initDiskCache)
-    dir, path := diskKey(format, quality, url)
-    f, err := os.Open(path)
-    if err != nil { return nil, 0, 0, false }
-    defer f.Close()
-    header := make([]byte, 4)
-    if _, err := io.ReadFull(f, header); err != nil { return nil, 0, 0, false }
-    w := int(binary.BigEndian.Uint16(header[0:2]))
-    h := int(binary.BigEndian.Uint16(header[2:4]))
-    b, err := io.ReadAll(f)
-    if err != nil { return nil, 0, 0, false }
-    // touch mtime to approximate LRU
-    _ = os.Chtimes(path, time.Now(), time.Now())
-    _ = os.MkdirAll(dir, 0o755)
-    return b, w, h, true
+	diskCacheOnce.Do(initDiskCache)
+	dir, path := diskKey(format, quality, url)
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, 0, 0, false
+	}
+	defer f.Close()
+	header := make([]byte, 4)
+	if _, err := io.ReadFull(f, header); err != nil {
+		return nil, 0, 0, false
+	}
+	w := int(binary.BigEndian.Uint16(header[0:2]))
+	h := int(binary.BigEndian.Uint16(header[2:4]))
+	b, err := io.ReadAll(f)
+	if err != nil {
+		return nil, 0, 0, false
+	}
+	// touch mtime to approximate LRU
+	_ = os.Chtimes(path, time.Now(), time.Now())
+	_ = os.MkdirAll(dir, 0o755)
+	return b, w, h, true
 }
 
 func diskCachePut(format string, quality int, url string, data []byte, w, h int) {
-    diskCacheOnce.Do(initDiskCache)
-    dir, path := diskKey(format, quality, url)
-    if err := os.MkdirAll(dir, 0o755); err != nil { return }
-    tmp := path + ".tmp"
-    f, err := os.Create(tmp)
-    if err != nil { return }
-    var hdr [4]byte
-    binary.BigEndian.PutUint16(hdr[0:2], uint16(w))
-    binary.BigEndian.PutUint16(hdr[2:4], uint16(h))
-    _, _ = f.Write(hdr[:])
-    _, _ = f.Write(data)
-    _ = f.Close()
-    _ = os.Rename(tmp, path)
-    // async prune
-    go pruneDiskCache()
+	diskCacheOnce.Do(initDiskCache)
+	dir, path := diskKey(format, quality, url)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return
+	}
+	tmp := path + ".tmp"
+	f, err := os.Create(tmp)
+	if err != nil {
+		return
+	}
+	var hdr [4]byte
+	binary.BigEndian.PutUint16(hdr[0:2], uint16(w))
+	binary.BigEndian.PutUint16(hdr[2:4], uint16(h))
+	_, _ = f.Write(hdr[:])
+	_, _ = f.Write(data)
+	_ = f.Close()
+	_ = os.Rename(tmp, path)
+	// async prune
+	go pruneDiskCache()
 }
 
 func pruneDiskCache() {
-    diskCacheMu.Lock()
-    defer diskCacheMu.Unlock()
-    // scan total size
-    var files []struct{ p string; sz int64; mt time.Time }
-    var total int64
-    filepath.WalkDir(diskCacheDir, func(p string, d fs.DirEntry, err error) error {
-        if err != nil { return nil }
-        if d.IsDir() { return nil }
-        if !strings.HasSuffix(strings.ToLower(p), ".bin") { return nil }
-        if info, e := d.Info(); e == nil {
-            files = append(files, struct{ p string; sz int64; mt time.Time }{p, info.Size(), info.ModTime()})
-            total += info.Size()
-        }
-        return nil
-    })
-    if total <= diskCacheMax || diskCacheMax <= 0 { return }
-    // sort by mtime asc
-    sort.Slice(files, func(i, j int) bool { return files[i].mt.Before(files[j].mt) })
-    for _, f := range files {
-        if total <= diskCacheMax { break }
-        _ = os.Remove(f.p)
-        total -= f.sz
-    }
+	diskCacheMu.Lock()
+	defer diskCacheMu.Unlock()
+	// scan total size
+	var files []struct {
+		p  string
+		sz int64
+		mt time.Time
+	}
+	var total int64
+	filepath.WalkDir(diskCacheDir, func(p string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			return nil
+		}
+		if !strings.HasSuffix(strings.ToLower(p), ".bin") {
+			return nil
+		}
+		if info, e := d.Info(); e == nil {
+			files = append(files, struct {
+				p  string
+				sz int64
+				mt time.Time
+			}{p, info.Size(), info.ModTime()})
+			total += info.Size()
+		}
+		return nil
+	})
+	if total <= diskCacheMax || diskCacheMax <= 0 {
+		return
+	}
+	// sort by mtime asc
+	sort.Slice(files, func(i, j int) bool { return files[i].mt.Before(files[j].mt) })
+	for _, f := range files {
+		if total <= diskCacheMax {
+			break
+		}
+		_ = os.Remove(f.p)
+		total -= f.sz
+	}
 }
 
 // Version is the magic stored in the OMS header.
@@ -679,13 +442,13 @@ const StyleDefault = styleDefault
 // Page represents loaded page data.
 // Data holds the final binary OMS representation.
 type Page struct {
-    Data       []byte
-    CachePacked []byte
-    tagCount   int
-    strCount   int
-    SetCookies []string
-    partCur    int
-    partCnt    int
+	Data        []byte
+	CachePacked []byte
+	tagCount    int
+	strCount    int
+	SetCookies  []string
+	partCur     int
+	partCnt     int
 }
 
 // NewPage allocates an empty page.
@@ -776,14 +539,18 @@ func (p *Page) AddLink(url, text string) {
 
 // AddBgcolor sets the page background color.
 func (p *Page) AddBgcolor(color string) {
-    if color == "" { return }
-    safe := normalizeBgForBlackText(color)
-    if safe == "" { safe = "#1a1a1a" }
-    safe = ensureMinForRGB565(safe)
-    p.addTag('D')
-    var buf [2]byte
-    binary.BigEndian.PutUint16(buf[:], calcColor(safe))
-    p.addData(buf[:])
+	if color == "" {
+		return
+	}
+	safe := normalizeBgForBlackText(color)
+	if safe == "" {
+		safe = "#1a1a1a"
+	}
+	safe = ensureMinForRGB565(safe)
+	p.addTag('D')
+	var buf [2]byte
+	binary.BigEndian.PutUint16(buf[:], calcColor(safe))
+	p.addData(buf[:])
 }
 
 // AddHr writes a horizontal line (tag 'R') with optional color.
@@ -983,19 +750,23 @@ func (p *Page) finalize() {
 		return (x<<8)&0xFF00 | (x>>8)&0x00FF
 	}
 
-    pc := 1
-    pt := 1
-    if p.partCur > 0 { pc = p.partCur }
-    if p.partCnt > 0 { pt = p.partCnt }
+	pc := 1
+	pt := 1
+	if p.partCur > 0 {
+		pc = p.partCur
+	}
+	if p.partCnt > 0 {
+		pt = p.partCnt
+	}
 
-    v2 := v2Header{
-        // TagCount matches legacy C implementation and includes the final 'Q'
-        TagCount:    swap16(cnt),
-        PartCurrent: swap16(pc),
-        PartCount:   swap16(pt),
-        StagCount:   swap16(stag),
-        Cachable:    0xFFFF,
-    }
+	v2 := v2Header{
+		// TagCount matches legacy C implementation and includes the final 'Q'
+		TagCount:    swap16(cnt),
+		PartCurrent: swap16(pc),
+		PartCount:   swap16(pt),
+		StagCount:   swap16(stag),
+		Cachable:    0xFFFF,
+	}
 
 	var comp bytes.Buffer
 	w, _ := flate.NewWriter(&comp, flate.DefaultCompression)
@@ -1052,7 +823,7 @@ func NormalizeOMS(b []byte) ([]byte, error) {
 	// Overwrite tag_count (byte-swapped) at V2 offset 18:20 (LE field)
 	swap := func(v uint16) uint16 { return (v<<8)&0xFF00 | (v>>8)&0x00FF }
 	binary.LittleEndian.PutUint16(dec[18:20], swap(uint16(wantCnt)))
-    // Preserve stag_count as authored during finalize (do not override)
+	// Preserve stag_count as authored during finalize (do not override)
 
 	// Repack: deflate + write common header
 	var comp bytes.Buffer
@@ -1341,198 +1112,271 @@ func (p *Page) Finalize() { p.finalize() }
 // splitByTags splits a raw payload (without V2 header) into parts with at most
 // maxTags tags each. Each part starts with the original leading OMS string (URL).
 func splitByTags(b []byte, maxTags int) [][]byte {
-    if maxTags <= 0 || len(b) < 2 {
-        return [][]byte{b}
-    }
-    // Prefix is initial page URL string (len + bytes)
-    if len(b) < 2 { return [][]byte{b} }
-    l := int(binary.BigEndian.Uint16(b[0:2]))
-    if 2+l > len(b) { return [][]byte{b} }
-    prefix := make([]byte, 2+l)
-    copy(prefix, b[:2+l])
-    p := 2 + l
-    start := p
-    tags := 0
-    limit := len(b)
-    parts := make([][]byte, 0, 2)
-    for p < limit {
-        tag := b[p]
-        p++
-        switch tag {
-        case 'T', 'L':
-            if p+2 > limit { p = limit; break }
-            l := int(binary.BigEndian.Uint16(b[p : p+2]))
-            p += 2 + l
-        case 'E', 'B', '+', 'V', 'Q', 'l':
-            // no payload
-        case 'D', 'R':
-            p += 2
-        case 'S', 'J':
-            p += 4
-        case 'I':
-            if p+8 > limit { p = limit; break }
-            dl := int(binary.BigEndian.Uint16(b[p+4 : p+6]))
-            p += 8 + dl
-        case 'k':
-            p += 1
-            if p+2 > limit { p = limit; break }
-            l := int(binary.BigEndian.Uint16(b[p : p+2]))
-            p += 2 + l
-        case 'h':
-            for i := 0; i < 2; i++ {
-                if p+2 > limit { p = limit; break }
-                l := int(binary.BigEndian.Uint16(b[p : p+2]))
-                p += 2 + l
-            }
-        case 'x':
-            p += 1
-            for i := 0; i < 2; i++ {
-                if p+2 > limit { p = limit; break }
-                l := int(binary.BigEndian.Uint16(b[p : p+2]))
-                p += 2 + l
-            }
-        case 'p', 'u', 'i', 'b', 'e':
-            for i := 0; i < 2; i++ {
-                if p+2 > limit { p = limit; break }
-                l := int(binary.BigEndian.Uint16(b[p : p+2]))
-                p += 2 + l
-            }
-        case 'c', 'r':
-            for i := 0; i < 2; i++ {
-                if p+2 > limit { p = limit; break }
-                l := int(binary.BigEndian.Uint16(b[p : p+2]))
-                p += 2 + l
-            }
-            p += 1
-        case 's':
-            if p+2 > limit { p = limit; break }
-            l := int(binary.BigEndian.Uint16(b[p : p+2]))
-            p += 2 + l
-            if p+1 > limit { p = limit; break }
-            p += 1
-            if p+2 > limit { p = limit; break }
-            p += 2 // count (ignored here)
-        case 'o':
-            for i := 0; i < 2; i++ {
-                if p+2 > limit { p = limit; break }
-                l := int(binary.BigEndian.Uint16(b[p : p+2]))
-                p += 2 + l
-            }
-            p += 1
-        default:
-            // Unknown: stop further splitting
-            p = limit
-        }
-        tags++
-        if tags >= maxTags {
-            // Cut part [start:p)
-            chunk := append([]byte(nil), b[start:p]...)
-            part := append(append([]byte(nil), prefix...), chunk...)
-            parts = append(parts, part)
-            start = p
-            tags = 0
-        }
-    }
-    if start < limit {
-        part := append(append([]byte(nil), prefix...), b[start:limit]...)
-        parts = append(parts, part)
-    }
-    if len(parts) == 0 { return [][]byte{b} }
-    return parts
+	if maxTags <= 0 || len(b) < 2 {
+		return [][]byte{b}
+	}
+	// Prefix is initial page URL string (len + bytes)
+	if len(b) < 2 {
+		return [][]byte{b}
+	}
+	l := int(binary.BigEndian.Uint16(b[0:2]))
+	if 2+l > len(b) {
+		return [][]byte{b}
+	}
+	prefix := make([]byte, 2+l)
+	copy(prefix, b[:2+l])
+	p := 2 + l
+	start := p
+	tags := 0
+	limit := len(b)
+	parts := make([][]byte, 0, 2)
+	for p < limit {
+		tag := b[p]
+		p++
+		switch tag {
+		case 'T', 'L':
+			if p+2 > limit {
+				p = limit
+				break
+			}
+			l := int(binary.BigEndian.Uint16(b[p : p+2]))
+			p += 2 + l
+		case 'E', 'B', '+', 'V', 'Q', 'l':
+			// no payload
+		case 'D', 'R':
+			p += 2
+		case 'S', 'J':
+			p += 4
+		case 'I':
+			if p+8 > limit {
+				p = limit
+				break
+			}
+			dl := int(binary.BigEndian.Uint16(b[p+4 : p+6]))
+			p += 8 + dl
+		case 'k':
+			p += 1
+			if p+2 > limit {
+				p = limit
+				break
+			}
+			l := int(binary.BigEndian.Uint16(b[p : p+2]))
+			p += 2 + l
+		case 'h':
+			for i := 0; i < 2; i++ {
+				if p+2 > limit {
+					p = limit
+					break
+				}
+				l := int(binary.BigEndian.Uint16(b[p : p+2]))
+				p += 2 + l
+			}
+		case 'x':
+			p += 1
+			for i := 0; i < 2; i++ {
+				if p+2 > limit {
+					p = limit
+					break
+				}
+				l := int(binary.BigEndian.Uint16(b[p : p+2]))
+				p += 2 + l
+			}
+		case 'p', 'u', 'i', 'b', 'e':
+			for i := 0; i < 2; i++ {
+				if p+2 > limit {
+					p = limit
+					break
+				}
+				l := int(binary.BigEndian.Uint16(b[p : p+2]))
+				p += 2 + l
+			}
+		case 'c', 'r':
+			for i := 0; i < 2; i++ {
+				if p+2 > limit {
+					p = limit
+					break
+				}
+				l := int(binary.BigEndian.Uint16(b[p : p+2]))
+				p += 2 + l
+			}
+			p += 1
+		case 's':
+			if p+2 > limit {
+				p = limit
+				break
+			}
+			l := int(binary.BigEndian.Uint16(b[p : p+2]))
+			p += 2 + l
+			if p+1 > limit {
+				p = limit
+				break
+			}
+			p += 1
+			if p+2 > limit {
+				p = limit
+				break
+			}
+			p += 2 // count (ignored here)
+		case 'o':
+			for i := 0; i < 2; i++ {
+				if p+2 > limit {
+					p = limit
+					break
+				}
+				l := int(binary.BigEndian.Uint16(b[p : p+2]))
+				p += 2 + l
+			}
+			p += 1
+		default:
+			// Unknown: stop further splitting
+			p = limit
+		}
+		tags++
+		if tags >= maxTags {
+			// Cut part [start:p)
+			chunk := append([]byte(nil), b[start:p]...)
+			part := append(append([]byte(nil), prefix...), chunk...)
+			parts = append(parts, part)
+			start = p
+			tags = 0
+		}
+	}
+	if start < limit {
+		part := append(append([]byte(nil), prefix...), b[start:limit]...)
+		parts = append(parts, part)
+	}
+	if len(parts) == 0 {
+		return [][]byte{b}
+	}
+	return parts
 }
 
 // ---------------------- Image cache (LRU by bytes) ----------------------
 
 type imgEntry struct {
-    key      string
-    data     []byte
-    w, h     int
-    prev,next *imgEntry
+	key        string
+	data       []byte
+	w, h       int
+	prev, next *imgEntry
 }
 
 type imgLRU struct {
-    mu   sync.Mutex
-    max  int64
-    size int64
-    m    map[string]*imgEntry
-    head *imgEntry
-    tail *imgEntry
+	mu   sync.Mutex
+	max  int64
+	size int64
+	m    map[string]*imgEntry
+	head *imgEntry
+	tail *imgEntry
 }
 
 func newImgLRU(max int64) *imgLRU {
-    return &imgLRU{max: max, m: map[string]*imgEntry{}}
+	return &imgLRU{max: max, m: map[string]*imgEntry{}}
 }
 
 func (c *imgLRU) moveFront(e *imgEntry) {
-    if c.head == e { return }
-    if e.prev != nil { e.prev.next = e.next }
-    if e.next != nil { e.next.prev = e.prev }
-    if c.tail == e { c.tail = e.prev }
-    e.prev = nil
-    e.next = c.head
-    if c.head != nil { c.head.prev = e }
-    c.head = e
-    if c.tail == nil { c.tail = e }
+	if c.head == e {
+		return
+	}
+	if e.prev != nil {
+		e.prev.next = e.next
+	}
+	if e.next != nil {
+		e.next.prev = e.prev
+	}
+	if c.tail == e {
+		c.tail = e.prev
+	}
+	e.prev = nil
+	e.next = c.head
+	if c.head != nil {
+		c.head.prev = e
+	}
+	c.head = e
+	if c.tail == nil {
+		c.tail = e
+	}
 }
 
 func (c *imgLRU) get(key string) ([]byte, int, int, bool) {
-    if c == nil { return nil, 0, 0, false }
-    c.mu.Lock(); defer c.mu.Unlock()
-    if e, ok := c.m[key]; ok {
-        c.moveFront(e)
-        return append([]byte(nil), e.data...), e.w, e.h, true
-    }
-    return nil, 0, 0, false
+	if c == nil {
+		return nil, 0, 0, false
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if e, ok := c.m[key]; ok {
+		c.moveFront(e)
+		return append([]byte(nil), e.data...), e.w, e.h, true
+	}
+	return nil, 0, 0, false
 }
 
 func (c *imgLRU) put(key string, data []byte, w, h int) {
-    if c == nil || c.max <= 0 { return }
-    c.mu.Lock(); defer c.mu.Unlock()
-    if e, ok := c.m[key]; ok {
-        c.size -= int64(len(e.data))
-        e.data = append([]byte(nil), data...)
-        e.w, e.h = w, h
-        c.size += int64(len(e.data))
-        c.moveFront(e)
-    } else {
-        e := &imgEntry{key: key, data: append([]byte(nil), data...), w: w, h: h}
-        e.next = c.head
-        if c.head != nil { c.head.prev = e }
-        c.head = e
-        if c.tail == nil { c.tail = e }
-        c.m[key] = e
-        c.size += int64(len(e.data))
-    }
-    for c.size > c.max && c.tail != nil {
-        old := c.tail
-        delete(c.m, old.key)
-        c.size -= int64(len(old.data))
-        c.tail = old.prev
-        if c.tail != nil { c.tail.next = nil } else { c.head = nil }
-    }
+	if c == nil || c.max <= 0 {
+		return
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if e, ok := c.m[key]; ok {
+		c.size -= int64(len(e.data))
+		e.data = append([]byte(nil), data...)
+		e.w, e.h = w, h
+		c.size += int64(len(e.data))
+		c.moveFront(e)
+	} else {
+		e := &imgEntry{key: key, data: append([]byte(nil), data...), w: w, h: h}
+		e.next = c.head
+		if c.head != nil {
+			c.head.prev = e
+		}
+		c.head = e
+		if c.tail == nil {
+			c.tail = e
+		}
+		c.m[key] = e
+		c.size += int64(len(e.data))
+	}
+	for c.size > c.max && c.tail != nil {
+		old := c.tail
+		delete(c.m, old.key)
+		c.size -= int64(len(old.data))
+		c.tail = old.prev
+		if c.tail != nil {
+			c.tail.next = nil
+		} else {
+			c.head = nil
+		}
+	}
 }
 
 var globalImgCache = func() *imgLRU {
-    mb := 200
-    if s := os.Getenv("OMS_IMG_CACHE_MB"); s != "" {
-        if v, err := strconv.Atoi(strings.TrimSpace(s)); err == nil && v >= 0 { mb = v }
-    }
-    if mb <= 0 { return nil }
-    return newImgLRU(int64(mb) * 1024 * 1024)
+	mb := 200
+	if s := os.Getenv("OMS_IMG_CACHE_MB"); s != "" {
+		if v, err := strconv.Atoi(strings.TrimSpace(s)); err == nil && v >= 0 {
+			mb = v
+		}
+	}
+	if mb <= 0 {
+		return nil
+	}
+	return newImgLRU(int64(mb) * 1024 * 1024)
 }()
 
 func imgCacheKey(format string, quality int, url string) string {
-    return format + "|q=" + strconv.Itoa(quality) + "|" + url
+	return format + "|q=" + strconv.Itoa(quality) + "|" + url
 }
 
 func imgCacheGet(format string, quality int, url string) ([]byte, int, int, bool) {
-    if globalImgCache == nil { return nil, 0, 0, false }
-    return globalImgCache.get(imgCacheKey(format, quality, url))
+	if globalImgCache == nil {
+		return nil, 0, 0, false
+	}
+	return globalImgCache.get(imgCacheKey(format, quality, url))
 }
 
 func imgCachePut(format string, quality int, url string, data []byte, w, h int) {
-    if globalImgCache == nil { return }
-    globalImgCache.put(imgCacheKey(format, quality, url), data, w, h)
+	if globalImgCache == nil {
+		return
+	}
+	globalImgCache.put(imgCacheKey(format, quality, url), data, w, h)
 }
 
 func addHeader(p *Page) {
@@ -1565,100 +1409,110 @@ func LoadPage(oURL string) (*Page, error) {
 // decodeLegacyToUTF8 converts known legacy encodings to UTF-8 based on header or meta hints.
 // Currently supports windows-1251; others fall back to raw bytes.
 func decodeLegacyToUTF8(body []byte, contentType string) []byte {
-    cs := sniffCharset(body, contentType)
-    lcs := strings.ToLower(strings.TrimSpace(cs))
-    switch lcs {
-    case "windows-1251", "cp1251", "win-1251", "charset=windows-1251":
-        return cp1251ToUTF8(body)
-    case "koi8-r", "koi8r", "charset=koi8-r":
-        return koi8rToUTF8(body)
-    default:
-        return body
-    }
+	cs := sniffCharset(body, contentType)
+	lcs := strings.ToLower(strings.TrimSpace(cs))
+	switch lcs {
+	case "windows-1251", "cp1251", "win-1251", "charset=windows-1251":
+		return cp1251ToUTF8(body)
+	case "koi8-r", "koi8r", "charset=koi8-r":
+		return koi8rToUTF8(body)
+	default:
+		return body
+	}
 }
 
 func sniffCharset(body []byte, contentType string) string {
-    s := strings.ToLower(contentType)
-    if i := strings.Index(s, "charset="); i != -1 {
-        v := s[i+8:]
-        // trim separators and quotes
-        for j, c := range v {
-            if c == ';' || c == ' ' || c == '"' || c == '\'' { v = v[:j]; break }
-        }
-        return strings.TrimSpace(v)
-    }
-    // Search first 2KB of body for meta charset
-    n := len(body)
-    if n > 2048 { n = 2048 }
-    low := strings.ToLower(string(body[:n]))
-    if i := strings.Index(low, "charset="); i != -1 {
-        v := low[i+8:]
-        for j, c := range v {
-            if c == ';' || c == ' ' || c == '"' || c == '\'' || c == '>' { v = v[:j]; break }
-        }
-        return strings.TrimSpace(v)
-    }
-    return "utf-8"
+	s := strings.ToLower(contentType)
+	if i := strings.Index(s, "charset="); i != -1 {
+		v := s[i+8:]
+		// trim separators and quotes
+		for j, c := range v {
+			if c == ';' || c == ' ' || c == '"' || c == '\'' {
+				v = v[:j]
+				break
+			}
+		}
+		return strings.TrimSpace(v)
+	}
+	// Search first 2KB of body for meta charset
+	n := len(body)
+	if n > 2048 {
+		n = 2048
+	}
+	low := strings.ToLower(string(body[:n]))
+	if i := strings.Index(low, "charset="); i != -1 {
+		v := low[i+8:]
+		for j, c := range v {
+			if c == ';' || c == ' ' || c == '"' || c == '\'' || c == '>' {
+				v = v[:j]
+				break
+			}
+		}
+		return strings.TrimSpace(v)
+	}
+	return "utf-8"
 }
 
 // cp1251ToUTF8 decodes Windows-1251 bytes into UTF-8 (subset sufficient for Cyrillic text).
 func cp1251ToUTF8(b []byte) []byte {
-    var out bytes.Buffer
-    for _, c := range b {
-        switch {
-        case c < 0x80:
-            out.WriteByte(c)
-        case c >= 0xC0 && c <= 0xDF: // Рђ..РЇ
-            ci := int(c); r := rune(0x0410 + (ci - 0xC0))
-            out.WriteRune(r)
-        case c >= 0xE0 && c <= 0xFF: // Р°..СЏ
-            ci := int(c); r := rune(0x0430 + (ci - 0xE0))
-            out.WriteRune(r)
-        case c == 0xA8: // РЃ
-            out.WriteRune('\u0401')
-        case c == 0xB8: // С‘
-            out.WriteRune('\u0451')
-        case c == 0xA0: // NBSP -> space
-            out.WriteByte(' ')
-        default:
-            // Best-effort: replace with '?'
-            out.WriteByte('?')
-        }
-    }
-    return out.Bytes()
+	var out bytes.Buffer
+	for _, c := range b {
+		switch {
+		case c < 0x80:
+			out.WriteByte(c)
+		case c >= 0xC0 && c <= 0xDF: // Рђ..РЇ
+			ci := int(c)
+			r := rune(0x0410 + (ci - 0xC0))
+			out.WriteRune(r)
+		case c >= 0xE0 && c <= 0xFF: // Р°..СЏ
+			ci := int(c)
+			r := rune(0x0430 + (ci - 0xE0))
+			out.WriteRune(r)
+		case c == 0xA8: // РЃ
+			out.WriteRune('\u0401')
+		case c == 0xB8: // С‘
+			out.WriteRune('\u0451')
+		case c == 0xA0: // NBSP -> space
+			out.WriteByte(' ')
+		default:
+			// Best-effort: replace with '?'
+			out.WriteByte('?')
+		}
+	}
+	return out.Bytes()
 }
 
 // koi8rToUTF8 decodes KOI8-R to UTF-8 covering common Cyrillic letters.
 func koi8rToUTF8(b []byte) []byte {
-    // Accurate KOI8-R mapping table for bytes 0x80..0xFF.
-    // See https://en.wikipedia.org/wiki/KOI8-R
-    var table = [128]rune{
-        0x2500, 0x2502, 0x250C, 0x2510, 0x2514, 0x2518, 0x251C, 0x2524, // 0x80..0x87
-        0x252C, 0x2534, 0x253C, 0x2580, 0x2584, 0x2588, 0x258C, 0x2590, // 0x88..0x8F
-        0x2591, 0x2592, 0x2593, 0x2320, 0x25A0, 0x2219, 0x221A, 0x2248, // 0x90..0x97
-        0x2264, 0x2265, 0x00A0, 0x2321, 0x00B0, 0x00B2, 0x00B7, 0x00F7, // 0x98..0x9F
-        0x2550, 0x2551, 0x2552, 0x0451, 0x2553, 0x2554, 0x2555, 0x2556, // 0xA0..0xA7
-        0x2557, 0x2558, 0x2559, 0x255A, 0x255B, 0x255C, 0x255D, 0x255E, // 0xA8..0xAF
-        0x255F, 0x2560, 0x2561, 0x0401, 0x2562, 0x2563, 0x2564, 0x2565, // 0xB0..0xB7
-        0x2566, 0x2567, 0x2568, 0x2569, 0x256A, 0x256B, 0x256C, 0x00A9, // 0xB8..0xBF
-        0x044E, 0x0430, 0x0431, 0x0446, 0x0434, 0x0435, 0x0444, 0x0433, // 0xC0..0xC7
-        0x0445, 0x0438, 0x0439, 0x043A, 0x043B, 0x043C, 0x043D, 0x043E, // 0xC8..0xCF
-        0x043F, 0x044F, 0x0440, 0x0441, 0x0442, 0x0443, 0x0436, 0x0432, // 0xD0..0xD7
-        0x044C, 0x044B, 0x0437, 0x0448, 0x044D, 0x0449, 0x0447, 0x044A, // 0xD8..0xDF
-        0x042E, 0x0410, 0x0411, 0x0426, 0x0414, 0x0415, 0x0424, 0x0413, // 0xE0..0xE7
-        0x0425, 0x0418, 0x0419, 0x041A, 0x041B, 0x041C, 0x041D, 0x041E, // 0xE8..0xEF
-        0x041F, 0x042F, 0x0420, 0x0421, 0x0422, 0x0423, 0x0416, 0x0412, // 0xF0..0xF7
-        0x042C, 0x042B, 0x0417, 0x0428, 0x042D, 0x0429, 0x0427, 0x042A, // 0xF8..0xFF
-    }
-    var out bytes.Buffer
-    for _, c := range b {
-        if c < 0x80 {
-            out.WriteByte(c)
-        } else {
-            out.WriteRune(table[int(c-0x80)])
-        }
-    }
-    return out.Bytes()
+	// Accurate KOI8-R mapping table for bytes 0x80..0xFF.
+	// See https://en.wikipedia.org/wiki/KOI8-R
+	var table = [128]rune{
+		0x2500, 0x2502, 0x250C, 0x2510, 0x2514, 0x2518, 0x251C, 0x2524, // 0x80..0x87
+		0x252C, 0x2534, 0x253C, 0x2580, 0x2584, 0x2588, 0x258C, 0x2590, // 0x88..0x8F
+		0x2591, 0x2592, 0x2593, 0x2320, 0x25A0, 0x2219, 0x221A, 0x2248, // 0x90..0x97
+		0x2264, 0x2265, 0x00A0, 0x2321, 0x00B0, 0x00B2, 0x00B7, 0x00F7, // 0x98..0x9F
+		0x2550, 0x2551, 0x2552, 0x0451, 0x2553, 0x2554, 0x2555, 0x2556, // 0xA0..0xA7
+		0x2557, 0x2558, 0x2559, 0x255A, 0x255B, 0x255C, 0x255D, 0x255E, // 0xA8..0xAF
+		0x255F, 0x2560, 0x2561, 0x0401, 0x2562, 0x2563, 0x2564, 0x2565, // 0xB0..0xB7
+		0x2566, 0x2567, 0x2568, 0x2569, 0x256A, 0x256B, 0x256C, 0x00A9, // 0xB8..0xBF
+		0x044E, 0x0430, 0x0431, 0x0446, 0x0434, 0x0435, 0x0444, 0x0433, // 0xC0..0xC7
+		0x0445, 0x0438, 0x0439, 0x043A, 0x043B, 0x043C, 0x043D, 0x043E, // 0xC8..0xCF
+		0x043F, 0x044F, 0x0440, 0x0441, 0x0442, 0x0443, 0x0436, 0x0432, // 0xD0..0xD7
+		0x044C, 0x044B, 0x0437, 0x0448, 0x044D, 0x0449, 0x0447, 0x044A, // 0xD8..0xDF
+		0x042E, 0x0410, 0x0411, 0x0426, 0x0414, 0x0415, 0x0424, 0x0413, // 0xE0..0xE7
+		0x0425, 0x0418, 0x0419, 0x041A, 0x041B, 0x041C, 0x041D, 0x041E, // 0xE8..0xEF
+		0x041F, 0x042F, 0x0420, 0x0421, 0x0422, 0x0423, 0x0416, 0x0412, // 0xF0..0xF7
+		0x042C, 0x042B, 0x0417, 0x0428, 0x042D, 0x0429, 0x0427, 0x042A, // 0xF8..0xFF
+	}
+	var out bytes.Buffer
+	for _, c := range b {
+		if c < 0x80 {
+			out.WriteByte(c)
+		} else {
+			out.WriteRune(table[int(c-0x80)])
+		}
+	}
+	return out.Bytes()
 }
 
 // LoadPageWithHeaders performs HTTP GET with optional headers and converts the HTML into OMS.
@@ -1685,6 +1539,7 @@ func LoadPageWithHeaders(oURL string, hdr http.Header) (*Page, error) {
 	if hdr.Get("Accept-Encoding") == "" {
 		hdr.Set("Accept-Encoding", "gzip")
 	}
+	ensureUpstreamUserAgent(hdr)
 	// РџСЂРёРјРµРЅСЏРµРј РІСЃРµ Р·Р°РіРѕР»РѕРІРєРё Рє Р·Р°РїСЂРѕСЃСѓ
 	for k, vs := range hdr {
 		for _, v := range vs {
@@ -1851,47 +1706,107 @@ type listCtx struct {
 	bullet  string
 }
 type walkState struct {
-    pre        bool
-    lists      []listCtx
-    styleStack []uint32
-    curStyle   uint32
-    inLink     bool
-    css        *Stylesheet
-    colorStack []string
-    curColor   string
+	pre        bool
+	lists      []listCtx
+	styleStack []uint32
+	curStyle   uint32
+	inLink     bool
+	css        *Stylesheet
+	colorStack []string
+	curColor   string
 }
 
 // RenderOptions define client rendering preferences relevant to OBML generation.
 type RenderOptions struct {
-    ImagesOn      bool
-    HighQuality   bool
-    ImageMIME     string         // e.g. "image/jpeg", "image/png"
-    MaxInlineKB   int            // max kilobytes for inline image ('I') before falling back to placeholder
-    ReqHeaders    http.Header    // copy of page request headers (UA, Lang, Cookies)
-    Referrer      string         // page URL for Referer
-    OriginCookies string         // cookies set by origin page (name=value; ...)
-    Jar           http.CookieJar // optional cookie jar for origin requests
-    // Opera Mini auth echo: include these as 'k' tags ('authcode' and 'authprefix')
-    AuthCode      string
-    AuthPrefix    string
-        ScreenW      int
-    ScreenH      int
-    NumColors    int
-    HeapKB       int
-    AlphaLevels  int
-    FormBody     string
-    // Pagination: 1-based page index and max tags per page (0=disabled)
-    Page          int
-    MaxTagsPerPage int
-    // Optional absolute base (scheme://host) for building navigation links
-    ServerBase    string
-    Styles        *Stylesheet
-    WantFullCache bool
+	ImagesOn      bool
+	HighQuality   bool
+	ImageMIME     string         // e.g. "image/jpeg", "image/png"
+	MaxInlineKB   int            // max kilobytes for inline image ('I') before falling back to placeholder
+	ReqHeaders    http.Header    // copy of page request headers (UA, Lang, Cookies)
+	Referrer      string         // page URL for Referer
+	OriginCookies string         // cookies set by origin page (name=value; ...)
+	Jar           http.CookieJar // optional cookie jar for origin requests
+	// Opera Mini auth echo: include these as 'k' tags ('authcode' and 'authprefix')
+	AuthCode    string
+	AuthPrefix  string
+	ScreenW     int
+	ScreenH     int
+	NumColors   int
+	HeapKB      int
+	AlphaLevels int
+	FormBody    string
+	// Pagination: 1-based page index and max tags per page (0=disabled)
+	Page           int
+	MaxTagsPerPage int
+	// Optional absolute base (scheme://host) for building navigation links
+	ServerBase    string
+	Styles        *Stylesheet
+	WantFullCache bool
+}
+
+// BuildPaginationQuery encodes paging parameters while preserving render options that affect output quality.
+func BuildPaginationQuery(target string, opts *RenderOptions, page, maxTags int) string {
+	vals := url.Values{}
+	vals.Set("url", target)
+	if maxTags > 0 {
+		vals.Set("pp", strconv.Itoa(maxTags))
+	}
+	if page > 0 {
+		vals.Set("page", strconv.Itoa(page))
+	}
+	if opts != nil {
+		if opts.ImagesOn {
+			vals.Set("img", "1")
+		}
+		if opts.HighQuality {
+			vals.Set("hq", "1")
+		}
+		if opts.ImageMIME != "" {
+			vals.Set("mime", opts.ImageMIME)
+		}
+		if opts.MaxInlineKB > 0 {
+			vals.Set("maxkb", strconv.Itoa(opts.MaxInlineKB))
+		}
+	}
+	return vals.Encode()
+}
+
+func ensureUpstreamUserAgent(hdr http.Header) {
+	if hdr == nil {
+		return
+	}
+	orig := hdr.Get("User-Agent")
+	if orig == "" {
+		return
+	}
+	if isLegacyOperaMiniUA(orig) {
+		if hdr.Get("X-OperaMini-UA") == "" {
+			hdr.Set("X-OperaMini-UA", orig)
+		}
+		if hdr.Get("X-OperaMini-Phone-UA") == "" {
+			hdr.Set("X-OperaMini-Phone-UA", orig)
+		}
+		hdr.Set("User-Agent", defaultUpstreamUA)
+	}
+}
+
+func isLegacyOperaMiniUA(ua string) bool {
+	ua = strings.ToLower(strings.TrimSpace(ua))
+	if ua == "" {
+		return false
+	}
+	if strings.Contains(ua, "opera mini/") {
+		return true
+	}
+	if strings.HasPrefix(ua, "opera/") && strings.Contains(ua, "midp") {
+		return true
+	}
+	return false
 }
 
 func defaultRenderPrefs() RenderOptions {
-    // Default pagination disabled; can be overridden via env in loader
-    return RenderOptions{ImagesOn: false, HighQuality: false, ImageMIME: "image/jpeg", MaxInlineKB: 96}
+	// Default pagination disabled; can be overridden via env in loader
+	return RenderOptions{ImagesOn: false, HighQuality: false, ImageMIME: "image/jpeg", MaxInlineKB: 96}
 }
 func (s *walkState) pushList(kind string) { s.lists = append(s.lists, listCtx{kind: kind}) }
 func (s *walkState) popList() {
@@ -1919,19 +1834,22 @@ func (s *walkState) popStyle(p *Page) {
 	}
 }
 
-
 func (s *walkState) pushColor(p *Page, hex string) {
-    s.colorStack = append(s.colorStack, s.curColor)
-    s.curColor = hex
-    if hex != "" { p.AddTextcolor(hex) }
+	s.colorStack = append(s.colorStack, s.curColor)
+	s.curColor = hex
+	if hex != "" {
+		p.AddTextcolor(hex)
+	}
 }
 func (s *walkState) popColor(p *Page) {
-    if l := len(s.colorStack); l > 0 {
-        prev := s.colorStack[l-1]
-        s.colorStack = s.colorStack[:l-1]
-        s.curColor = prev
-        if prev != "" { p.AddTextcolor(prev) }
-    }
+	if l := len(s.colorStack); l > 0 {
+		prev := s.colorStack[l-1]
+		s.colorStack = s.colorStack[:l-1]
+		s.curColor = prev
+		if prev != "" {
+			p.AddTextcolor(prev)
+		}
+	}
 }
 
 func isDisplayNone(style string) bool {
@@ -2018,17 +1936,28 @@ func condenseSpaces(s string) string {
 func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool, st *walkState, prefs RenderOptions) {
 	for c := cur; c != nil; c = c.NextSibling {
 		recurse := true
-        if c.Type == html.ElementNode {
-            // Skip hidden elements
-            if stAttr := getAttr(c, "style"); stAttr != "" && isDisplayNone(stAttr) { continue }
-            // Apply computed CSS conservatively: support display:none and background-color
-            if st.css != nil {
-                if props := computeStyleFor(c, st.css); props != nil {
-                    if strings.Contains(props["display"], "none") { continue }
-                    
-                }
-            }
-            switch strings.ToLower(c.Data) {
+		if c.Type == html.ElementNode {
+			// Skip hidden elements
+			if stAttr := getAttr(c, "style"); stAttr != "" && isDisplayNone(stAttr) {
+				continue
+			}
+			// Apply computed CSS conservatively: support display:none and background-color
+			if st.css != nil {
+				if props := computeStyleFor(c, st.css); props != nil {
+					if strings.Contains(props["display"], "none") {
+						continue
+					}
+
+				}
+			}
+			tag := strings.ToLower(c.Data)
+			if handler, ok := extraHTML4Handlers[tag]; ok {
+				ctx := elementContext{node: c, base: base, page: p, visited: visited, state: st, prefs: prefs}
+				if handler(&ctx) {
+					continue
+				}
+			}
+			switch tag {
 			case "html", "head":
 			case "title":
 				if t := findTextNode(c, visited); t != nil {
@@ -2038,22 +1967,22 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 					p.AddBreak()
 				}
 			case "body":
-					if l := getAttr(c, "bgcolor"); l != "" {
-						p.AddBgcolor(l)
+				if l := getAttr(c, "bgcolor"); l != "" {
+					p.AddBgcolor(l)
+				}
+				if l := cssToHex(getAttr(c, "text")); l != "" {
+					p.AddTextcolor(l)
+					st.curColor = l
+				}
+				if stl := getAttr(c, "style"); stl != "" {
+					if col := parseCssColor(stl, "background-color"); col != "" {
+						p.AddBgcolor(col)
 					}
-					if l := cssToHex(getAttr(c, "text")); l != "" {
-						p.AddTextcolor(l)
-						st.curColor = l
+					if col := parseCssColor(stl, "color"); col != "" {
+						p.AddTextcolor(col)
+						st.curColor = col
 					}
-					if stl := getAttr(c, "style"); stl != "" {
-						if col := parseCssColor(stl, "background-color"); col != "" {
-							p.AddBgcolor(col)
-						}
-						if col := parseCssColor(stl, "color"); col != "" {
-							p.AddTextcolor(col)
-							st.curColor = col
-						}
-					}
+				}
 			case "br":
 				p.AddBreak()
 			case "hr":
@@ -2079,8 +2008,8 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 				}
 				// Do not recurse into heading children to avoid duplicate text
 				recurse = false
-            case "div", "section", "article", "header", "footer", "main", "nav", "aside":
-                p.AddParagraph()
+			case "div", "section", "article", "header", "footer", "main", "nav", "aside":
+				p.AddParagraph()
 			case "b", "strong":
 				st.pushStyle(p, st.curStyle|styleBoldBit)
 				if c.FirstChild != nil {
@@ -2149,15 +2078,36 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 						aligned = true
 					}
 					pushed := 0
-					if parseCssHas(sp, "font-weight", "bold") { st.pushStyle(p, st.curStyle|styleBoldBit); pushed++ }
-					if parseCssHas(sp, "font-style", "italic") { st.pushStyle(p, st.curStyle|styleItalicBit); pushed++ }
-					if parseCssHas(sp, "text-decoration", "underline") { st.pushStyle(p, st.curStyle|styleUnderBit); pushed++ }
+					if parseCssHas(sp, "font-weight", "bold") {
+						st.pushStyle(p, st.curStyle|styleBoldBit)
+						pushed++
+					}
+					if parseCssHas(sp, "font-style", "italic") {
+						st.pushStyle(p, st.curStyle|styleItalicBit)
+						pushed++
+					}
+					if parseCssHas(sp, "text-decoration", "underline") {
+						st.pushStyle(p, st.curStyle|styleUnderBit)
+						pushed++
+					}
 					colorPushed := false
-					if col := parseCssColor(sp, "color"); col != "" { st.pushColor(p, col); colorPushed = true }
-					if c.FirstChild != nil { walkRich(c.FirstChild, base, p, visited, st, prefs) }
-					for pushed > 0 { pushed--; st.popStyle(p) }
-					if colorPushed { st.popColor(p) }
-					if aligned { st.popStyle(p) }
+					if col := parseCssColor(sp, "color"); col != "" {
+						st.pushColor(p, col)
+						colorPushed = true
+					}
+					if c.FirstChild != nil {
+						walkRich(c.FirstChild, base, p, visited, st, prefs)
+					}
+					for pushed > 0 {
+						pushed--
+						st.popStyle(p)
+					}
+					if colorPushed {
+						st.popColor(p)
+					}
+					if aligned {
+						st.popStyle(p)
+					}
 					recurse = false
 				}
 			case "font":
@@ -2201,7 +2151,7 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 				p.addTag('E')
 				p.AddBreak()
 				recurse = false
-        case "img":
+			case "img":
 				// Images handling based on client prefs
 				src := strings.TrimSpace(getAttr(c, "src"))
 				if src == "" {
@@ -2269,16 +2219,22 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 					if props := computeStyleFor(c, st.css); props != nil {
 						if v := props["list-style-type"]; v != "" {
 							switch v {
-							case "circle": bul = "○ "
-							case "square": bul = "■ "
-							case "disc": bul = "• "
-							case "none": bul = ""
+							case "circle":
+								bul = "○ "
+							case "square":
+								bul = "■ "
+							case "disc":
+								bul = "• "
+							case "none":
+								bul = ""
 							}
 						}
 					}
 				}
 				st.pushList("ul")
-				if top := st.currentList(); top != nil { top.bullet = bul }
+				if top := st.currentList(); top != nil {
+					top.bullet = bul
+				}
 			case "ol":
 				st.pushList("ol")
 			case "li":
@@ -2307,7 +2263,7 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 				p.AddBreak()
 				recurse = false
 			case "dd":
-                p.AddText(": ")
+				p.AddText(": ")
 				if c.FirstChild != nil {
 					walkRich(c.FirstChild, base, p, visited, st, prefs)
 				}
@@ -2389,16 +2345,23 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 				} else {
 					// Traverse sections and rows: thead/tbody/tfoot/tr
 					for sec := c.FirstChild; sec != nil; sec = sec.NextSibling {
-						if sec.Type != html.ElementNode { continue }
+						if sec.Type != html.ElementNode {
+							continue
+						}
 						if strings.EqualFold(sec.Data, "tr") {
 							row := make([]string, 0, 8)
 							for cell := sec.FirstChild; cell != nil; cell = cell.NextSibling {
 								if cell.Type == html.ElementNode && (strings.EqualFold(cell.Data, "td") || strings.EqualFold(cell.Data, "th")) {
 									txt := strings.TrimSpace(collectText(cell))
-									if txt != "" { row = append(row, txt) }
+									if txt != "" {
+										row = append(row, txt)
+									}
 								}
 							}
-							if len(row) > 0 { p.AddText(strings.Join(row, " | ")); p.AddBreak() }
+							if len(row) > 0 {
+								p.AddText(strings.Join(row, " | "))
+								p.AddBreak()
+							}
 							continue
 						}
 						if strings.EqualFold(sec.Data, "thead") || strings.EqualFold(sec.Data, "tbody") || strings.EqualFold(sec.Data, "tfoot") {
@@ -2408,48 +2371,61 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 									for cell := r.FirstChild; cell != nil; cell = cell.NextSibling {
 										if cell.Type == html.ElementNode && (strings.EqualFold(cell.Data, "td") || strings.EqualFold(cell.Data, "th")) {
 											txt := strings.TrimSpace(collectText(cell))
-											if txt != "" { row = append(row, txt) }
+											if txt != "" {
+												row = append(row, txt)
+											}
 										}
 									}
-									if len(row) > 0 { p.AddText(strings.Join(row, " | ")); p.AddBreak() }
+									if len(row) > 0 {
+										p.AddText(strings.Join(row, " | "))
+										p.AddBreak()
+									}
 								}
 							}
 						}
 					}
 					recurse = false
 				}
-			            case "details":
-                // Render expanded content inline: summary processed elsewhere
-                if c.FirstChild != nil { walkRich(c.FirstChild, base, p, visited, st, prefs) }
-                recurse = false
-            case "audio", "video":
-                if src := strings.TrimSpace(getAttr(c, "src")); src != "" {
-                    p.AddLink(resolveLink(base, src), "[Media]")
-                }
-                for s := c.FirstChild; s != nil; s = s.NextSibling {
-                    if s.Type == html.ElementNode && strings.EqualFold(s.Data, "source") {
-                        if ss := strings.TrimSpace(getAttr(s, "src")); ss != "" {
-                            p.AddLink(resolveLink(base, ss), "[Media]")
-                        }
-                    }
-                }
-                recurse = false
-            case "picture":
-                chosen := ""
-                for s := c.FirstChild; s != nil && chosen == ""; s = s.NextSibling {
-                    if s.Type == html.ElementNode && strings.EqualFold(s.Data, "source") {
-                        if ss := strings.TrimSpace(getAttr(s, "srcset")); ss != "" { chosen = pickSrcFromSrcset(ss) }
-                        if chosen == "" { chosen = strings.TrimSpace(getAttr(s, "src")) }
-                    }
-                }
-                if chosen == "" {
-                    if img := findFirstChild(c, "img"); img != nil {
-                        chosen = strings.TrimSpace(getAttr(img, "src"))
-                    }
-                }
-                if chosen != "" { p.AddLink(resolveLink(base, chosen), "[Image]") }
-                recurse = false
-            case "form":
+			case "details":
+				// Render expanded content inline: summary processed elsewhere
+				if c.FirstChild != nil {
+					walkRich(c.FirstChild, base, p, visited, st, prefs)
+				}
+				recurse = false
+			case "audio", "video":
+				if src := strings.TrimSpace(getAttr(c, "src")); src != "" {
+					p.AddLink(resolveLink(base, src), "[Media]")
+				}
+				for s := c.FirstChild; s != nil; s = s.NextSibling {
+					if s.Type == html.ElementNode && strings.EqualFold(s.Data, "source") {
+						if ss := strings.TrimSpace(getAttr(s, "src")); ss != "" {
+							p.AddLink(resolveLink(base, ss), "[Media]")
+						}
+					}
+				}
+				recurse = false
+			case "picture":
+				chosen := ""
+				for s := c.FirstChild; s != nil && chosen == ""; s = s.NextSibling {
+					if s.Type == html.ElementNode && strings.EqualFold(s.Data, "source") {
+						if ss := strings.TrimSpace(getAttr(s, "srcset")); ss != "" {
+							chosen = pickSrcFromSrcset(ss)
+						}
+						if chosen == "" {
+							chosen = strings.TrimSpace(getAttr(s, "src"))
+						}
+					}
+				}
+				if chosen == "" {
+					if img := findFirstChild(c, "img"); img != nil {
+						chosen = strings.TrimSpace(getAttr(img, "src"))
+					}
+				}
+				if chosen != "" {
+					p.AddLink(resolveLink(base, chosen), "[Image]")
+				}
+				recurse = false
+			case "form":
 				action := getAttr(c, "action")
 				p.AddForm(action)
 			case "button":
@@ -2588,9 +2564,12 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 		if recurse && c.FirstChild != nil {
 			walkRich(c.FirstChild, base, p, visited, st, prefs)
 		}
-		if c.Type == html.ElementNode && (strings.EqualFold(c.Data, "ul") || strings.EqualFold(c.Data, "ol") || strings.EqualFold(c.Data, "dl")) {
-			st.popList()
-			p.AddParagraph()
+		if c.Type == html.ElementNode {
+			switch strings.ToLower(c.Data) {
+			case "ul", "ol", "dl", "dir", "menu":
+				st.popList()
+				p.AddParagraph()
+			}
 		}
 	}
 }
@@ -2771,48 +2750,57 @@ func extractTitle(n *html.Node) string {
 	}
 	return dfs(n)
 }
+
 // findFirstChild returns the first direct child element with the given tag name.
 func findFirstChild(n *html.Node, name string) *html.Node {
-    low := strings.ToLower(name)
-    for c := n.FirstChild; c != nil; c = c.NextSibling {
-        if c.Type == html.ElementNode && strings.EqualFold(c.Data, low) {
-            return c
-        }
-    }
-    return nil
+	low := strings.ToLower(name)
+	for c := n.FirstChild; c != nil; c = c.NextSibling {
+		if c.Type == html.ElementNode && strings.EqualFold(c.Data, low) {
+			return c
+		}
+	}
+	return nil
 }
 
 // findFirstByTag performs DFS to find the first element with the given tag name.
 func findFirstByTag(n *html.Node, name string) *html.Node {
-    low := strings.ToLower(name)
-    var dfs func(*html.Node) *html.Node
-    dfs = func(x *html.Node) *html.Node {
-        if x.Type == html.ElementNode && strings.EqualFold(x.Data, low) {
-            return x
-        }
-        for c := x.FirstChild; c != nil; c = c.NextSibling {
-            if r := dfs(c); r != nil { return r }
-        }
-        return nil
-    }
-    return dfs(n)
+	low := strings.ToLower(name)
+	var dfs func(*html.Node) *html.Node
+	dfs = func(x *html.Node) *html.Node {
+		if x.Type == html.ElementNode && strings.EqualFold(x.Data, low) {
+			return x
+		}
+		for c := x.FirstChild; c != nil; c = c.NextSibling {
+			if r := dfs(c); r != nil {
+				return r
+			}
+		}
+		return nil
+	}
+	return dfs(n)
 }
 
 // parseCssHas returns true if inline style contains prop with a value including val substring.
 func parseCssHas(style, prop, val string) bool {
-    if style == "" { return false }
-    s := strings.ToLower(style)
-    prop = strings.ToLower(prop)
-    val = strings.ToLower(val)
-    parts := strings.Split(s, ";")
-    for _, part := range parts {
-        kv := strings.SplitN(strings.TrimSpace(part), ":", 2)
-        if len(kv) != 2 { continue }
-        k := strings.TrimSpace(kv[0])
-        v := strings.TrimSpace(kv[1])
-        if k == prop && strings.Contains(v, val) { return true }
-    }
-    return false
+	if style == "" {
+		return false
+	}
+	s := strings.ToLower(style)
+	prop = strings.ToLower(prop)
+	val = strings.ToLower(val)
+	parts := strings.Split(s, ";")
+	for _, part := range parts {
+		kv := strings.SplitN(strings.TrimSpace(part), ":", 2)
+		if len(kv) != 2 {
+			continue
+		}
+		k := strings.TrimSpace(kv[0])
+		v := strings.TrimSpace(kv[1])
+		if k == prop && strings.Contains(v, val) {
+			return true
+		}
+	}
+	return false
 }
 
 // LoadCompactPageWithHeaders fetches the URL (with headers) and returns a small
@@ -2922,8 +2910,8 @@ func fetchAndEncodeImage(absURL string, prefs RenderOptions) ([]byte, int, int, 
 	if prefs.Jar != nil {
 		ihc.Jar = prefs.Jar
 	}
-    client := ihc
-    resp, err := client.Do(req)
+	client := ihc
+	resp, err := client.Do(req)
 	if err != nil {
 		if debug {
 			log.Printf("IMG fetch: %v", err)
@@ -2965,46 +2953,52 @@ func fetchAndEncodeImage(absURL string, prefs RenderOptions) ([]byte, int, int, 
 	b := img.Bounds()
 	w := b.Dx()
 	h := b.Dy()
-    // Encode to requested MIME; check disk cache first with final format/quality key
-    var out bytes.Buffer
-    want := strings.ToLower(prefs.ImageMIME)
-    if want == "image/jpeg" && imageHasAlpha(img) {
-        want = "image/png"
-    }
-    // Derive quality only for JPEG
-    q := 0
-    if want == "image/jpeg" {
-        if prefs.HighQuality { q = 85 } else { q = 40 }
-    }
-    if data, cw, ch, ok := diskCacheGet(want, q, absURL); ok {
-        return data, cw, ch, true
-    }
-    switch want {
-    case "image/png":
-        enc := png.Encoder{CompressionLevel: png.BestCompression}
-        if prefs.HighQuality {
-            enc.CompressionLevel = png.BestCompression
-        } else {
-            enc.CompressionLevel = png.DefaultCompression
-        }
-        if err := enc.Encode(&out, img); err != nil {
-            if debug {
-                log.Printf("IMG encode png: %v", err)
-            }
-            return nil, 0, 0, false
-        }
-    default:
-        if q == 0 { q = 60 }
-        if err := jpeg.Encode(&out, img, &jpeg.Options{Quality: q}); err != nil {
-            if debug {
-                log.Printf("IMG encode jpeg: %v", err)
-            }
-            return nil, 0, 0, false
-        }
-    }
-    enc := append([]byte(nil), out.Bytes()...)
-    diskCachePut(want, q, absURL, enc, w, h)
-    return enc, w, h, true
+	// Encode to requested MIME; check disk cache first with final format/quality key
+	var out bytes.Buffer
+	want := strings.ToLower(prefs.ImageMIME)
+	if want == "image/jpeg" && imageHasAlpha(img) {
+		want = "image/png"
+	}
+	// Derive quality only for JPEG
+	q := 0
+	if want == "image/jpeg" {
+		if prefs.HighQuality {
+			q = 85
+		} else {
+			q = 40
+		}
+	}
+	if data, cw, ch, ok := diskCacheGet(want, q, absURL); ok {
+		return data, cw, ch, true
+	}
+	switch want {
+	case "image/png":
+		enc := png.Encoder{CompressionLevel: png.BestCompression}
+		if prefs.HighQuality {
+			enc.CompressionLevel = png.BestCompression
+		} else {
+			enc.CompressionLevel = png.DefaultCompression
+		}
+		if err := enc.Encode(&out, img); err != nil {
+			if debug {
+				log.Printf("IMG encode png: %v", err)
+			}
+			return nil, 0, 0, false
+		}
+	default:
+		if q == 0 {
+			q = 60
+		}
+		if err := jpeg.Encode(&out, img, &jpeg.Options{Quality: q}); err != nil {
+			if debug {
+				log.Printf("IMG encode jpeg: %v", err)
+			}
+			return nil, 0, 0, false
+		}
+	}
+	enc := append([]byte(nil), out.Bytes()...)
+	diskCachePut(want, q, absURL, enc, w, h)
+	return enc, w, h, true
 }
 
 // imageHasAlpha returns true if any sampled pixel has alpha != 0xff.
@@ -3082,13 +3076,43 @@ func decodeDataURI(uri string, prefs RenderOptions) ([]byte, int, int, bool) {
 // ---------------------- Public API with options ----------------------
 
 // LoadPageWithHeadersAndOptions performs HTTP GET with optional headers and rendering options.
+
 func LoadPageWithHeadersAndOptions(oURL string, hdr http.Header, opts *RenderOptions) (*Page, error) {
-	req, err := http.NewRequest(http.MethodGet, oURL, nil)
+	effectiveURL := oURL
+	method := http.MethodGet
+	var bodyReader io.Reader
+	var contentTypeOverride string
+
 	if hdr == nil {
 		hdr = http.Header{}
 	}
+
+	if opts != nil {
+		if submission := prepareOperaMiniSubmission(oURL, opts.FormBody); submission != nil {
+			if submission.URL != "" {
+				effectiveURL = submission.URL
+			}
+			if submission.Method != "" {
+				method = submission.Method
+			}
+			if submission.Body != "" {
+				bodyReader = strings.NewReader(submission.Body)
+			}
+			if submission.ContentType != "" {
+				contentTypeOverride = submission.ContentType
+			}
+		}
+	}
+
+	req, err := http.NewRequest(method, effectiveURL, bodyReader)
+	if err != nil {
+		return errorPage(effectiveURL, "Internal server error"), nil
+	}
+	if contentTypeOverride != "" && hdr.Get("Content-Type") == "" {
+		hdr.Set("Content-Type", contentTypeOverride)
+	}
 	if hdr.Get("User-Agent") == "" {
-		hdr.Set("User-Agent", "Mozilla/5.0 (Linux; Android 9; OMS Test) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36")
+		hdr.Set("User-Agent", defaultUpstreamUA)
 	}
 	if hdr.Get("Accept") == "" {
 		hdr.Set("Accept", "text/html,application/xhtml+xml,*/*;q=0.8")
@@ -3108,10 +3132,9 @@ func LoadPageWithHeadersAndOptions(oURL string, hdr http.Header, opts *RenderOpt
 	if opts != nil && opts.Jar != nil {
 		hc.Jar = opts.Jar
 	}
-	client := hc
-	resp, err := client.Do(req)
+	resp, err := hc.Do(req)
 	if err != nil {
-		return errorPage(oURL, "Timeout loading page"), nil
+		return errorPage(effectiveURL, "Timeout loading page"), nil
 	}
 	defer resp.Body.Close()
 	var reader io.ReadCloser = resp.Body
@@ -3130,70 +3153,96 @@ func LoadPageWithHeadersAndOptions(oURL string, hdr http.Header, opts *RenderOpt
 			defer fr.Close()
 		}
 	}
-    body, err := io.ReadAll(reader)
-    if err != nil {
-        return errorPage(oURL, "Internal server error"), nil
-    }
-    if looksLikeOMS(body) {
-        return &Page{Data: body, SetCookies: resp.Header["Set-Cookie"]}, nil
-    }
-    // Decode to UTF-8 to support legacy charsets (e.g. windows-1251, koi8-r)
-    utf8Body := decodeLegacyToUTF8(body, resp.Header.Get("Content-Type"))
-    doc, err := html.Parse(bytes.NewReader(utf8Body))
-    if err != nil {
-        return errorPage(oURL, "Internal server error while parsing"), nil
-    }
+	body, err := io.ReadAll(reader)
+	if err != nil {
+		return errorPage(effectiveURL, "Internal server error"), nil
+	}
+	if looksLikeOMS(body) {
+		return &Page{Data: body, SetCookies: resp.Header["Set-Cookie"]}, nil
+	}
+	utf8Body := decodeLegacyToUTF8(body, resp.Header.Get("Content-Type"))
+	doc, err := html.Parse(bytes.NewReader(utf8Body))
+	if err != nil {
+		return errorPage(effectiveURL, "Internal server error while parsing"), nil
+	}
 	p := NewPage()
-	p.AddString("1/" + oURL)
+	p.AddString("1/" + effectiveURL)
 	p.AddAuthcode("c37c206d2c235978d086b64c39a2fc17df68dbdd5dc04dd8b199177f95be6181")
 	p.AddAuthprefix("t19-12")
 	p.AddStyle(styleDefault)
-	base := oURL
+	base := effectiveURL
 	if i := strings.Index(base, "?"); i != -1 {
 		base = base[:i]
 	}
 	base = findBaseURL(doc, base)
-    // Select prefs or fallback
-    rp := defaultRenderPrefs()
-    if opts != nil {
-        rp = *opts
-    }
-    rp.ReqHeaders = hdr
-    rp.Referrer = oURL
-    // Build minimal stylesheet (inline + linked)
-    rp.Styles = buildStylesheet(doc, base, hdr, opts.Jar)
-    // Apply body defaults (background/text) with contrast if necessary
-    chosenCol := ""
-    if body := findFirstByTag(doc, "body"); body != nil {
-        var bgHex, fgHex string
-        if rp.Styles != nil {
-            if props := computeStyleFor(body, rp.Styles); props != nil {
-                if v := props["background-color"]; v != "" { bgHex = v }
-                if v := props["color"]; v != "" { fgHex = v }
-            }
-        }
-        if fgHex == "" { if v := getAttr(body, "text"); v != "" { fgHex = v } }
-        if bgHex == "" { if v := getAttr(body, "bgcolor"); v != "" { bgHex = v } }
-        if bgHex == "" { if v := getAttr(body, "bgcolor"); v != "" { bgHex = v } }
-        if stl := getAttr(body, "style"); stl != "" {
-            if v := parseCssColor(stl, "background-color"); v != "" { bgHex = v }
-            if v := parseCssColor(stl, "color"); v != "" { fgHex = v }
-        }
-        if bgHex != "" { p.AddBgcolor(bgHex) }
-        chosenCol = ""
-        if fgHex != "" { p.AddTextcolor(fgHex); chosenCol = fgHex } else if bgHex != "" && isDarkHex(bgHex) { p.AddTextcolor("#eeeeee"); chosenCol = "#eeeeee" }
-    }
-    visited := map[*html.Node]bool{}
-    st := walkState{curStyle: styleDefault}
-    if chosenCol != "" { st.curColor = chosenCol }
-    st.css = rp.Styles
-    p.AddStyle(styleDefault)
-    walkRich(doc, base, p, visited, &st, rp)
-	// Build lightweight Cookie header for same-request image fetches
+	rp := defaultRenderPrefs()
+	var jar http.CookieJar
+	if opts != nil {
+		rp = *opts
+		jar = opts.Jar
+	}
+	rp.ReqHeaders = hdr
+	rp.Referrer = effectiveURL
+	rp.Styles = buildStylesheet(doc, base, hdr, jar)
+	chosenCol := ""
+	if body := findFirstByTag(doc, "body"); body != nil {
+		var bgHex, fgHex string
+		if rp.Styles != nil {
+			if props := computeStyleFor(body, rp.Styles); props != nil {
+				if v := props["background-color"]; v != "" {
+					bgHex = v
+				}
+				if v := props["color"]; v != "" {
+					fgHex = v
+				}
+			}
+		}
+		if fgHex == "" {
+			if v := getAttr(body, "text"); v != "" {
+				fgHex = v
+			}
+		}
+		if bgHex == "" {
+			if v := getAttr(body, "bgcolor"); v != "" {
+				bgHex = v
+			}
+		}
+		if bgHex == "" {
+			if v := getAttr(body, "bgcolor"); v != "" {
+				bgHex = v
+			}
+		}
+		if stl := getAttr(body, "style"); stl != "" {
+			if v := parseCssColor(stl, "background-color"); v != "" {
+				bgHex = v
+			}
+			if v := parseCssColor(stl, "color"); v != "" {
+				fgHex = v
+			}
+		}
+		if bgHex != "" {
+			p.AddBgcolor(bgHex)
+		}
+		chosenCol = ""
+		if fgHex != "" {
+			p.AddTextcolor(fgHex)
+			chosenCol = fgHex
+		} else if bgHex != "" && isDarkHex(bgHex) {
+			p.AddTextcolor("#eeeeee")
+			chosenCol = "#eeeeee"
+		}
+	}
+	visited := map[*html.Node]bool{}
+	st := walkState{curStyle: styleDefault}
+	if chosenCol != "" {
+		st.curColor = chosenCol
+	}
+	st.css = rp.Styles
+	p.AddStyle(styleDefault)
+	walkRich(doc, base, p, visited, &st, rp)
 	if len(p.SetCookies) > 0 {
 		var pairs []string
 		for _, sc := range p.SetCookies {
-			// take name=value before first ';'
 			i := strings.IndexByte(sc, ';')
 			kv := sc
 			if i != -1 {
@@ -3208,119 +3257,270 @@ func LoadPageWithHeadersAndOptions(oURL string, hdr http.Header, opts *RenderOpt
 			rp.OriginCookies = strings.Join(pairs, "; ")
 		}
 	}
-    // Optional pagination: split by tags, page index 1-based
-    // Determine effective pagination from options or env
-    pageIdx := 1
-    maxTags := 0
-    if opts != nil {
-        if opts.Page > 0 { pageIdx = opts.Page }
-        if opts.MaxTagsPerPage > 0 { maxTags = opts.MaxTagsPerPage }
-    }
-    if maxTags == 0 {
-        if s := os.Getenv("OMS_PAGINATE_TAGS"); s != "" {
-            if v, err := strconv.Atoi(strings.TrimSpace(s)); err == nil && v > 0 {
-                maxTags = v
-            }
-        }
-        if maxTags == 0 {
-            // Sensible default for old clients; adjust as needed
-            maxTags = 1200
-        }
-    }
-    if pageIdx < 1 { pageIdx = 1 }
-
-    // Split raw payload (without V2 header) into parts by tag boundaries
-    parts := splitByTags(p.Data, maxTags)
-    if len(parts) == 0 {
-        // Fallback: no tags recognized; finalize as-is
-        p.finalize()
-        return p, nil
-    }
-    if pageIdx > len(parts) { pageIdx = len(parts) }
-    sel := parts[pageIdx-1]
-    // If we have multiple parts, append Prev/Next navigation (only when ServerBase is known)
-    serverBase := ""
-    if opts != nil { serverBase = opts.ServerBase }
-    if len(parts) > 1 && serverBase != "" {
-        // Build small OBML fragment with navigation links
-        nav := NewPage()
-        nav.AddHr("")
-        // Build base query
-        qpp := strconv.Itoa(maxTags)
-        // Prev
-        if pageIdx > 1 {
-            prevURL := serverBase + "/fetch?url=" + url.QueryEscape(oURL) + "&pp=" + qpp + "&page=" + strconv.Itoa(pageIdx-1)
-            nav.AddLink("0/"+prevURL, "Назад")
-        }
-        // Next
-        if pageIdx < len(parts) {
-            nextURL := serverBase + "/fetch?url=" + url.QueryEscape(oURL) + "&pp=" + qpp + "&page=" + strconv.Itoa(pageIdx+1)
-            nav.AddLink("0/"+nextURL, "Далее")
-        }
-        nav.AddHr("")
-        sel = append(sel, nav.Data...)
-    }
-    // Replace payload with selected part and set part fields
-    p.Data = sel
-    p.partCur = pageIdx
-    p.partCnt = len(parts)
-    p.finalize()
-    return p, nil
+	pageIdx := 1
+	maxTags := 0
+	if opts != nil {
+		if opts.Page > 0 {
+			pageIdx = opts.Page
+		}
+		if opts.MaxTagsPerPage > 0 {
+			maxTags = opts.MaxTagsPerPage
+		}
+	}
+	if maxTags == 0 {
+		if s := os.Getenv("OMS_PAGINATE_TAGS"); s != "" {
+			if v, err := strconv.Atoi(strings.TrimSpace(s)); err == nil && v > 0 {
+				maxTags = v
+			}
+		}
+		if maxTags == 0 {
+			maxTags = 1200
+		}
+	}
+	if pageIdx < 1 {
+		pageIdx = 1
+	}
+	parts := splitByTags(p.Data, maxTags)
+	if len(parts) == 0 {
+		p.finalize()
+		return p, nil
+	}
+	if pageIdx > len(parts) {
+		pageIdx = len(parts)
+	}
+	sel := parts[pageIdx-1]
+	serverBase := ""
+	if opts != nil {
+		serverBase = opts.ServerBase
+	}
+	if len(parts) > 1 && serverBase != "" {
+		nav := NewPage()
+		nav.AddHr("")
+		if pageIdx > 1 {
+			prevURL := serverBase + "/fetch?" + BuildPaginationQuery(effectiveURL, &rp, pageIdx-1, maxTags)
+			nav.AddLink("0/"+prevURL, "\u041D\u0430\u0437\u0430\u0434")
+		}
+		if pageIdx < len(parts) {
+			nextURL := serverBase + "/fetch?" + BuildPaginationQuery(effectiveURL, &rp, pageIdx+1, maxTags)
+			nav.AddLink("0/"+nextURL, "\u0414\u0430\u043B\u0435\u0435")
+		}
+		nav.AddHr("")
+		sel = append(sel, nav.Data...)
+	}
+	p.Data = sel
+	p.partCur = pageIdx
+	p.partCnt = len(parts)
+	p.finalize()
+	return p, nil
 }
 
+type formSubmission struct {
+	Method      string
+	URL         string
+	Body        string
+	ContentType string
+}
 
+func prepareOperaMiniSubmission(baseURL, payload string) *formSubmission {
+	payload = strings.TrimSpace(payload)
+	if payload == "" || payload == "0" {
+		return nil
+	}
+	if !strings.Contains(payload, "=") {
+		return nil
+	}
+	values := url.Values{}
+	actionOverride := ""
+	method := http.MethodGet
+	parts := strings.Split(payload, "&")
+	for _, part := range parts {
+		if part == "" {
+			continue
+		}
+		kv := strings.SplitN(part, "=", 2)
+		rawKey := kv[0]
+		rawVal := ""
+		if len(kv) == 2 {
+			rawVal = kv[1]
+		}
+		key, err := url.QueryUnescape(rawKey)
+		if err != nil {
+			key = rawKey
+		}
+		val, err := url.QueryUnescape(rawVal)
+		if err != nil {
+			val = rawVal
+		}
+		key = strings.TrimSpace(key)
+		val = strings.TrimSpace(val)
+		if key == "" {
+			continue
+		}
+		switch strings.ToLower(key) {
+		case "opf":
+			if val == "" || val == "0" || val == "1" {
+				method = http.MethodGet
+			} else {
+				method = http.MethodPost
+			}
+			continue
+		case "opa", "action":
+			if val != "" {
+				actionOverride = val
+			}
+			continue
+		}
+		if actionOverride == "" && looksLikeActionKey(key) {
+			actionOverride = key
+		}
+		normalizedKey := key
+		if looksLikeActionKey(key) {
+			if strings.HasPrefix(key, "/") && len(key) > 1 {
+				normalizedKey = strings.TrimLeft(key, "/")
+			} else if strings.Contains(key, "://") {
+				normalizedKey = ""
+			}
+		}
+		if normalizedKey == "" {
+			continue
+		}
+		values.Add(normalizedKey, val)
+	}
+	base, err := url.Parse(baseURL)
+	if err != nil {
+		base = nil
+	}
+	var target *url.URL
+	if actionOverride != "" {
+		override := actionOverride
+		if strings.HasPrefix(override, "//") && base != nil {
+			override = base.Scheme + ":" + override
+		}
+		if u, err := url.Parse(override); err == nil {
+			if base != nil && !u.IsAbs() {
+				target = base.ResolveReference(u)
+			} else {
+				target = u
+			}
+		}
+	}
+	if target == nil && base != nil {
+		clone := *base
+		target = &clone
+	}
+	if target == nil {
+		targetURL := baseURL
+		if method == http.MethodGet {
+			if len(values) > 0 {
+				sep := "?"
+				if strings.Contains(targetURL, "?") {
+					sep = "&"
+				}
+				targetURL += sep + values.Encode()
+			}
+			return &formSubmission{Method: http.MethodGet, URL: targetURL}
+		}
+		return &formSubmission{
+			Method:      http.MethodPost,
+			URL:         targetURL,
+			Body:        values.Encode(),
+			ContentType: "application/x-www-form-urlencoded",
+		}
+	}
+	if method == http.MethodGet {
+		q := target.Query()
+		for k, vs := range values {
+			for _, v := range vs {
+				q.Add(k, v)
+			}
+		}
+		target.RawQuery = q.Encode()
+		return &formSubmission{Method: http.MethodGet, URL: target.String()}
+	}
+	return &formSubmission{
+		Method:      http.MethodPost,
+		URL:         target.String(),
+		Body:        values.Encode(),
+		ContentType: "application/x-www-form-urlencoded",
+	}
+}
 
-
-
-
-
+func looksLikeActionKey(key string) bool {
+	if key == "" {
+		return false
+	}
+	if strings.HasPrefix(key, "http://") || strings.HasPrefix(key, "https://") {
+		return true
+	}
+	if strings.HasPrefix(key, "//") {
+		return true
+	}
+	return strings.HasPrefix(key, "/")
+}
 
 // SetPart allows external callers to set pagination metadata on the page.
 func (p *Page) SetPart(cur, cnt int) {
-    if cur < 0 { cur = 0 }
-    if cnt < 0 { cnt = 0 }
-    p.partCur = cur
-    p.partCnt = cnt
+	if cur < 0 {
+		cur = 0
+	}
+	if cnt < 0 {
+		cnt = 0
+	}
+	p.partCur = cur
+	p.partCnt = cnt
 }
 
 // NormalizeOMSWithStag adjusts an OMS response bytes and sets stag_count to the provided value.
 // stag is written as a swapped little-endian field.
 func NormalizeOMSWithStag(b []byte, stag int) ([]byte, error) {
-    if len(b) < 6 {
-        return b, nil
-    }
-    if binary.LittleEndian.Uint16(b[:2]) != Version {
-        return b, nil
-    }
-    fr := flate.NewReader(bytes.NewReader(b[6:]))
-    dec, err := io.ReadAll(fr)
-    fr.Close()
-    if err != nil { return b, nil }
-    if len(dec) < 35 { return b, nil }
-    if dec[len(dec)-1] != 'Q' { dec = append(dec, 'Q') }
-    parsed := parseTagCountFromDec(dec)
-    if parsed < 1 { parsed = 1 }
-    wantCnt := parsed + 1
-    swap := func(v uint16) uint16 { return (v<<8)&0xFF00 | (v>>8)&0x00FF }
-    binary.LittleEndian.PutUint16(dec[18:20], swap(uint16(wantCnt)))
-    if stag < 0 { stag = 0 }
-    binary.LittleEndian.PutUint16(dec[26:28], swap(uint16(stag)))
-    var comp bytes.Buffer
-    w, _ := flate.NewWriter(&comp, flate.DefaultCompression)
-    _, _ = w.Write(dec)
-    _ = w.Close()
-    size := 6 + comp.Len()
-    header := make([]byte, 6)
-    binary.LittleEndian.PutUint16(header[:2], Version)
-    binary.BigEndian.PutUint32(header[2:], uint32(size))
-    out := append(header, comp.Bytes()...)
-    return out, nil
+	if len(b) < 6 {
+		return b, nil
+	}
+	if binary.LittleEndian.Uint16(b[:2]) != Version {
+		return b, nil
+	}
+	fr := flate.NewReader(bytes.NewReader(b[6:]))
+	dec, err := io.ReadAll(fr)
+	fr.Close()
+	if err != nil {
+		return b, nil
+	}
+	if len(dec) < 35 {
+		return b, nil
+	}
+	if dec[len(dec)-1] != 'Q' {
+		dec = append(dec, 'Q')
+	}
+	parsed := parseTagCountFromDec(dec)
+	if parsed < 1 {
+		parsed = 1
+	}
+	wantCnt := parsed + 1
+	swap := func(v uint16) uint16 { return (v<<8)&0xFF00 | (v>>8)&0x00FF }
+	binary.LittleEndian.PutUint16(dec[18:20], swap(uint16(wantCnt)))
+	if stag < 0 {
+		stag = 0
+	}
+	binary.LittleEndian.PutUint16(dec[26:28], swap(uint16(stag)))
+	var comp bytes.Buffer
+	w, _ := flate.NewWriter(&comp, flate.DefaultCompression)
+	_, _ = w.Write(dec)
+	_ = w.Close()
+	size := 6 + comp.Len()
+	header := make([]byte, 6)
+	binary.LittleEndian.PutUint16(header[:2], Version)
+	binary.BigEndian.PutUint32(header[2:], uint32(size))
+	out := append(header, comp.Bytes()...)
+	return out, nil
 }
 
 // SelectOMSPartFromPacked returns a selected part from a packed OMS payload. Stub: returns whole payload.
 func SelectOMSPartFromPacked(data []byte, page, maxTags int) ([]byte, int, int, error) {
-    if page <= 0 { page = 1 }
-    if maxTags <= 0 { return data, 1, 1, nil }
-    return data, 1, 1, nil
+	if page <= 0 {
+		page = 1
+	}
+	if maxTags <= 0 {
+		return data, 1, 1, nil
+	}
+	return data, 1, 1, nil
 }
-
