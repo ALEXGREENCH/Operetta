@@ -1727,14 +1727,15 @@ type RenderOptions struct {
 	OriginCookies string         // cookies set by origin page (name=value; ...)
 	Jar           http.CookieJar // optional cookie jar for origin requests
 	// Opera Mini auth echo: include these as 'k' tags ('authcode' and 'authprefix')
-	AuthCode    string
-	AuthPrefix  string
-	ScreenW     int
-	ScreenH     int
-	NumColors   int
-	HeapKB      int
-	AlphaLevels int
-	FormBody    string
+	AuthCode       string
+	AuthPrefix     string
+	GatewayVersion int // OM gateway discriminator (280 for 2.x, 285 for 3.x)
+	ScreenW        int
+	ScreenH        int
+	NumColors      int
+	HeapBytes      int // client-reported memory budget (bytes)
+	AlphaLevels    int
+	FormBody       string
 	// Pagination: 1-based page index and max tags per page (0=disabled)
 	Page           int
 	MaxTagsPerPage int

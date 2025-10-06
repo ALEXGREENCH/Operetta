@@ -229,7 +229,7 @@ func rootHandler(w http.ResponseWriter, r *http.Request) {
 						}
 					case "m":
 						if n, err := strconv.Atoi(val); err == nil && n >= 0 {
-							o.HeapKB = n
+							o.HeapBytes = n
 						}
 					case "l":
 						if n, err := strconv.Atoi(val); err == nil && n >= 0 {
@@ -248,7 +248,7 @@ func rootHandler(w http.ResponseWriter, r *http.Request) {
 			// Pagination from client
 			if ov := strings.TrimSpace(params["o"]); ov != "" {
 				if n, err := strconv.Atoi(ov); err == nil && n > 0 {
-					o.MaxTagsPerPage = n
+					o.GatewayVersion = n
 				}
 			}
 			if wv := strings.TrimSpace(params["w"]); wv != "" {
