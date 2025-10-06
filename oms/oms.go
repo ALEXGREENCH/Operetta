@@ -314,7 +314,7 @@ func initDiskCache() {
 	}
 	if err := os.MkdirAll(diskCacheDir, 0o755); err != nil { /* ignore */
 	}
-	mb := 200
+	mb := 100
 	if s := os.Getenv("OMS_IMG_CACHE_MB"); s != "" {
 		if v, err := strconv.Atoi(strings.TrimSpace(s)); err == nil && v >= 0 {
 			mb = v
@@ -1365,7 +1365,7 @@ func (c *imgLRU) put(key string, data []byte, w, h int) {
 }
 
 var globalImgCache = func() *imgLRU {
-	mb := 200
+	mb := 100
 	if s := os.Getenv("OMS_IMG_CACHE_MB"); s != "" {
 		if v, err := strconv.Atoi(strings.TrimSpace(s)); err == nil && v >= 0 {
 			mb = v
@@ -2895,18 +2895,75 @@ func LoadCompactPageWithHeaders(oURL string, hdr http.Header) (*Page, error) {
 // fetchAndEncodeImage downloads the image at absURL and encodes it into the
 // client-requested format, returning bytes and dimensions.
 // absURL should be absolute (no 0/ prefix).
+type cacheCandidate struct {
+	format  string
+	quality int
+}
+
+func cacheCandidatesFor(prefs RenderOptions) []cacheCandidate {
+	want := strings.ToLower(strings.TrimSpace(prefs.ImageMIME))
+	if want == "" {
+		want = "image/jpeg"
+	}
+	var out []cacheCandidate
+	seen := make(map[string]struct{})
+	add := func(format string, quality int) {
+		key := format + "|" + strconv.Itoa(quality)
+		if _, ok := seen[key]; ok {
+			return
+		}
+		seen[key] = struct{}{}
+		out = append(out, cacheCandidate{format: format, quality: quality})
+	}
+	switch want {
+	case "image/png":
+		add("image/png", 0)
+	default:
+		add("image/jpeg", jpegQualityFor(prefs))
+		add("image/png", 0)
+	}
+	return out
+}
+
+func jpegQualityFor(prefs RenderOptions) int {
+	if prefs.HighQuality {
+		return 85
+	}
+	return 40
+}
+
 func fetchAndEncodeImage(absURL string, prefs RenderOptions) ([]byte, int, int, bool) {
 	debug := os.Getenv("OMS_IMG_DEBUG") == "1"
-	// data: URIs
+	candidates := cacheCandidatesFor(prefs)
+
+	for _, cand := range candidates {
+		if data, w, h, ok := imgCacheGet(cand.format, cand.quality, absURL); ok {
+			if debug {
+				log.Printf("IMG cache hit mem fmt=%s q=%d url=%s", cand.format, cand.quality, absURL)
+			}
+			return data, w, h, true
+		}
+		if data, w, h, ok := diskCacheGet(cand.format, cand.quality, absURL); ok {
+			imgCachePut(cand.format, cand.quality, absURL, data, w, h)
+			if debug {
+				log.Printf("IMG cache hit disk fmt=%s q=%d url=%s", cand.format, cand.quality, absURL)
+			}
+			return data, w, h, true
+		}
+	}
+
 	if strings.HasPrefix(absURL, "data:") {
-		if b, w, h, ok := decodeDataURI(absURL, prefs); ok {
-			return b, w, h, true
+		if data, w, h, format, quality, ok := decodeDataURI(absURL, prefs); ok {
+			imgCachePut(format, quality, absURL, data, w, h)
+			diskCachePut(format, quality, absURL, data, w, h)
+			return data, w, h, true
 		}
 		if debug {
 			log.Printf("IMG decode data: failed url=%s", absURL)
 		}
 		return nil, 0, 0, false
 	}
+
 	req, err := http.NewRequest(http.MethodGet, absURL, nil)
 	if err != nil {
 		if debug {
@@ -2915,7 +2972,6 @@ func fetchAndEncodeImage(absURL string, prefs RenderOptions) ([]byte, int, int, 
 		return nil, 0, 0, false
 	}
 	req.Header.Set("Accept", "image/*")
-	// Carry over useful headers from the page request
 	if prefs.ReqHeaders != nil {
 		if ua := prefs.ReqHeaders.Get("User-Agent"); ua != "" {
 			req.Header.Set("User-Agent", ua)
@@ -2923,7 +2979,6 @@ func fetchAndEncodeImage(absURL string, prefs RenderOptions) ([]byte, int, int, 
 		if al := prefs.ReqHeaders.Get("Accept-Language"); al != "" {
 			req.Header.Set("Accept-Language", al)
 		}
-		// Merge cookies from client and origin page
 		var cookieParts []string
 		if ck := prefs.ReqHeaders.Get("Cookie"); ck != "" {
 			cookieParts = append(cookieParts, ck)
@@ -2941,11 +2996,10 @@ func fetchAndEncodeImage(absURL string, prefs RenderOptions) ([]byte, int, int, 
 	if prefs.Referrer != "" {
 		req.Header.Set("Referer", prefs.Referrer)
 	}
-	ihc := &http.Client{Timeout: 8 * time.Second}
+	client := &http.Client{Timeout: 8 * time.Second}
 	if prefs.Jar != nil {
-		ihc.Jar = prefs.Jar
+		client.Jar = prefs.Jar
 	}
-	client := ihc
 	resp, err := client.Do(req)
 	if err != nil {
 		if debug {
@@ -2954,6 +3008,7 @@ func fetchAndEncodeImage(absURL string, prefs RenderOptions) ([]byte, int, int, 
 		return nil, 0, 0, false
 	}
 	defer resp.Body.Close()
+
 	var rc io.ReadCloser = resp.Body
 	switch strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Encoding"))) {
 	case "gzip":
@@ -2970,6 +3025,7 @@ func fetchAndEncodeImage(absURL string, prefs RenderOptions) ([]byte, int, int, 
 			defer fr.Close()
 		}
 	}
+
 	raw, err := io.ReadAll(rc)
 	if err != nil || len(raw) == 0 {
 		if debug {
@@ -2977,7 +3033,7 @@ func fetchAndEncodeImage(absURL string, prefs RenderOptions) ([]byte, int, int, 
 		}
 		return nil, 0, 0, false
 	}
-	// Decode
+
 	img, _, err := image.Decode(bytes.NewReader(raw))
 	if err != nil {
 		if debug {
@@ -2985,55 +3041,56 @@ func fetchAndEncodeImage(absURL string, prefs RenderOptions) ([]byte, int, int, 
 		}
 		return nil, 0, 0, false
 	}
+
+	data, w, h, format, quality, err := encodeImage(img, prefs)
+	if err != nil {
+		if debug {
+			log.Printf("IMG encode %s: %v", format, err)
+		}
+		return nil, 0, 0, false
+	}
+
+	imgCachePut(format, quality, absURL, data, w, h)
+	diskCachePut(format, quality, absURL, data, w, h)
+	return data, w, h, true
+}
+
+func encodeImage(img image.Image, prefs RenderOptions) ([]byte, int, int, string, int, error) {
 	b := img.Bounds()
 	w := b.Dx()
 	h := b.Dy()
-	// Encode to requested MIME; check disk cache first with final format/quality key
-	var out bytes.Buffer
-	want := strings.ToLower(prefs.ImageMIME)
+
+	want := strings.ToLower(strings.TrimSpace(prefs.ImageMIME))
+	if want == "" {
+		want = "image/jpeg"
+	}
 	if want == "image/jpeg" && imageHasAlpha(img) {
 		want = "image/png"
 	}
-	// Derive quality only for JPEG
-	q := 0
-	if want == "image/jpeg" {
-		if prefs.HighQuality {
-			q = 85
-		} else {
-			q = 40
-		}
-	}
-	if data, cw, ch, ok := diskCacheGet(want, q, absURL); ok {
-		return data, cw, ch, true
-	}
+
+	var out bytes.Buffer
+	quality := 0
+
 	switch want {
 	case "image/png":
-		enc := png.Encoder{CompressionLevel: png.BestCompression}
+		enc := png.Encoder{CompressionLevel: png.DefaultCompression}
 		if prefs.HighQuality {
 			enc.CompressionLevel = png.BestCompression
-		} else {
-			enc.CompressionLevel = png.DefaultCompression
 		}
 		if err := enc.Encode(&out, img); err != nil {
-			if debug {
-				log.Printf("IMG encode png: %v", err)
-			}
-			return nil, 0, 0, false
+			return nil, 0, 0, want, quality, err
 		}
 	default:
-		if q == 0 {
-			q = 60
+		quality = jpegQualityFor(prefs)
+		if quality <= 0 {
+			quality = 60
 		}
-		if err := jpeg.Encode(&out, img, &jpeg.Options{Quality: q}); err != nil {
-			if debug {
-				log.Printf("IMG encode jpeg: %v", err)
-			}
-			return nil, 0, 0, false
+		if err := jpeg.Encode(&out, img, &jpeg.Options{Quality: quality}); err != nil {
+			return nil, 0, 0, want, quality, err
 		}
 	}
-	enc := append([]byte(nil), out.Bytes()...)
-	diskCachePut(want, q, absURL, enc, w, h)
-	return enc, w, h, true
+
+	return append([]byte(nil), out.Bytes()...), w, h, want, quality, nil
 }
 
 // imageHasAlpha returns true if any sampled pixel has alpha != 0xff.
@@ -3063,11 +3120,11 @@ func imageHasAlpha(img image.Image) bool {
 	return false
 }
 
-func decodeDataURI(uri string, prefs RenderOptions) ([]byte, int, int, bool) {
+func decodeDataURI(uri string, prefs RenderOptions) ([]byte, int, int, string, int, bool) {
 	// data:[<mediatype>][;base64],<data>
 	comma := strings.IndexByte(uri, ',')
 	if !strings.HasPrefix(uri, "data:") || comma == -1 {
-		return nil, 0, 0, false
+		return nil, 0, 0, "", 0, false
 	}
 	meta := uri[len("data:"):comma]
 	data := uri[comma+1:]
@@ -3075,7 +3132,7 @@ func decodeDataURI(uri string, prefs RenderOptions) ([]byte, int, int, bool) {
 	if strings.Contains(meta, ";base64") {
 		b, err := base64.StdEncoding.DecodeString(data)
 		if err != nil {
-			return nil, 0, 0, false
+			return nil, 0, 0, "", 0, false
 		}
 		raw = b
 	} else {
@@ -3083,29 +3140,13 @@ func decodeDataURI(uri string, prefs RenderOptions) ([]byte, int, int, bool) {
 	}
 	img, _, err := image.Decode(bytes.NewReader(raw))
 	if err != nil {
-		return nil, 0, 0, false
+		return nil, 0, 0, "", 0, false
 	}
-	b := img.Bounds()
-	w := b.Dx()
-	h := b.Dy()
-	var out bytes.Buffer
-	switch strings.ToLower(prefs.ImageMIME) {
-	case "image/png":
-		if err := png.Encode(&out, img); err != nil {
-			return nil, 0, 0, false
-		}
-	default:
-		q := 60
-		if prefs.HighQuality {
-			q = 85
-		} else {
-			q = 40
-		}
-		if err := jpeg.Encode(&out, img, &jpeg.Options{Quality: q}); err != nil {
-			return nil, 0, 0, false
-		}
+	enc, w, h, format, quality, err := encodeImage(img, prefs)
+	if err != nil {
+		return nil, 0, 0, format, quality, false
 	}
-	return out.Bytes(), w, h, true
+	return enc, w, h, format, quality, true
 }
 
 // ---------------------- Public API with options ----------------------
