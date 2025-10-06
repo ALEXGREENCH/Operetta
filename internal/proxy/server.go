@@ -482,7 +482,11 @@ func keysOf(m map[string][]string) []string {
 }
 
 func normalizeObmlURL(u string) string {
-	s := u
+	s := strings.TrimSpace(u)
+	if s == "" {
+		return s
+	}
+	s = urlDecode(s)
 	if strings.HasPrefix(s, "/obml/") {
 		s = s[len("/obml/"):]
 		// optional numeric version and slash
@@ -499,8 +503,8 @@ func normalizeObmlURL(u string) string {
 	if strings.HasPrefix(s, "0/") {
 		s = s[2:]
 	}
-	// Prepend http:// if no scheme present
-	if !(strings.HasPrefix(s, "http://") || strings.HasPrefix(s, "https://")) {
+	lower := strings.ToLower(s)
+	if !(strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://")) {
 		s = "http://" + s
 	}
 	return s

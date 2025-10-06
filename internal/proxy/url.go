@@ -1,6 +1,9 @@
 package proxy
 
-import "strings"
+import (
+	neturl "net/url"
+	"strings"
+)
 
 // urlDecode converts percent-encoded sequences like %2f into their byte values.
 func urlDecode(url string) string {
@@ -34,33 +37,59 @@ func fromHex(c byte) byte {
 // buildURL builds a new URL based on the current url, action, and get params.
 // It mirrors the logic from the legacy C implementation.
 func buildURL(base, action, get string) string {
-	// Ensure base is fully decoded because callers may double-encode it in links
-	base = urlDecode(urlDecode(base))
+	decodedBase := urlDecode(urlDecode(base))
+	decodedAction := ""
 	if action != "" {
-		action = urlDecode(action)
+		decodedAction = urlDecode(action)
 	}
-	newURL := ""
-	if action != "" {
-		if strings.Contains(action, "://") {
-			newURL = action
-		} else {
-			if strings.HasPrefix(action, "/") {
-				slash := strings.Index(base[7:], "/")
-				if slash != -1 {
-					base = base[:7+slash]
-				}
-				action = action[1:]
-			} else {
-				slash := strings.LastIndex(base, "/")
-				if slash > 6 { // position after http://
-					base = base[:slash]
+
+	if parsedBase, err := neturl.Parse(decodedBase); err == nil && parsedBase.Scheme != "" {
+		finalURL := parsedBase
+		if decodedAction != "" {
+			if ref, err := neturl.Parse(decodedAction); err == nil {
+				if ref.IsAbs() {
+					finalURL = ref
+				} else {
+					finalURL = parsedBase.ResolveReference(ref)
 				}
 			}
-			newURL = base + "/" + action
 		}
-	} else {
-		newURL = base
+		if get != "" {
+			if finalURL.RawQuery != "" {
+				finalURL.RawQuery += "&" + get
+			} else {
+				finalURL.RawQuery = get
+			}
+		}
+		return finalURL.String()
 	}
+
+	newURL := decodedBase
+	if decodedAction != "" {
+		switch {
+		case strings.Contains(decodedAction, "://"):
+			newURL = decodedAction
+		case strings.HasPrefix(decodedAction, "/"):
+			hostPrefix := decodedBase
+			if idx := strings.Index(decodedBase, "//"); idx != -1 {
+				hostStart := idx + 2
+				if slash := strings.Index(decodedBase[hostStart:], "/"); slash != -1 {
+					hostPrefix = decodedBase[:hostStart+slash]
+				}
+			}
+			newURL = strings.TrimRight(hostPrefix, "/") + decodedAction
+		default:
+			basePrefix := decodedBase
+			if strings.HasSuffix(basePrefix, "/") {
+				basePrefix = strings.TrimRight(basePrefix, "/")
+			}
+			if last := strings.LastIndex(basePrefix, "/"); last != -1 {
+				basePrefix = basePrefix[:last]
+			}
+			newURL = strings.TrimRight(basePrefix, "/") + "/" + decodedAction
+		}
+	}
+
 	if get != "" {
 		if strings.Contains(newURL, "?") {
 			newURL += "&" + get
@@ -68,5 +97,6 @@ func buildURL(base, action, get string) string {
 			newURL += "?" + get
 		}
 	}
+
 	return newURL
 }
