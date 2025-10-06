@@ -33,6 +33,8 @@ import (
 
 const defaultUpstreamUA = "Mozilla/5.0 (Linux; Android 9; OMS Test) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
 
+const defaultPaginationBytes = 48000
+
 // ---------------------- Minimal CSS support ----------------------
 
 // isWhiteHex returns true if the color equals #ffffff (case-insensitive).
@@ -1115,6 +1117,19 @@ func splitByTags(b []byte, maxTags int) [][]byte {
 	if maxTags <= 0 || len(b) < 2 {
 		return [][]byte{b}
 	}
+	maxBytes := defaultPaginationBytes
+	if s := strings.TrimSpace(os.Getenv("OMS_PAGINATE_BYTES")); s != "" {
+		if v, err := strconv.Atoi(s); err == nil {
+			if v <= 0 {
+				maxBytes = 0
+			} else {
+				maxBytes = v
+			}
+		}
+	}
+	if maxBytes > 0 && maxBytes < 1024 {
+		maxBytes = 1024
+	}
 	// Prefix is initial page URL string (len + bytes)
 	if len(b) < 2 {
 		return [][]byte{b}
@@ -1232,7 +1247,8 @@ func splitByTags(b []byte, maxTags int) [][]byte {
 			p = limit
 		}
 		tags++
-		if tags >= maxTags {
+		chunkBytes := p - start
+		if tags >= maxTags || (maxBytes > 0 && chunkBytes >= maxBytes) {
 			// Cut part [start:p)
 			chunk := append([]byte(nil), b[start:p]...)
 			part := append(append([]byte(nil), prefix...), chunk...)
