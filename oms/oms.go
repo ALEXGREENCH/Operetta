@@ -3299,12 +3299,79 @@ func LoadPageWithHeadersAndOptions(oURL string, hdr http.Header, opts *RenderOpt
 		nav.AddHr("")
 		if pageIdx > 1 {
 			prevURL := serverBase + "/fetch?" + BuildPaginationQuery(effectiveURL, &rp, pageIdx-1, maxTags)
-			nav.AddLink("0/"+prevURL, "\u041D\u0430\u0437\u0430\u0434")
+			nav.AddLink("0/"+prevURL, "[<<]")
+		} else {
+			nav.AddText("[<<]")
 		}
+		nav.AddText(" ")
 		if pageIdx < len(parts) {
 			nextURL := serverBase + "/fetch?" + BuildPaginationQuery(effectiveURL, &rp, pageIdx+1, maxTags)
-			nav.AddLink("0/"+nextURL, "\u0414\u0430\u043B\u0435\u0435")
+			nav.AddLink("0/"+nextURL, "[>>]")
+		} else {
+			nav.AddText("[>>]")
 		}
+		nav.AddBreak()
+		pageSet := map[int]struct{}{}
+		addCandidate := func(n int) {
+			if n >= 1 && n <= len(parts) {
+				pageSet[n] = struct{}{}
+			}
+		}
+		for i := 1; i <= 3; i++ {
+			addCandidate(i)
+		}
+		for i := pageIdx - 2; i <= pageIdx+2; i++ {
+			addCandidate(i)
+		}
+		for i := len(parts) - 2; i <= len(parts); i++ {
+			addCandidate(i)
+		}
+		if len(pageSet) == 0 {
+			addCandidate(pageIdx)
+		}
+		var ordered []int
+		for n := range pageSet {
+			ordered = append(ordered, n)
+		}
+		sort.Ints(ordered)
+		lastShown := 0
+		for _, n := range ordered {
+			if lastShown != 0 && n-lastShown > 1 {
+				nav.AddText("…")
+			}
+			label := fmt.Sprintf("[%d]", n)
+			if n == pageIdx {
+				nav.AddText("•" + label)
+			} else {
+				pageURL := serverBase + "/fetch?" + BuildPaginationQuery(effectiveURL, &rp, n, maxTags)
+				nav.AddLink("0/"+pageURL, label)
+			}
+			lastShown = n
+		}
+		nav.AddBreak()
+		nav.AddText(fmt.Sprintf("Выбор страницы (1…%d)", len(parts)))
+		nav.AddBreak()
+		formAction := "0/" + serverBase + "/fetch"
+		nav.AddForm(formAction)
+		nav.AddHidden("url", effectiveURL)
+		if maxTags > 0 {
+			nav.AddHidden("pp", strconv.Itoa(maxTags))
+		}
+		if rp.ImagesOn {
+			nav.AddHidden("img", "1")
+		}
+		if rp.HighQuality {
+			nav.AddHidden("hq", "1")
+		}
+		if rp.ImageMIME != "" {
+			nav.AddHidden("mime", rp.ImageMIME)
+		}
+		if rp.MaxInlineKB > 0 {
+			nav.AddHidden("maxkb", strconv.Itoa(rp.MaxInlineKB))
+		}
+		nav.AddTextInput("page", "")
+		nav.AddText(" ")
+		nav.AddSubmit("go", "OK")
 		nav.AddHr("")
 		sel = append(sel, nav.Data...)
 	}
