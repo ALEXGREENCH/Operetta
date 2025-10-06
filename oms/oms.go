@@ -2357,8 +2357,8 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 				p.AddText("+")
 				recurse = false
 			case "table":
-				if hasFormControls(c) {
-					// let recursion process inputs/selects
+				if hasFormControls(c) || hasAnchorLinks(c) {
+					// let recursion process interactive content to preserve links
 				} else {
 					// Traverse sections and rows: thead/tbody/tfoot/tr
 					for sec := c.FirstChild; sec != nil; sec = sec.NextSibling {
@@ -2656,6 +2656,24 @@ func hasFormControls(n *html.Node) bool {
 	}
 	rec(n)
 	return found
+}
+
+func hasAnchorLinks(n *html.Node) bool {
+	var rec func(*html.Node) bool
+	rec = func(x *html.Node) bool {
+		for c := x.FirstChild; c != nil; c = c.NextSibling {
+			if c.Type == html.ElementNode {
+				if strings.EqualFold(c.Data, "a") && strings.TrimSpace(getAttr(c, "href")) != "" {
+					return true
+				}
+				if rec(c) {
+					return true
+				}
+			}
+		}
+		return false
+	}
+	return rec(n)
 }
 
 // findFirstImgAlt returns alt text for first <img> under a node
