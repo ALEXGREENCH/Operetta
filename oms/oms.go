@@ -825,7 +825,9 @@ func NormalizeOMS(b []byte) ([]byte, error) {
 	// Overwrite tag_count (byte-swapped) at V2 offset 18:20 (LE field)
 	swap := func(v uint16) uint16 { return (v<<8)&0xFF00 | (v>>8)&0x00FF }
 	binary.LittleEndian.PutUint16(dec[18:20], swap(uint16(wantCnt)))
-	// Preserve stag_count as authored during finalize (do not override)
+	// Force stag_count to legacy-friendly 0x0400
+	binary.LittleEndian.PutUint16(dec[26:28], swap(uint16(0x0400)))
+	// Preserve other header fields from finalize
 
 	// Repack: deflate + write common header
 	var comp bytes.Buffer
