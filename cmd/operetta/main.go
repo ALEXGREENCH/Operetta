@@ -11,7 +11,7 @@ import (
 )
 
 func main() {
-	addrFlag := flag.String("addr", ":8080", "listen address, e.g. :80 or 0.0.0.0:8080")
+	addrFlag := flag.String("addr", ":8081", "listen address, e.g. :81 or 0.0.0.0:8081")
 	flag.Parse()
 
 	addr := *addrFlag

@@ -4,6 +4,7 @@ import (
 	"compress/flate"
 	"compress/gzip"
 	"compress/zlib"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -19,10 +20,10 @@ import (
 )
 
 type propState struct {
-    val       string
-    spec      cascadia.Specificity
-    order     int
-    important bool
+	val       string
+	spec      cascadia.Specificity
+	order     int
+	important bool
 }
 
 type cssDeclaration struct {
@@ -174,6 +175,7 @@ func parseCSSText(txt string, startOrder int, ctx *cssParseContext) ([]cssRule, 
 	}
 	sheet, err := parser.Parse(trimmed)
 	if err != nil {
+		fmt.Println("Error parsing CSS text:", err)
 		return nil, startOrder
 	}
 
@@ -242,21 +244,7 @@ func parseCSSText(txt string, startOrder int, ctx *cssParseContext) ([]cssRule, 
 				}
 				group, err := cascadia.ParseGroup(strings.Join(rule.Selectors, ","))
 				if err != nil {
-					for _, raw := range rule.Selectors {
-						raw = strings.TrimSpace(raw)
-						if raw == "" {
-							continue
-						}
-						sel, serr := cascadia.Parse(raw)
-						if serr != nil || sel == nil {
-							continue
-						}
-						if sel.PseudoElement() != "" {
-							continue
-						}
-						rules = append(rules, cssRule{selector: sel, specificity: sel.Specificity(), declarations: cloneDecls(decls), order: order})
-						order++
-					}
+					fmt.Println("Error parsing CSS group:", err)
 					continue
 				}
 				for _, sel := range group {
@@ -376,32 +364,31 @@ func mediaRuleActive(prelude string, opts *RenderOptions) bool {
 	if strings.TrimSpace(prelude) == "" {
 		return true
 	}
+
 	queries := strings.Split(prelude, ",")
 	for _, raw := range queries {
-		q := strings.ToLower(strings.TrimSpace(raw))
-		if q == "" {
+		query := strings.ToLower(strings.TrimSpace(raw))
+		if query == "" {
 			continue
 		}
+
 		mediaType := ""
-		rest := q
-		parts := strings.Fields(q)
+		rest := query
+		parts := strings.Fields(query)
 		if len(parts) > 0 && !strings.HasPrefix(parts[0], "(") {
 			mediaType = parts[0]
-			rest = strings.TrimSpace(strings.TrimPrefix(q, mediaType))
+			rest = strings.TrimSpace(strings.TrimPrefix(query, mediaType))
 		}
+
 		switch mediaType {
 		case "", "all", "screen", "handheld", "projection":
 			// ok
 		case "print", "speech", "aural", "braille", "embossed", "tty", "tv":
 			continue
 		default:
-			continue
-		}
-		if rest == "" {
-			return true
-		}
-		if evaluateMediaFeatures(rest, opts) {
-			return true
+			if evaluateMediaFeatures(rest, opts) {
+				return true
+			}
 		}
 	}
 	return false
@@ -420,6 +407,7 @@ func evaluateMediaFeatures(expr string, opts *RenderOptions) bool {
 	if height <= 0 {
 		height = 320
 	}
+
 	clauses := strings.Split(expr, "and")
 	for _, clause := range clauses {
 		c := strings.TrimSpace(clause)
@@ -435,6 +423,7 @@ func evaluateMediaFeatures(expr string, opts *RenderOptions) bool {
 		if len(parts) == 2 {
 			value = strings.TrimSpace(parts[1])
 		}
+
 		switch feature {
 		case "orientation":
 			orientation := "portrait"
@@ -463,13 +452,13 @@ func evaluateMediaFeatures(expr string, opts *RenderOptions) bool {
 		case "prefers-color-scheme":
 			scheme := "light"
 			if opts != nil && opts.NumColors >= 256 {
-				scheme = "light"
+				scheme = "dark"
 			}
 			if value != "" && value != scheme {
 				return false
 			}
 		default:
-			// unsupported feature, assume true
+			// Unsupported feature, assume true for simplicity
 		}
 	}
 	return true
@@ -529,7 +518,7 @@ func computeStyleFor(n *html.Node, ss *Stylesheet) map[string]string {
 	if ss == nil || n == nil || n.Type != html.ElementNode {
 		return nil
 	}
-	
+
 	props := map[string]propState{}
 
 	for _, rule := range ss.rules {
