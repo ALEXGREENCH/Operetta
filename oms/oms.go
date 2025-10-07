@@ -22,6 +22,7 @@ import (
 	"strings"
 
 	"fmt"
+	"golang.org/x/image/draw"
 	"golang.org/x/net/html"
 	"log"
 	"math"
@@ -3057,10 +3058,26 @@ func fetchAndEncodeImage(absURL string, prefs RenderOptions) ([]byte, int, int, 
 	return data, w, h, true
 }
 
-func encodeImage(img image.Image, prefs RenderOptions) ([]byte, int, int, string, int, error) {
+func clampImageToScreenWidth(img image.Image, maxWidth int) (image.Image, int, int) {
 	b := img.Bounds()
 	w := b.Dx()
 	h := b.Dy()
+	if maxWidth <= 0 || w <= 0 || h <= 0 || w <= maxWidth {
+		return img, w, h
+	}
+
+	scaledH := int(math.Round(float64(h) * float64(maxWidth) / float64(w)))
+	if scaledH < 1 {
+		scaledH = 1
+	}
+
+	dst := image.NewRGBA(image.Rect(0, 0, maxWidth, scaledH))
+	draw.CatmullRom.Scale(dst, dst.Bounds(), img, b, draw.Over, nil)
+	return dst, maxWidth, scaledH
+}
+
+func encodeImage(img image.Image, prefs RenderOptions) ([]byte, int, int, string, int, error) {
+	img, w, h := clampImageToScreenWidth(img, prefs.ScreenW)
 
 	want := strings.ToLower(strings.TrimSpace(prefs.ImageMIME))
 	if want == "" {
