@@ -8,7 +8,6 @@ import (
 	"crypto/sha1"
 	"encoding/base64"
 	"encoding/binary"
-	_ "golang.org/x/image/webp"
 	"image"
 	_ "image/gif"
 	"image/jpeg"
@@ -21,15 +20,18 @@ import (
 	"sort"
 	"strings"
 
+	_ "golang.org/x/image/webp"
+
 	"fmt"
-	"golang.org/x/image/draw"
-	"golang.org/x/net/html"
 	"log"
 	"math"
 	"os"
 	"strconv"
 	"sync"
 	"time"
+
+	"golang.org/x/image/draw"
+	"golang.org/x/net/html"
 )
 
 const defaultUpstreamUA = "Mozilla/5.0 (Linux; Android 9; OMS Test) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
@@ -1961,13 +1963,26 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 			if stAttr := getAttr(c, "style"); stAttr != "" && isDisplayNone(stAttr) {
 				continue
 			}
-			// Apply computed CSS conservatively: support display:none and background-color
+			// Apply computed CSS: honor display:none, text-align and color (from stylesheet)
+			alignedPushed := false
+			colorPushed := false
 			if st.css != nil {
 				if props := computeStyleFor(c, st.css); props != nil {
 					if strings.Contains(props["display"], "none") {
 						continue
 					}
-
+					switch strings.ToLower(strings.TrimSpace(props["text-align"])) {
+					case "center":
+						st.pushStyle(p, st.curStyle|styleCenterBit)
+						alignedPushed = true
+					case "right":
+						st.pushStyle(p, st.curStyle|styleRightBit)
+						alignedPushed = true
+					}
+					if col := strings.TrimSpace(props["color"]); col != "" {
+						st.pushColor(p, col)
+						colorPushed = true
+					}
 				}
 			}
 			tag := strings.ToLower(c.Data)
@@ -2554,6 +2569,14 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 				}
 				p.EndSelect()
 			}
+
+			if colorPushed {
+				st.popColor(p)
+			}
+			if alignedPushed {
+				st.popStyle(p)
+			}
+
 		} else if c.Type == html.TextNode {
 			if !visited[c] {
 				// Skip any stray text nodes under head/style/script/meta/link/noscript
