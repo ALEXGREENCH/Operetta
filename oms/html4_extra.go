@@ -60,7 +60,47 @@ func init() {
 		"isindex":  handleIsIndex,
 		"applet":   handleApplet,
 		"param":    handleParam,
+		"b": handleBold,
+        "strong": handleBold,
+        "i": handleItalic,
+        "em": handleItalic,
+        "u": handleUnderline,
+        "s": handleStrike,
+        "strike": handleStrike,
+        "del": handleStrike,
+        "ins": handleUnderline,
 	}
+}
+
+func handleBold(ctx *elementContext) bool {
+    cleanup := ctx.pushStyle(ctx.state.curStyle | styleBoldBit)
+    defer cleanup()
+    ctx.renderChildren()
+    return true
+}
+
+func handleItalic(ctx *elementContext) bool {
+    cleanup := ctx.pushStyle(ctx.state.curStyle | styleItalicBit)
+    defer cleanup()
+    ctx.renderChildren()
+    return true
+}
+
+func handleUnderline(ctx *elementContext) bool {
+    cleanup := ctx.pushStyle(ctx.state.curStyle | styleUnderBit)
+    defer cleanup()
+    ctx.renderChildren()
+    return true
+}
+
+func handleStrike(ctx *elementContext) bool {
+    // В OMS/OM2 отдельного бита для зачёркивания нет.
+    // Минимально отличим текст (как делают старые прокси) – используем underline.
+    // Если позже введёшь собственный бит – поменяй здесь.
+    cleanup := ctx.pushStyle(ctx.state.curStyle | styleUnderBit)
+    defer cleanup()
+    ctx.renderChildren()
+    return true
 }
 
 func handleFont(ctx *elementContext) bool {

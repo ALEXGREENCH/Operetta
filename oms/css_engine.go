@@ -805,3 +805,24 @@ func shouldSkipWhiteFill(prop, val string) bool {
 	}
 	return false
 }
+
+func findTextColorFor(n *html.Node, st *walkState) string {
+    if n == nil {
+        return st.curColor
+    }
+    for _, a := range n.Attr {
+        if strings.EqualFold(a.Key, "style") {
+            parts := strings.Split(a.Val, ";")
+            for _, part := range parts {
+                kv := strings.SplitN(part, ":", 2)
+                if len(kv) == 2 && strings.TrimSpace(strings.ToLower(kv[0])) == "color" {
+                    return strings.TrimSpace(kv[1])
+                }
+            }
+        }
+        if strings.EqualFold(a.Key, "color") {
+            return strings.TrimSpace(a.Val)
+        }
+    }
+    return st.curColor
+}

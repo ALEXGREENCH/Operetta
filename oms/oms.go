@@ -196,30 +196,23 @@ func effectiveTextColor(n *html.Node, st *walkState) string {
 }
 
 func addTextWithColor(p *Page, st *walkState, n *html.Node, text string) {
-	if text == "" {
-		return
-	}
-	if !st.pre {
-		text = condenseSpaces(text)
-	}
-	if text == "" {
-		return
-	}
+    if text == "" { return }
 
-	want := effectiveTextColor(n, st)
-	if want != "" && want != st.curColor {
-		prev := st.curColor
-		p.AddTextcolor(want)
-		p.AddText(text)
-		if prev != "" {
-			p.AddTextcolor(prev)
-		} else {
-			p.AddTextcolor("#000000")
-		}
-		return
-	}
-	p.AddText(text)
+    want := findTextColorFor(n, st)
+    if want != "" && want != st.curColor {
+        prev := st.curColor
+        // Устанавливаем цвет без потери жирного/курсива:
+        p.AddStyle(st.curStyle | (uint32(calcColor(want)) << 8))
+        p.AddText(text)
+        // Восстановить предыдущий цвет (или чёрный как дефолт):
+        restore := prev
+        if restore == "" { restore = "#000000" }
+        p.AddStyle(st.curStyle | (uint32(calcColor(restore)) << 8))
+        return
+    }
+    p.AddText(text)
 }
+
 
 // cssToHex normalizes common CSS color syntaxes into #rrggbb.
 // Supports: #rgb/#rrggbb, black/white, rgb()/rgba() with 0-255 or % values.
@@ -509,8 +502,10 @@ func calcColor(color string) uint16 {
 	return uint16(r) | uint16(g)<<5 | uint16(b)<<11
 }
 
-// AddTextcolor applies text color via style tag.
-func (p *Page) AddTextcolor(color string) { p.AddStyle(uint32(calcColor(color)) << 8) }
+// Deprecated: do not use directly — use AddStyle(curStyle | (color<<8)) instead.
+func (p *Page) AddTextcolor(color string) {
+    p.AddStyle(uint32(calcColor(color)) << 8)
+}
 
 // AddStyle appends style information.
 func (p *Page) AddStyle(style uint32) {
@@ -1842,36 +1837,56 @@ func (s *walkState) currentList() *listCtx {
 	}
 	return &s.lists[len(s.lists)-1]
 }
+
 func (s *walkState) pushStyle(p *Page, style uint32) {
-	s.styleStack = append(s.styleStack, s.curStyle)
-	s.curStyle = style
-	p.AddStyle(style)
+    s.styleStack = append(s.styleStack, s.curStyle)
+    s.curStyle = style
+    var colorPart uint32
+    if s.curColor != "" {
+        colorPart = uint32(calcColor(s.curColor)) << 8
+    }
+    p.AddStyle(style | colorPart)
 }
+
 func (s *walkState) popStyle(p *Page) {
-	if l := len(s.styleStack); l > 0 {
-		prev := s.styleStack[l-1]
-		s.styleStack = s.styleStack[:l-1]
-		s.curStyle = prev
-		p.AddStyle(prev)
-	}
+    if len(s.styleStack) == 0 {
+        return
+    }
+    s.curStyle = s.styleStack[len(s.styleStack)-1]
+    s.styleStack = s.styleStack[:len(s.styleStack)-1]
+    var colorPart uint32
+    if s.curColor != "" {
+        colorPart = uint32(calcColor(s.curColor)) << 8
+    }
+    p.AddStyle(s.curStyle | colorPart)
 }
 
 func (s *walkState) pushColor(p *Page, hex string) {
-	s.colorStack = append(s.colorStack, s.curColor)
-	s.curColor = hex
-	if hex != "" {
-		p.AddTextcolor(hex)
-	}
+    s.colorStack = append(s.colorStack, s.curColor)
+    s.curColor = hex
+    if hex != "" {
+        cur := s.curStyle
+        if len(s.styleStack) > 0 {
+            cur = s.styleStack[len(s.styleStack)-1]
+        }
+        p.AddStyle(cur | (uint32(calcColor(hex)) << 8))
+    }
 }
+
 func (s *walkState) popColor(p *Page) {
-	if l := len(s.colorStack); l > 0 {
-		prev := s.colorStack[l-1]
-		s.colorStack = s.colorStack[:l-1]
-		s.curColor = prev
-		if prev != "" {
-			p.AddTextcolor(prev)
-		}
-	}
+    if len(s.colorStack) == 0 {
+        return
+    }
+    prev := s.colorStack[len(s.colorStack)-1]
+    s.colorStack = s.colorStack[:len(s.colorStack)-1]
+    s.curColor = prev
+    cur := s.curStyle
+    if len(s.styleStack) > 0 {
+        cur = s.styleStack[len(s.styleStack)-1]
+    }
+    if prev != "" {
+        p.AddStyle(cur | (uint32(calcColor(prev)) << 8))
+    }
 }
 
 func isDisplayNone(style string) bool {
@@ -2184,7 +2199,11 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 					p.AddText(name)
 				}
 				p.addTag('E')
-				p.AddBreak()
+				// TODO;...
+                if ns := nextSignificantSibling(c); !(ns != nil && ns.Type == html.TextNode &&
+					hasPrefixAny(strings.TrimLeft(ns.Data, " \t\r\n"), "]", "|", ")")) {
+					p.AddBreak()
+				}
 				recurse = false
 			case "img":
 				// Images handling based on client prefs
@@ -3708,4 +3727,35 @@ func SelectOMSPartFromPacked(data []byte, page, maxTags int) ([]byte, int, int, 
 		return data, 1, 1, nil
 	}
 	return data, 1, 1, nil
+}
+
+func nextSignificantSibling(n *html.Node) *html.Node {
+    for s := n.NextSibling; s != nil; s = s.NextSibling {
+        if s.Type == html.TextNode {
+            if strings.TrimSpace(s.Data) == "" {
+                continue
+            }
+            return s
+        }
+        if s.Type == html.ElementNode {
+            return s
+        }
+    }
+    return nil
+}
+
+func hasPrefixAny(s string, prefixes ...string) bool {
+    for _, p := range prefixes {
+        if strings.HasPrefix(s, p) {
+            return true
+        }
+    }
+    return false
+}
+
+func (s *walkState) currentStyle() uint32 {
+    if len(s.styleStack) > 0 {
+        return s.styleStack[len(s.styleStack)-1]
+    }
+    return s.curStyle
 }
