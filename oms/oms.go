@@ -5,7 +5,6 @@ import (
 	"compress/flate"
 	"compress/gzip"
 	"compress/zlib"
-	"crypto/sha1"
 	"encoding/base64"
 	"encoding/binary"
 	"image"
@@ -13,10 +12,8 @@ import (
 	"image/jpeg"
 	"image/png"
 	"io"
-	"io/fs"
 	"net/http"
 	"net/url"
-	"path/filepath"
 	"sort"
 	"strings"
 
@@ -36,7 +33,8 @@ import (
 
 const defaultUpstreamUA = "Mozilla/5.0 (Linux; Android 9; OMS Test) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
 
-const defaultPaginationBytes = 48000
+const defaultPaginationBytes = 32000
+const maxInlineBackgroundSize = 128
 
 // ---------------------- Minimal CSS support ----------------------
 
@@ -196,23 +194,26 @@ func effectiveTextColor(n *html.Node, st *walkState) string {
 }
 
 func addTextWithColor(p *Page, st *walkState, n *html.Node, text string) {
-    if text == "" { return }
+	if text == "" {
+		return
+	}
 
-    want := findTextColorFor(n, st)
-    if want != "" && want != st.curColor {
-        prev := st.curColor
-        // Устанавливаем цвет без потери жирного/курсива:
-        p.AddStyle(st.curStyle | (uint32(calcColor(want)) << 8))
-        p.AddText(text)
-        // Восстановить предыдущий цвет (или чёрный как дефолт):
-        restore := prev
-        if restore == "" { restore = "#000000" }
-        p.AddStyle(st.curStyle | (uint32(calcColor(restore)) << 8))
-        return
-    }
-    p.AddText(text)
+	want := findTextColorFor(n, st)
+	if want != "" && want != st.curColor {
+		prev := st.curColor
+		// Устанавливаем цвет без потери жирного/курсива:
+		p.AddStyle(st.curStyle | (uint32(calcColor(want)) << 8))
+		p.AddText(text)
+		// Восстановить предыдущий цвет (или чёрный как дефолт):
+		restore := prev
+		if restore == "" {
+			restore = "#000000"
+		}
+		p.AddStyle(st.curStyle | (uint32(calcColor(restore)) << 8))
+		return
+	}
+	p.AddText(text)
 }
-
 
 // cssToHex normalizes common CSS color syntaxes into #rrggbb.
 // Supports: #rgb/#rrggbb, black/white, rgb()/rgba() with 0-255 or % values.
@@ -293,823 +294,6 @@ func cssToHex(v string) string {
 	}
 	return ""
 }
-
-// ---------------------- Disk image cache ----------------------
-
-var (
-	diskCacheOnce sync.Once
-	diskCacheDir  string
-	diskCacheMax  int64
-	diskCacheMu   sync.Mutex
-)
-
-func initDiskCache() {
-	diskCacheDir = os.Getenv("OMS_IMG_CACHE_DIR")
-	if diskCacheDir == "" {
-		diskCacheDir = filepath.Join("cache", "img")
-	}
-	if err := os.MkdirAll(diskCacheDir, 0o755); err != nil { /* ignore */
-	}
-	mb := 100
-	if s := os.Getenv("OMS_IMG_CACHE_MB"); s != "" {
-		if v, err := strconv.Atoi(strings.TrimSpace(s)); err == nil && v >= 0 {
-			mb = v
-		}
-	}
-	diskCacheMax = int64(mb) * 1024 * 1024
-}
-
-func diskKey(format string, quality int, url string) (string, string) {
-	h := sha1.Sum([]byte(format + "|q=" + strconv.Itoa(quality) + "|" + url))
-	hex := make([]byte, 40)
-	const hexd = "0123456789abcdef"
-	for i, b := range h[:] {
-		hex[i*2] = hexd[b>>4]
-		hex[i*2+1] = hexd[b&0xF]
-	}
-	dir := filepath.Join(diskCacheDir, string(hex[0]), string(hex[1]))
-	return dir, filepath.Join(dir, string(hex)+".bin")
-}
-
-func diskCacheGet(format string, quality int, url string) ([]byte, int, int, bool) {
-	diskCacheOnce.Do(initDiskCache)
-	dir, path := diskKey(format, quality, url)
-	f, err := os.Open(path)
-	if err != nil {
-		return nil, 0, 0, false
-	}
-	defer f.Close()
-	header := make([]byte, 4)
-	if _, err := io.ReadFull(f, header); err != nil {
-		return nil, 0, 0, false
-	}
-	w := int(binary.BigEndian.Uint16(header[0:2]))
-	h := int(binary.BigEndian.Uint16(header[2:4]))
-	b, err := io.ReadAll(f)
-	if err != nil {
-		return nil, 0, 0, false
-	}
-	// touch mtime to approximate LRU
-	_ = os.Chtimes(path, time.Now(), time.Now())
-	_ = os.MkdirAll(dir, 0o755)
-	return b, w, h, true
-}
-
-func diskCachePut(format string, quality int, url string, data []byte, w, h int) {
-	diskCacheOnce.Do(initDiskCache)
-	dir, path := diskKey(format, quality, url)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return
-	}
-	tmp := path + ".tmp"
-	f, err := os.Create(tmp)
-	if err != nil {
-		return
-	}
-	var hdr [4]byte
-	binary.BigEndian.PutUint16(hdr[0:2], uint16(w))
-	binary.BigEndian.PutUint16(hdr[2:4], uint16(h))
-	_, _ = f.Write(hdr[:])
-	_, _ = f.Write(data)
-	_ = f.Close()
-	_ = os.Rename(tmp, path)
-	// async prune
-	go pruneDiskCache()
-}
-
-func pruneDiskCache() {
-	diskCacheMu.Lock()
-	defer diskCacheMu.Unlock()
-	// scan total size
-	var files []struct {
-		p  string
-		sz int64
-		mt time.Time
-	}
-	var total int64
-	filepath.WalkDir(diskCacheDir, func(p string, d fs.DirEntry, err error) error {
-		if err != nil {
-			return nil
-		}
-		if d.IsDir() {
-			return nil
-		}
-		if !strings.HasSuffix(strings.ToLower(p), ".bin") {
-			return nil
-		}
-		if info, e := d.Info(); e == nil {
-			files = append(files, struct {
-				p  string
-				sz int64
-				mt time.Time
-			}{p, info.Size(), info.ModTime()})
-			total += info.Size()
-		}
-		return nil
-	})
-	if total <= diskCacheMax || diskCacheMax <= 0 {
-		return
-	}
-	// sort by mtime asc
-	sort.Slice(files, func(i, j int) bool { return files[i].mt.Before(files[j].mt) })
-	for _, f := range files {
-		if total <= diskCacheMax {
-			break
-		}
-		_ = os.Remove(f.p)
-		total -= f.sz
-	}
-}
-
-// Version is the magic stored in the OMS header.
-const Version = 0x3218
-
-// Heuristic default text style for OM2 streams (no bold by default)
-const (
-	styleDefault   uint32 = 0x00000000
-	styleBoldBit   uint32 = 0x00000001
-	styleItalicBit uint32 = 0x00000004
-	styleUnderBit  uint32 = 0x00000008
-	styleCenterBit uint32 = 0x00000010
-	styleRightBit  uint32 = 0x00000020
-)
-
-// StyleDefault is an exported alias for external callers.
-const StyleDefault = styleDefault
-
-// Page represents loaded page data.
-// Data holds the final binary OMS representation.
-type Page struct {
-	Data        []byte
-	CachePacked []byte
-	tagCount    int
-	strCount    int
-	SetCookies  []string
-	partCur     int
-	partCnt     int
-}
-
-// NewPage allocates an empty page.
-func NewPage() *Page { return &Page{} }
-
-func (p *Page) addData(b []byte) { p.Data = append(p.Data, b...) }
-
-func (p *Page) addTag(tag byte) {
-	p.addData([]byte{tag})
-	p.tagCount++
-}
-
-// AddString stores a string prefixed with its big-endian length.
-func (p *Page) AddString(s string) {
-	var lenBuf [2]byte
-	binary.BigEndian.PutUint16(lenBuf[:], uint16(len(s)))
-	p.addData(lenBuf[:])
-	p.addData([]byte(s))
-	p.strCount++
-}
-
-func (p *Page) addAuthdata(data string, typ byte) {
-	p.addTag('k')
-	p.addData([]byte{typ})
-	p.AddString(data)
-}
-
-// AddAuthprefix adds an auth prefix tag.
-func (p *Page) AddAuthprefix(prefix string) { p.addAuthdata(prefix, 0) }
-
-// AddAuthcode adds an auth code tag.
-func (p *Page) AddAuthcode(code string) { p.addAuthdata(code, 1) }
-
-func ch(c byte) byte {
-	switch {
-	case c >= '0' && c <= '9':
-		return c - '0'
-	case c >= 'A' && c <= 'F':
-		return c - 'A' + 10
-	case c >= 'a' && c <= 'f':
-		return c - 'a' + 10
-	}
-	return 0
-}
-
-func calcColor(color string) uint16 {
-	if len(color) < 7 || color[0] != '#' {
-		return 0
-	}
-	r := (ch(color[1])<<4 | ch(color[2])) >> 3
-	g := (ch(color[3])<<4 | ch(color[4])) >> 2
-	b := (ch(color[5])<<4 | ch(color[6])) >> 3
-	return uint16(r) | uint16(g)<<5 | uint16(b)<<11
-}
-
-// Deprecated: do not use directly — use AddStyle(curStyle | (color<<8)) instead.
-func (p *Page) AddTextcolor(color string) {
-    p.AddStyle(uint32(calcColor(color)) << 8)
-}
-
-// AddStyle appends style information.
-func (p *Page) AddStyle(style uint32) {
-	p.addTag('S')
-	var buf [4]byte
-	binary.BigEndian.PutUint32(buf[:], style)
-	p.addData(buf[:])
-}
-
-// AddText appends text content.
-func (p *Page) AddText(text string) {
-	text = strings.TrimLeft(text, "\r\n")
-	if text == "" {
-		return
-	}
-	p.addTag('T')
-	p.AddString(text)
-}
-
-// AddBreak adds a line break tag.
-func (p *Page) AddBreak() { p.addTag('B') }
-
-// AddLink adds a hyperlink with accompanying text.
-func (p *Page) AddLink(url, text string) {
-	p.addTag('L')
-	p.AddString(url)
-	p.AddText(text)
-	p.AddBreak()
-	p.addTag('E')
-}
-
-// AddBgcolor sets the page background color.
-func (p *Page) AddBgcolor(color string) {
-	if color == "" {
-		return
-	}
-	safe := normalizeBgForBlackText(color)
-	if safe == "" {
-		safe = "#1a1a1a"
-	}
-	safe = ensureMinForRGB565(safe)
-	p.addTag('D')
-	var buf [2]byte
-	binary.BigEndian.PutUint16(buf[:], calcColor(safe))
-	p.addData(buf[:])
-}
-
-// AddHr writes a horizontal line (tag 'R') with optional color.
-// If color is empty, defaults to black (0).
-func (p *Page) AddHr(color string) {
-	p.addTag('R')
-	var c uint16
-	if color == "" {
-		c = 0
-	} else {
-		c = calcColor(color)
-	}
-	var buf [2]byte
-	binary.BigEndian.PutUint16(buf[:], c)
-	p.addData(buf[:])
-}
-
-// AddImagePlaceholder writes tag 'J' with width and height (uint16 BE).
-func (p *Page) AddImagePlaceholder(width, height int) {
-	if width < 0 {
-		width = 0
-	}
-	if height < 0 {
-		height = 0
-	}
-	p.addTag('J')
-	var buf [4]byte
-	binary.BigEndian.PutUint16(buf[0:2], uint16(width))
-	binary.BigEndian.PutUint16(buf[2:4], uint16(height))
-	p.addData(buf[:])
-}
-
-// AddImageInline writes tag 'I' (PNG/JPEG bytes) with dimensions.
-// The actual codec is implied by the client request (k=image/jpeg/png).
-func (p *Page) AddImageInline(width, height int, data []byte) {
-	if width < 0 {
-		width = 0
-	}
-	if height < 0 {
-		height = 0
-	}
-	p.addTag('I')
-	var hdr [8]byte
-	binary.BigEndian.PutUint16(hdr[0:2], uint16(width))
-	binary.BigEndian.PutUint16(hdr[2:4], uint16(height))
-	binary.BigEndian.PutUint16(hdr[4:6], uint16(len(data)))
-	// rsrvd
-	binary.BigEndian.PutUint16(hdr[6:8], 0)
-	p.addData(hdr[:])
-	p.addData(data)
-}
-
-// AddPlus inserts a block separator tag.
-func (p *Page) AddPlus() { p.addTag('+') }
-
-// AddParagraph inserts a paragraph tag.
-func (p *Page) AddParagraph() { p.addTag('V') }
-
-// AddForm begins a form description.
-func (p *Page) AddForm(action string) {
-	p.addTag('h')
-	if action == "" {
-		p.AddString("1")
-	} else {
-		p.AddString(action)
-	}
-	p.AddString("1")
-}
-
-// AddTextInput adds a text input field.
-func (p *Page) AddTextInput(name, value string) {
-	p.addTag('x')
-	// Config byte (protocol extension); keep 0 by default
-	p.addData([]byte{0})
-	p.AddString(name)
-	p.AddString(value)
-}
-
-// AddPassInput adds a password input field.
-func (p *Page) AddPassInput(name, value string) {
-	p.addTag('p')
-	p.AddString(name)
-	p.AddString(value)
-}
-
-// AddCheckbox adds a checkbox control: tag 'c' + name + value + 1-byte checked.
-func (p *Page) AddCheckbox(name, value string, checked bool) {
-	p.addTag('c')
-	p.AddString(name)
-	p.AddString(value)
-	if checked {
-		p.addData([]byte{1})
-	} else {
-		p.addData([]byte{0})
-	}
-}
-
-func (p *Page) AddSubmit(name, value string) {
-	p.addTag('u')
-	p.AddString(name)
-	p.AddString(value)
-}
-
-// AddRadio adds a radio button field (name, value, checked).
-func (p *Page) AddRadio(name, value string, checked bool) {
-	p.addTag('r')
-	p.AddString(name)
-	p.AddString(value)
-	if checked {
-		p.addData([]byte{1})
-	} else {
-		p.addData([]byte{0})
-	}
-}
-
-// AddHidden adds a hidden input field.
-func (p *Page) AddHidden(name, value string) {
-	p.addTag('i')
-	p.AddString(name)
-	p.AddString(value)
-}
-
-// BeginSelect starts a select control (name, multiple, option count).
-func (p *Page) BeginSelect(name string, multiple bool, count int) {
-	p.addTag('s')
-	p.AddString(name)
-	if multiple {
-		p.addData([]byte{1})
-	} else {
-		p.addData([]byte{0})
-	}
-	var buf [2]byte
-	binary.BigEndian.PutUint16(buf[:], uint16(count))
-	p.addData(buf[:])
-}
-
-// AddOption appends an option to the current select control.
-// Order per client reader: value first, then label, then selected flag.
-func (p *Page) AddOption(value, label string, selected bool) {
-	p.addTag('o')
-	p.AddString(value)
-	p.AddString(label)
-	if selected {
-		p.addData([]byte{1})
-	} else {
-		p.addData([]byte{0})
-	}
-}
-
-// EndSelect closes a select block.
-func (p *Page) EndSelect() { p.addTag('l') }
-
-// AddButton adds a generic button control.
-func (p *Page) AddButton(name, value string) {
-	p.addTag('b')
-	p.AddString(name)
-	p.AddString(value)
-}
-
-// AddReset adds a reset button control.
-func (p *Page) AddReset(name, value string) {
-	p.addTag('e')
-	p.AddString(name)
-	p.AddString(value)
-}
-
-type v2Header struct {
-	Res1        [9]uint16
-	TagCount    uint16
-	PartCurrent uint16
-	PartCount   uint16
-	Res2        uint16
-	StagCount   uint16
-	Res3        uint16
-	Res4        uint8
-	Cachable    uint16
-	Res5        uint16
-}
-
-func (p *Page) finalize() {
-	// Append end-of-page marker like the C implementation
-	p.addTag('Q')
-	// Derive TagCount by scanning payload to avoid mismatches
-	base := computeTagCount(p.Data)
-	cnt := adjustTagCount(base)
-	// If no override set, bump by +1 to avoid OM2 AIOOBE on some pages
-	if os.Getenv("OMS_TAGCOUNT_MODE") == "" && os.Getenv("OMS_TAGCOUNT_DELTA") == "" {
-		cnt++
-	}
-
-	// Derive string count and use swapped value for robust client handling
-	stag := p.strCount + 1
-
-	// РџРѕРјРѕС‰РЅРёРє РґР»СЏ "СЃРІРѕРїР°" РєР°Рє Сѓ TagCount:
-	swap16 := func(v int) uint16 {
-		x := uint16(v & 0xFFFF)
-		return (x<<8)&0xFF00 | (x>>8)&0x00FF
-	}
-
-	pc := 1
-	pt := 1
-	if p.partCur > 0 {
-		pc = p.partCur
-	}
-	if p.partCnt > 0 {
-		pt = p.partCnt
-	}
-
-	v2 := v2Header{
-		// TagCount matches legacy C implementation and includes the final 'Q'
-		TagCount:    swap16(cnt),
-		PartCurrent: swap16(pc),
-		PartCount:   swap16(pt),
-		StagCount:   swap16(stag),
-		Cachable:    0xFFFF,
-	}
-
-	var comp bytes.Buffer
-	w, _ := flate.NewWriter(&comp, flate.DefaultCompression)
-	_ = binary.Write(w, binary.LittleEndian, &v2)
-	w.Write(p.Data)
-	w.Close()
-	size := 6 + comp.Len()
-	header := make([]byte, 6)
-	binary.LittleEndian.PutUint16(header[:2], Version)
-	binary.BigEndian.PutUint32(header[2:], uint32(size))
-	p.Data = append(header, comp.Bytes()...)
-}
-
-// Normalize ensures the final OMS payload strictly follows conservative
-// compatibility rules used by test pages: last tag 'Q', tag_count = parsed+1,
-// stag_count = 0x0400. It rewrites the V2 header if necessary.
-func (p *Page) Normalize() {
-	nb, err := NormalizeOMS(p.Data)
-	if err == nil && nb != nil {
-		p.Data = nb
-	}
-}
-
-// NormalizeOMS adjusts an OMS response bytes.
-func NormalizeOMS(b []byte) ([]byte, error) {
-	if len(b) < 6 {
-		return b, nil
-	}
-	if binary.LittleEndian.Uint16(b[:2]) != Version {
-		return b, nil
-	}
-	// Inflate body
-	fr := flate.NewReader(bytes.NewReader(b[6:]))
-	dec, err := io.ReadAll(fr)
-	fr.Close()
-	if err != nil {
-		return b, nil
-	}
-	if len(dec) < 35 {
-		return b, nil
-	}
-
-	// Ensure payload ends with 'Q'
-	if dec[len(dec)-1] != 'Q' {
-		dec = append(dec, 'Q')
-	}
-
-	// Compute tag count from dec stream
-	parsed := parseTagCountFromDec(dec)
-	if parsed < 1 {
-		parsed = 1
-	}
-	wantCnt := parsed + 1 // conservative +1
-	// Overwrite tag_count (byte-swapped) at V2 offset 18:20 (LE field)
-	swap := func(v uint16) uint16 { return (v<<8)&0xFF00 | (v>>8)&0x00FF }
-	binary.LittleEndian.PutUint16(dec[18:20], swap(uint16(wantCnt)))
-	// Force stag_count to legacy-friendly 0x0400
-	binary.LittleEndian.PutUint16(dec[26:28], swap(uint16(0x0400)))
-	// Preserve other header fields from finalize
-
-	// Repack: deflate + write common header
-	var comp bytes.Buffer
-	w, _ := flate.NewWriter(&comp, flate.DefaultCompression)
-	_, _ = w.Write(dec)
-	_ = w.Close()
-	size := 6 + comp.Len()
-	header := make([]byte, 6)
-	binary.LittleEndian.PutUint16(header[:2], Version)
-	binary.BigEndian.PutUint32(header[2:], uint32(size))
-	out := append(header, comp.Bytes()...)
-	return out, nil
-}
-
-// parseTagCountFromDec walks the inflated stream (starting with V2 header)
-// and returns number of tags in the payload.
-func parseTagCountFromDec(dec []byte) int {
-	if len(dec) < 35 {
-		return 0
-	}
-	p := 35
-	// Skip initial page URL string (len + bytes)
-	if p+2 <= len(dec) {
-		l := int(binary.BigEndian.Uint16(dec[p : p+2]))
-		p += 2 + l
-	}
-	n := 0
-	limit := len(dec)
-	for p < limit {
-		tag := dec[p]
-		n++
-		p++
-		switch tag {
-		case 'T':
-			if p+2 > limit {
-				return n
-			}
-			l := int(binary.BigEndian.Uint16(dec[p : p+2]))
-			p += 2 + l
-		case 'L':
-			if p+2 > limit {
-				return n
-			}
-			l := int(binary.BigEndian.Uint16(dec[p : p+2]))
-			p += 2 + l
-		case 'E', 'B', '+', 'V', 'Q', 'l':
-		case 'D':
-			p += 2
-		case 'R':
-			p += 2
-		case 'S':
-			p += 4
-		case 'J':
-			p += 4
-		case 'I':
-			if p+8 > limit {
-				return n
-			}
-			dl := int(binary.BigEndian.Uint16(dec[p+4 : p+6]))
-			p += 8 + dl
-		case 'k':
-			p += 1
-			if p+2 > limit {
-				return n
-			}
-			l := int(binary.BigEndian.Uint16(dec[p : p+2]))
-			p += 2 + l
-		case 'h':
-			for i := 0; i < 2; i++ {
-				if p+2 > limit {
-					return n
-				}
-				l := int(binary.BigEndian.Uint16(dec[p : p+2]))
-				p += 2 + l
-			}
-		case 'x':
-			p += 1
-			for i := 0; i < 2; i++ {
-				if p+2 > limit {
-					return n
-				}
-				l := int(binary.BigEndian.Uint16(dec[p : p+2]))
-				p += 2 + l
-			}
-		case 'p', 'u', 'i', 'b', 'e':
-			for i := 0; i < 2; i++ {
-				if p+2 > limit {
-					return n
-				}
-				l := int(binary.BigEndian.Uint16(dec[p : p+2]))
-				p += 2 + l
-			}
-		case 'c', 'r':
-			for i := 0; i < 2; i++ {
-				if p+2 > limit {
-					return n
-				}
-				l := int(binary.BigEndian.Uint16(dec[p : p+2]))
-				p += 2 + l
-			}
-			p += 1
-		case 's':
-			if p+2 > limit {
-				return n
-			}
-			l := int(binary.BigEndian.Uint16(dec[p : p+2]))
-			p += 2 + l
-			if p+1 > limit {
-				return n
-			}
-			p += 1
-			if p+2 > limit {
-				return n
-			}
-			_ = int(binary.BigEndian.Uint16(dec[p : p+2]))
-			p += 2
-		case 'o':
-			for i := 0; i < 2; i++ {
-				if p+2 > limit {
-					return n
-				}
-				l := int(binary.BigEndian.Uint16(dec[p : p+2]))
-				p += 2 + l
-			}
-			p += 1
-		default:
-			return n
-		}
-	}
-	return n
-}
-
-// computeTagCount scans the payload (p.Data) and counts tags conservatively.
-// It skips the initial OMS_STRING with page URL and then walks tagged payload.
-func computeTagCount(b []byte) int {
-	if len(b) < 2 {
-		return 0
-	}
-	p := 0
-	// Skip initial URL string
-	l := int(binary.BigEndian.Uint16(b[p : p+2]))
-	p += 2 + l
-	n := 0
-	limit := len(b)
-	for p < limit {
-		tag := b[p]
-		n++
-		p++
-		switch tag {
-		case 'T':
-			if p+2 > limit {
-				return n
-			}
-			l := int(binary.BigEndian.Uint16(b[p : p+2]))
-			p += 2 + l
-		case 'L':
-			if p+2 > limit {
-				return n
-			}
-			l := int(binary.BigEndian.Uint16(b[p : p+2]))
-			p += 2 + l
-		case 'E', 'B', '+', 'V', 'Q', 'l':
-			// no payload
-		case 'D':
-			p += 2
-		case 'R':
-			p += 2
-		case 'S':
-			p += 4
-		case 'J':
-			p += 4
-		case 'I':
-			if p+8 > limit {
-				return n
-			}
-			dl := int(binary.BigEndian.Uint16(b[p+4 : p+6]))
-			p += 8 + dl
-		case 'k':
-			p += 1 // type
-			if p+2 > limit {
-				return n
-			}
-			l := int(binary.BigEndian.Uint16(b[p : p+2]))
-			p += 2 + l
-		case 'h':
-			// two strings
-			for i := 0; i < 2; i++ {
-				if p+2 > limit {
-					return n
-				}
-				l := int(binary.BigEndian.Uint16(b[p : p+2]))
-				p += 2 + l
-			}
-		case 'x':
-			p += 1 // cfg
-			for i := 0; i < 2; i++ {
-				if p+2 > limit {
-					return n
-				}
-				l := int(binary.BigEndian.Uint16(b[p : p+2]))
-				p += 2 + l
-			}
-		case 'p', 'u', 'i', 'b', 'e':
-			for i := 0; i < 2; i++ {
-				if p+2 > limit {
-					return n
-				}
-				l := int(binary.BigEndian.Uint16(b[p : p+2]))
-				p += 2 + l
-			}
-		case 'c', 'r':
-			for i := 0; i < 2; i++ {
-				if p+2 > limit {
-					return n
-				}
-				l := int(binary.BigEndian.Uint16(b[p : p+2]))
-				p += 2 + l
-			}
-			p += 1 // checked
-		case 's':
-			if p+2 > limit {
-				return n
-			}
-			l := int(binary.BigEndian.Uint16(b[p : p+2]))
-			p += 2 + l // name
-			if p+1 > limit {
-				return n
-			}
-			p += 1 // multiple
-			if p+2 > limit {
-				return n
-			}
-			_ = int(binary.BigEndian.Uint16(b[p : p+2]))
-			p += 2
-		case 'o':
-			// value, label, selected
-			for i := 0; i < 2; i++ {
-				if p+2 > limit {
-					return n
-				}
-				l := int(binary.BigEndian.Uint16(b[p : p+2]))
-				p += 2 + l
-			}
-			p += 1
-		default:
-			// Unknown tag: stop counting
-			return n
-		}
-	}
-	return n
-}
-
-func adjustTagCount(base int) int {
-	// Strategy selection via env OMS_TAGCOUNT_MODE: exact|exclude_q|plus1|plus2
-	// Or numeric delta via OMS_TAGCOUNT_DELTA (>=0)
-	if m := os.Getenv("OMS_TAGCOUNT_MODE"); m != "" {
-		switch m {
-		case "exact":
-			return base
-		case "exclude_q":
-			if base > 0 {
-				return base - 1
-			}
-			return base
-		case "plus1":
-			return base + 1
-		case "plus2":
-			return base + 2
-		}
-	}
-	if s := os.Getenv("OMS_TAGCOUNT_DELTA"); s != "" {
-		if v, err := strconv.Atoi(s); err == nil && v >= 0 {
-			return base + v
-		}
-	}
-	// Р”Р»СЏ Opera Mini 2.06 РЅСѓР¶РµРЅ С‚РѕС‡РЅС‹Р№ СЃС‡С‘С‚С‡РёРє (РІРєР»СЋС‡Р°СЏ С„РёРЅР°Р»СЊРЅС‹Р№ 'Q')
-	return base
-}
-
-// Finalize exposes page finalization for external callers.
-// It wraps the internal finalize to build the complete OMS payload.
-func (p *Page) Finalize() { p.finalize() }
-
-// ---------------------- Pagination helpers ----------------------
 
 // splitByTags splits a raw payload (without V2 header) into parts with at most
 // maxTags tags each. Each part starts with the original leading OMS string (URL).
@@ -1397,8 +581,6 @@ func imgCachePut(format string, quality int, url string, data []byte, w, h int) 
 
 func addHeader(p *Page) {
 	p.AddString("1/internal:error")
-	p.AddAuthcode("c37c206d2c235978d086b64c39a2fc17df68dbdd5dc04dd8b199177f95be6181")
-	p.AddAuthprefix("t19-12")
 	p.AddStyle(styleDefault)
 	p.AddPlus()
 	p.AddText("Internal server error")
@@ -1602,8 +784,6 @@ func LoadPageWithHeaders(oURL string, hdr http.Header) (*Page, error) {
 	p := NewPage()
 	// Prefix page URL with "1/" as in legacy streams for better client compatibility
 	p.AddString("1/" + oURL)
-	p.AddAuthcode("c37c206d2c235978d086b64c39a2fc17df68dbdd5dc04dd8b199177f95be6181")
-	p.AddAuthprefix("t19-12")
 	p.AddStyle(styleDefault)
 	base := oURL
 	if i := strings.Index(base, "?"); i != -1 {
@@ -1623,15 +803,9 @@ func looksLikeOMS(b []byte) bool {
 	if len(b) < 8 {
 		return false
 	}
-	if binary.LittleEndian.Uint16(b[:2]) != Version {
-		return false
-	}
-	// Optional size sanity: match length if reasonable
-	// Some producers may not set it exactly; ignore mismatch.
-	// Try to inflate body and verify last tag is 'Q'.
-	fr := flate.NewReader(bytes.NewReader(b[6:]))
-	dec, err := io.ReadAll(fr)
-	fr.Close()
+	headerWord := binary.LittleEndian.Uint16(b[:2])
+	compression := compressionFromHeaderByte(byte(headerWord >> 8))
+	dec, err := decompressPayload(compression, b[6:])
 	if err != nil || len(dec) == 0 {
 		return false
 	}
@@ -1736,8 +910,9 @@ type walkState struct {
 type RenderOptions struct {
 	ImagesOn      bool
 	HighQuality   bool
-	ImageMIME     string         // e.g. "image/jpeg", "image/png"
-	MaxInlineKB   int            // max kilobytes for inline image ('I') before falling back to placeholder
+	ImageMIME     string // e.g. "image/jpeg", "image/png"
+	MaxInlineKB   int    // max kilobytes for inline image ('I') before falling back to placeholder
+	Compression   CompressionMethod
 	ReqHeaders    http.Header    // copy of page request headers (UA, Lang, Cookies)
 	Referrer      string         // page URL for Referer
 	OriginCookies string         // cookies set by origin page (name=value; ...)
@@ -1759,6 +934,7 @@ type RenderOptions struct {
 	ServerBase    string
 	Styles        *Stylesheet
 	WantFullCache bool
+	ClientVersion ClientVersion
 }
 
 // BuildPaginationQuery encodes paging parameters while preserving render options that affect output quality.
@@ -1823,7 +999,14 @@ func isLegacyOperaMiniUA(ua string) bool {
 
 func defaultRenderPrefs() RenderOptions {
 	// Default pagination disabled; can be overridden via env in loader
-	return RenderOptions{ImagesOn: false, HighQuality: false, ImageMIME: "image/jpeg", MaxInlineKB: 96}
+	return RenderOptions{
+		ImagesOn:      false,
+		HighQuality:   false,
+		ImageMIME:     "image/jpeg",
+		MaxInlineKB:   96,
+		Compression:   CompressionDeflate,
+		ClientVersion: ClientVersion2,
+	}
 }
 func (s *walkState) pushList(kind string) { s.lists = append(s.lists, listCtx{kind: kind}) }
 func (s *walkState) popList() {
@@ -1839,54 +1022,54 @@ func (s *walkState) currentList() *listCtx {
 }
 
 func (s *walkState) pushStyle(p *Page, style uint32) {
-    s.styleStack = append(s.styleStack, s.curStyle)
-    s.curStyle = style
-    var colorPart uint32
-    if s.curColor != "" {
-        colorPart = uint32(calcColor(s.curColor)) << 8
-    }
-    p.AddStyle(style | colorPart)
+	s.styleStack = append(s.styleStack, s.curStyle)
+	s.curStyle = style
+	var colorPart uint32
+	if s.curColor != "" {
+		colorPart = uint32(calcColor(s.curColor)) << 8
+	}
+	p.AddStyle(style | colorPart)
 }
 
 func (s *walkState) popStyle(p *Page) {
-    if len(s.styleStack) == 0 {
-        return
-    }
-    s.curStyle = s.styleStack[len(s.styleStack)-1]
-    s.styleStack = s.styleStack[:len(s.styleStack)-1]
-    var colorPart uint32
-    if s.curColor != "" {
-        colorPart = uint32(calcColor(s.curColor)) << 8
-    }
-    p.AddStyle(s.curStyle | colorPart)
+	if len(s.styleStack) == 0 {
+		return
+	}
+	s.curStyle = s.styleStack[len(s.styleStack)-1]
+	s.styleStack = s.styleStack[:len(s.styleStack)-1]
+	var colorPart uint32
+	if s.curColor != "" {
+		colorPart = uint32(calcColor(s.curColor)) << 8
+	}
+	p.AddStyle(s.curStyle | colorPart)
 }
 
 func (s *walkState) pushColor(p *Page, hex string) {
-    s.colorStack = append(s.colorStack, s.curColor)
-    s.curColor = hex
-    if hex != "" {
-        cur := s.curStyle
-        if len(s.styleStack) > 0 {
-            cur = s.styleStack[len(s.styleStack)-1]
-        }
-        p.AddStyle(cur | (uint32(calcColor(hex)) << 8))
-    }
+	s.colorStack = append(s.colorStack, s.curColor)
+	s.curColor = hex
+	if hex != "" {
+		cur := s.curStyle
+		if len(s.styleStack) > 0 {
+			cur = s.styleStack[len(s.styleStack)-1]
+		}
+		p.AddStyle(cur | (uint32(calcColor(hex)) << 8))
+	}
 }
 
 func (s *walkState) popColor(p *Page) {
-    if len(s.colorStack) == 0 {
-        return
-    }
-    prev := s.colorStack[len(s.colorStack)-1]
-    s.colorStack = s.colorStack[:len(s.colorStack)-1]
-    s.curColor = prev
-    cur := s.curStyle
-    if len(s.styleStack) > 0 {
-        cur = s.styleStack[len(s.styleStack)-1]
-    }
-    if prev != "" {
-        p.AddStyle(cur | (uint32(calcColor(prev)) << 8))
-    }
+	if len(s.colorStack) == 0 {
+		return
+	}
+	prev := s.colorStack[len(s.colorStack)-1]
+	s.colorStack = s.colorStack[:len(s.colorStack)-1]
+	s.curColor = prev
+	cur := s.curStyle
+	if len(s.styleStack) > 0 {
+		cur = s.styleStack[len(s.styleStack)-1]
+	}
+	if prev != "" {
+		p.AddStyle(cur | (uint32(calcColor(prev)) << 8))
+	}
 }
 
 func isDisplayNone(style string) bool {
@@ -1948,6 +1131,235 @@ func parseCssTextAlign(style string) string {
 	return ""
 }
 
+func hasClass(n *html.Node, want string) bool {
+	want = strings.ToLower(strings.TrimSpace(want))
+	if want == "" {
+		return false
+	}
+	classes := strings.Fields(strings.ToLower(getAttr(n, "class")))
+	for _, c := range classes {
+		if c == want {
+			return true
+		}
+	}
+	return false
+}
+
+func hasAnyClass(n *html.Node, classes ...string) bool {
+	for _, cls := range classes {
+		if hasClass(n, cls) {
+			return true
+		}
+	}
+	return false
+}
+
+func parseCssValue(style, prop string) string {
+	if style == "" {
+		return ""
+	}
+	prop = strings.ToLower(strings.TrimSpace(prop))
+	if prop == "" {
+		return ""
+	}
+	for _, part := range strings.Split(style, ";") {
+		kv := strings.SplitN(part, ":", 2)
+		if len(kv) != 2 {
+			continue
+		}
+		key := strings.ToLower(strings.TrimSpace(kv[0]))
+		if key != prop {
+			continue
+		}
+		return strings.TrimSpace(kv[1])
+	}
+	return ""
+}
+
+func stripCssImportant(val string) string {
+	trimmed := strings.TrimSpace(val)
+	lower := strings.ToLower(trimmed)
+	if strings.HasSuffix(lower, "!important") {
+		return strings.TrimSpace(trimmed[:len(trimmed)-len("!important")])
+	}
+	return trimmed
+}
+
+func cssPropValue(props map[string]string, inline, prop string) string {
+	if prop == "" {
+		return ""
+	}
+	key := strings.ToLower(prop)
+	if props != nil {
+		if v := strings.TrimSpace(props[key]); v != "" {
+			return stripCssImportant(v)
+		}
+	}
+	if inline != "" {
+		if v := parseCssValue(inline, key); v != "" {
+			return stripCssImportant(v)
+		}
+	}
+	return ""
+}
+
+func extractBackgroundImageURL(value string) string {
+	v := strings.TrimSpace(value)
+	if v == "" {
+		return ""
+	}
+	lower := strings.ToLower(v)
+	searchIdx := 0
+	for {
+		idx := strings.Index(lower[searchIdx:], "url(")
+		if idx == -1 {
+			return ""
+		}
+		idx += searchIdx
+		start := idx + 4
+		depth := 1
+		end := start
+		for end < len(v) && depth > 0 {
+			switch v[end] {
+			case '(':
+				depth++
+			case ')':
+				depth--
+				if depth == 0 {
+					raw := strings.TrimSpace(v[start:end])
+					raw = strings.Trim(raw, "\"'")
+					if raw != "" && !strings.EqualFold(raw, "none") {
+						return raw
+					}
+				}
+			}
+			end++
+		}
+		if depth > 0 || end >= len(v) {
+			return ""
+		}
+		searchIdx = end
+		if searchIdx >= len(v) {
+			return ""
+		}
+	}
+}
+
+func cssValueToPx(val string, base int) int {
+	val = stripCssImportant(val)
+	if val == "" {
+		return 0
+	}
+	px, ok := cssLengthToPx(val, base)
+	if !ok || px <= 0 {
+		return 0
+	}
+	return px
+}
+
+func hasTextContent(n *html.Node) bool {
+	if n == nil {
+		return false
+	}
+	for c := n.FirstChild; c != nil; c = c.NextSibling {
+		if c.Type == html.TextNode && strings.TrimSpace(c.Data) != "" {
+			return true
+		}
+		if c.Type == html.ElementNode {
+			switch strings.ToLower(c.Data) {
+			case "script", "style", "noscript":
+				continue
+			}
+			if hasTextContent(c) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func renderBackgroundImage(n *html.Node, props map[string]string, base string, p *Page, prefs RenderOptions) bool {
+	if n == nil || p == nil || !prefs.ImagesOn {
+		return false
+	}
+	inlineStyle := getAttr(n, "style")
+	bgVal := cssPropValue(props, inlineStyle, "background-image")
+	if bgVal == "" {
+		bgVal = cssPropValue(props, inlineStyle, "background")
+	}
+	if bgVal == "" {
+		return false
+	}
+	urlVal := extractBackgroundImageURL(bgVal)
+	if urlVal == "" {
+		return false
+	}
+	tag := strings.ToLower(n.Data)
+	inlineCandidate := tag == "span" || tag == "a" || tag == "i" || tag == "b" || tag == "strong" || tag == "em"
+	if !inlineCandidate && !hasClass(n, "balls") {
+		return false
+	}
+	if hasTextContent(n) {
+		return false
+	}
+	repeat := strings.ToLower(cssPropValue(props, inlineStyle, "background-repeat"))
+	if repeat != "" && repeat != "no-repeat" && repeat != "initial" {
+		return false
+	}
+	widthHint := cssValueToPx(cssPropValue(props, inlineStyle, "width"), prefs.ScreenW)
+	heightHint := cssValueToPx(cssPropValue(props, inlineStyle, "height"), prefs.ScreenH)
+	if (widthHint > maxInlineBackgroundSize || heightHint > maxInlineBackgroundSize) && !hasClass(n, "balls") {
+		return false
+	}
+	abs := urlVal
+	if !strings.HasPrefix(urlVal, "data:") {
+		if base != "" {
+			if resolved := resolveAbsURL(base, urlVal); resolved != "" {
+				abs = resolved
+			}
+		}
+		if !strings.Contains(abs, "://") && !strings.HasPrefix(abs, "data:") {
+			return false
+		}
+	}
+	data, w, h, ok := fetchAndEncodeImage(abs, prefs)
+	if !ok {
+		return false
+	}
+	if widthHint <= 0 {
+		widthHint = w
+	}
+	if heightHint <= 0 {
+		heightHint = h
+	}
+	if widthHint <= 0 || heightHint <= 0 {
+		return false
+	}
+	if widthHint > maxInlineBackgroundSize || heightHint > maxInlineBackgroundSize {
+		return false
+	}
+	if prefs.MaxInlineKB > 0 && len(data) > prefs.MaxInlineKB*1024 {
+		return false
+	}
+	p.AddImageInline(widthHint, heightHint, data)
+	return true
+}
+
+func resetComputedStyles(st *walkState, p *Page, colorPushed *bool, stylePushed *bool, alignedPushed *bool) {
+	if *colorPushed {
+		st.popColor(p)
+		*colorPushed = false
+	}
+	if *stylePushed {
+		st.popStyle(p)
+		*stylePushed = false
+	}
+	if *alignedPushed {
+		st.popStyle(p)
+		*alignedPushed = false
+	}
+}
+
 func condenseSpaces(s string) string {
 	s = strings.ReplaceAll(strings.ReplaceAll(s, "\n", " "), "\r", " ")
 	if !strings.Contains(s, "  ") {
@@ -1973,629 +1385,899 @@ func condenseSpaces(s string) string {
 func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool, st *walkState, prefs RenderOptions) {
 	for c := cur; c != nil; c = c.NextSibling {
 		recurse := true
+		var colorPushed bool
+		var stylePushed bool
+		var alignedPushed bool
+		var bgRendered bool
 		if c.Type == html.ElementNode {
 			// Skip hidden elements
 			if stAttr := getAttr(c, "style"); stAttr != "" && isDisplayNone(stAttr) {
 				continue
 			}
 			// Apply computed CSS: honor display:none, text-align and color (from stylesheet)
-			alignedPushed := false
-			colorPushed := false
+			var props map[string]string
 			if st.css != nil {
-				if props := computeStyleFor(c, st.css); props != nil {
-					if strings.Contains(props["display"], "none") {
-						continue
-					}
-					switch strings.ToLower(strings.TrimSpace(props["text-align"])) {
-					case "center":
-						st.pushStyle(p, st.curStyle|styleCenterBit)
-						alignedPushed = true
-					case "right":
-						st.pushStyle(p, st.curStyle|styleRightBit)
-						alignedPushed = true
-					}
-					if col := strings.TrimSpace(props["color"]); col != "" {
-						st.pushColor(p, col)
-						colorPushed = true
-					}
-				}
-			}
-			tag := strings.ToLower(c.Data)
-			if handler, ok := extraHTML4Handlers[tag]; ok {
-				ctx := elementContext{node: c, base: base, page: p, visited: visited, state: st, prefs: prefs}
-				if handler(&ctx) {
+				props = computeStyleFor(c, st.css)
+				if props != nil && strings.Contains(props["display"], "none") {
 					continue
 				}
 			}
-			switch tag {
-			case "html", "head":
-			case "title":
+			bgRendered = renderBackgroundImage(c, props, base, p, prefs)
+			if props != nil {
+				switch strings.ToLower(strings.TrimSpace(props["text-align"])) {
+				case "center":
+					st.pushStyle(p, st.curStyle|styleCenterBit)
+					alignedPushed = true
+				case "right":
+					st.pushStyle(p, st.curStyle|styleRightBit)
+					alignedPushed = true
+				}
+				styleOverride := st.curStyle
+				styleChanged := false
+				if weight := strings.TrimSpace(props["font-weight"]); weight != "" {
+					lw := strings.ToLower(weight)
+					switch {
+					case strings.Contains(lw, "bold"), strings.Contains(lw, "bolder"):
+						if styleOverride&styleBoldBit == 0 {
+							styleOverride |= styleBoldBit
+							styleChanged = true
+						}
+					case strings.Contains(lw, "normal"), strings.Contains(lw, "lighter"):
+						if styleOverride&styleBoldBit != 0 {
+							styleOverride &^= styleBoldBit
+							styleChanged = true
+						}
+					default:
+						if n, err := strconv.Atoi(lw); err == nil {
+							if n >= 600 {
+								if styleOverride&styleBoldBit == 0 {
+									styleOverride |= styleBoldBit
+									styleChanged = true
+								}
+							} else if n > 0 && styleOverride&styleBoldBit != 0 {
+								styleOverride &^= styleBoldBit
+								styleChanged = true
+							}
+						}
+					}
+				}
+				if fs := strings.ToLower(strings.TrimSpace(props["font-style"])); fs != "" {
+					if strings.Contains(fs, "italic") || strings.Contains(fs, "oblique") {
+						if styleOverride&styleItalicBit == 0 {
+							styleOverride |= styleItalicBit
+							styleChanged = true
+						}
+					} else if strings.Contains(fs, "normal") {
+						if styleOverride&styleItalicBit != 0 {
+							styleOverride &^= styleItalicBit
+							styleChanged = true
+						}
+					}
+				}
+				if td := strings.ToLower(strings.TrimSpace(props["text-decoration"])); td != "" {
+					if strings.Contains(td, "underline") {
+						if styleOverride&styleUnderBit == 0 {
+							styleOverride |= styleUnderBit
+							styleChanged = true
+						}
+					} else if strings.Contains(td, "none") {
+						if styleOverride&styleUnderBit != 0 {
+							styleOverride &^= styleUnderBit
+							styleChanged = true
+						}
+					}
+				}
+				if styleChanged && styleOverride != st.curStyle {
+					st.pushStyle(p, styleOverride)
+					stylePushed = true
+				}
+				if col := strings.TrimSpace(props["color"]); col != "" {
+					st.pushColor(p, col)
+					colorPushed = true
+				}
+			}
+		}
+		tag := strings.ToLower(c.Data)
+		if handler, ok := extraHTML4Handlers[tag]; ok {
+			ctx := elementContext{node: c, base: base, page: p, visited: visited, state: st, prefs: prefs}
+			if handler(&ctx) {
+				continue
+			}
+		}
+		switch tag {
+		case "html", "head":
+		case "title":
+			if t := findTextNode(c, visited); t != nil {
+				visited[t] = true
+				p.AddPlus()
+				p.AddText(strings.TrimSpace(t.Data))
+				p.AddBreak()
+			}
+		case "body":
+			if l := getAttr(c, "bgcolor"); l != "" {
+				p.AddBgcolor(l)
+			}
+			if l := cssToHex(getAttr(c, "text")); l != "" {
+				p.AddTextcolor(l)
+				st.curColor = l
+			}
+			if stl := getAttr(c, "style"); stl != "" {
+				if col := parseCssColor(stl, "background-color"); col != "" {
+					p.AddBgcolor(col)
+				}
+				if col := parseCssColor(stl, "color"); col != "" {
+					p.AddTextcolor(col)
+					st.curColor = col
+				}
+			}
+		case "br":
+			p.AddBreak()
+		case "hr":
+			p.AddHr(getAttr(c, "color"))
+		case "p":
+			p.AddParagraph()
+		case "h1", "h2", "h3", "h4", "h5", "h6":
+			// Prefer full collected text; fallback to first text node
+			txt := strings.TrimSpace(collectText(c))
+			if txt == "" {
 				if t := findTextNode(c, visited); t != nil {
 					visited[t] = true
-					p.AddPlus()
-					p.AddText(strings.TrimSpace(t.Data))
-					p.AddBreak()
+					txt = strings.TrimSpace(t.Data)
 				}
-			case "body":
-				if l := getAttr(c, "bgcolor"); l != "" {
-					p.AddBgcolor(l)
-				}
-				if l := cssToHex(getAttr(c, "text")); l != "" {
-					p.AddTextcolor(l)
-					st.curColor = l
-				}
-				if stl := getAttr(c, "style"); stl != "" {
-					if col := parseCssColor(stl, "background-color"); col != "" {
-						p.AddBgcolor(col)
-					}
-					if col := parseCssColor(stl, "color"); col != "" {
-						p.AddTextcolor(col)
-						st.curColor = col
-					}
-				}
-			case "br":
-				p.AddBreak()
-			case "hr":
-				p.AddHr(getAttr(c, "color"))
-			case "p":
-				p.AddParagraph()
-			case "h1", "h2", "h3", "h4", "h5", "h6":
-				// Prefer full collected text; fallback to first text node
-				txt := strings.TrimSpace(collectText(c))
-				if txt == "" {
-					if t := findTextNode(c, visited); t != nil {
-						visited[t] = true
-						txt = strings.TrimSpace(t.Data)
-					}
-				}
-				if txt != "" {
-					p.AddPlus()
-					// Emphasize headings
-					st.pushStyle(p, st.curStyle|styleBoldBit)
-					p.AddText(txt)
-					st.popStyle(p)
-					p.AddBreak()
-				}
-				// Do not recurse into heading children to avoid duplicate text
-				recurse = false
-			case "div", "section", "article", "header", "footer", "main", "nav", "aside":
-				p.AddParagraph()
-			case "b", "strong":
+			}
+			if txt != "" {
+				p.AddPlus()
+				// Emphasize headings
 				st.pushStyle(p, st.curStyle|styleBoldBit)
+				p.AddText(txt)
+				st.popStyle(p)
+				p.AddBreak()
+			}
+			// Do not recurse into heading children to avoid duplicate text
+			recurse = false
+		case "div", "section", "article", "header", "footer", "main", "nav", "aside":
+			if hasClass(c, "p") {
+				resetComputedStyles(st, p, &colorPushed, &stylePushed, &alignedPushed)
+				st.pushColor(p, "#007700")
+				p.AddPlus()
 				if c.FirstChild != nil {
 					walkRich(c.FirstChild, base, p, visited, st, prefs)
 				}
-				st.popStyle(p)
-				recurse = false
-			case "i", "em":
-				st.pushStyle(p, st.curStyle|styleItalicBit)
+				st.popColor(p)
+				p.AddBreak()
+				continue
+			}
+			if hasAnyClass(c, "ts", "tsb", "tso") {
+				resetComputedStyles(st, p, &colorPushed, &stylePushed, &alignedPushed)
+				st.pushColor(p, "#aaaaaa")
 				if c.FirstChild != nil {
 					walkRich(c.FirstChild, base, p, visited, st, prefs)
 				}
-				st.popStyle(p)
-				recurse = false
-			case "u":
-				st.pushStyle(p, st.curStyle|styleUnderBit)
-				if c.FirstChild != nil {
-					walkRich(c.FirstChild, base, p, visited, st, prefs)
-				}
-				st.popStyle(p)
-				recurse = false
-			case "small":
-				st.pushStyle(p, st.curStyle|styleItalicBit)
-				if c.FirstChild != nil {
-					walkRich(c.FirstChild, base, p, visited, st, prefs)
-				}
-				st.popStyle(p)
-				recurse = false
-			case "center":
+				st.popColor(p)
+				p.AddBreak()
+				continue
+			}
+			if hasClass(c, "center") {
+				resetComputedStyles(st, p, &colorPushed, &stylePushed, &alignedPushed)
 				st.pushStyle(p, st.curStyle|styleCenterBit)
 				if c.FirstChild != nil {
 					walkRich(c.FirstChild, base, p, visited, st, prefs)
 				}
 				st.popStyle(p)
-				recurse = false
-			case "big":
+				p.AddBreak()
+				continue
+			}
+			if hasClass(c, "nw") {
+				resetComputedStyles(st, p, &colorPushed, &stylePushed, &alignedPushed)
+				if c.FirstChild != nil {
+					walkRich(c.FirstChild, base, p, visited, st, prefs)
+				}
+				continue
+			}
+			if hasClass(c, "bro") {
+				resetComputedStyles(st, p, &colorPushed, &stylePushed, &alignedPushed)
+				if c.FirstChild != nil {
+					walkRich(c.FirstChild, base, p, visited, st, prefs)
+				}
+				p.AddBreak()
+				continue
+			}
+			if hasClass(c, "copy") {
+				resetComputedStyles(st, p, &colorPushed, &stylePushed, &alignedPushed)
 				st.pushStyle(p, st.curStyle|styleBoldBit)
+				st.pushColor(p, "#ffffff")
+				p.AddPlus()
 				if c.FirstChild != nil {
 					walkRich(c.FirstChild, base, p, visited, st, prefs)
 				}
+				st.popColor(p)
 				st.popStyle(p)
-				recurse = false
-			case "sup":
-				p.AddText("^")
+				p.AddBreak()
+				continue
+			}
+			if hasClass(c, "copy2") {
+				resetComputedStyles(st, p, &colorPushed, &stylePushed, &alignedPushed)
+				st.pushColor(p, "#060")
+				p.AddPlus()
 				if c.FirstChild != nil {
 					walkRich(c.FirstChild, base, p, visited, st, prefs)
 				}
-				p.AddText("^")
-				recurse = false
-			case "sub":
-				p.AddText("_")
+				st.popColor(p)
+				p.AddBreak()
+				continue
+			}
+			if hasClass(c, "pr") {
+				resetComputedStyles(st, p, &colorPushed, &stylePushed, &alignedPushed)
+				st.pushStyle(p, st.curStyle|styleBoldBit|styleCenterBit)
+				st.pushColor(p, "#ffffff")
+				p.AddPlus()
 				if c.FirstChild != nil {
 					walkRich(c.FirstChild, base, p, visited, st, prefs)
 				}
-				p.AddText("_")
-				recurse = false
-			case "span":
-				if sp := getAttr(c, "style"); sp != "" {
-					aligned := false
-					if ta := parseCssTextAlign(sp); ta == "center" {
-						st.pushStyle(p, st.curStyle|styleCenterBit)
-						aligned = true
-					}
-					if ta := parseCssTextAlign(sp); ta == "right" {
-						st.pushStyle(p, st.curStyle|styleRightBit)
-						aligned = true
-					}
-					pushed := 0
-					if parseCssHas(sp, "font-weight", "bold") {
-						st.pushStyle(p, st.curStyle|styleBoldBit)
-						pushed++
-					}
-					if parseCssHas(sp, "font-style", "italic") {
-						st.pushStyle(p, st.curStyle|styleItalicBit)
-						pushed++
-					}
-					if parseCssHas(sp, "text-decoration", "underline") {
-						st.pushStyle(p, st.curStyle|styleUnderBit)
-						pushed++
-					}
-					colorPushed := false
-					if col := parseCssColor(sp, "color"); col != "" {
-						st.pushColor(p, col)
-						colorPushed = true
-					}
-					if c.FirstChild != nil {
-						walkRich(c.FirstChild, base, p, visited, st, prefs)
-					}
-					for pushed > 0 {
-						pushed--
-						st.popStyle(p)
-					}
-					if colorPushed {
-						st.popColor(p)
-					}
-					if aligned {
-						st.popStyle(p)
-					}
-					recurse = false
-				}
-			case "font":
-				if col := strings.TrimSpace(getAttr(c, "color")); col != "" {
-					st.pushStyle(p, st.curStyle)
-					p.AddTextcolor(col)
-					if c.FirstChild != nil {
-						walkRich(c.FirstChild, base, p, visited, st, prefs)
-					}
-					st.popStyle(p)
-					recurse = false
-				}
-			case "a":
-				href := getAttr(c, "href")
-				link := resolveLink(base, href)
-				name := "Link"
-				if t := findTextNode(c, visited); t != nil {
-					visited[t] = true
-					if txt := strings.TrimSpace(t.Data); txt != "" {
-						name = txt
-					}
-				}
-				if name == "Link" {
-					if alt := findFirstImgAlt(c); alt != "" {
-						name = alt
-					}
-				}
-				// Render link with children as content
-				p.addTag('L')
-				p.AddString(link)
-				before := p.tagCount
-				prevIn := st.inLink
-				st.inLink = true
+				st.popColor(p)
+				st.popStyle(p)
+				p.AddBreak()
+				continue
+			}
+			if hasClass(c, "sepo") {
+				resetComputedStyles(st, p, &colorPushed, &stylePushed, &alignedPushed)
+				st.pushStyle(p, st.curStyle|styleBoldBit)
+				st.pushColor(p, "#060")
+				p.AddPlus()
 				if c.FirstChild != nil {
 					walkRich(c.FirstChild, base, p, visited, st, prefs)
 				}
-				st.inLink = prevIn
-				if p.tagCount == before {
-					p.AddText(name)
+				st.popColor(p)
+				st.popStyle(p)
+				p.AddBreak()
+				continue
+			}
+			if hasClass(c, "bl") {
+				resetComputedStyles(st, p, &colorPushed, &stylePushed, &alignedPushed)
+				p.AddText("| ")
+				if c.FirstChild != nil {
+					walkRich(c.FirstChild, base, p, visited, st, prefs)
 				}
-				p.addTag('E')
-				// TODO;...
-                if ns := nextSignificantSibling(c); !(ns != nil && ns.Type == html.TextNode &&
-					hasPrefixAny(strings.TrimLeft(ns.Data, " \t\r\n"), "]", "|", ")")) {
-					p.AddBreak()
+				p.AddBreak()
+				continue
+			}
+			if hasAnyClass(c, "str-up", "str-dw") {
+				resetComputedStyles(st, p, &colorPushed, &stylePushed, &alignedPushed)
+				p.AddPlus()
+				if c.FirstChild != nil {
+					walkRich(c.FirstChild, base, p, visited, st, prefs)
 				}
-				recurse = false
-			case "img":
-				// Images handling based on client prefs
-				src := strings.TrimSpace(getAttr(c, "src"))
-				if src == "" {
-					if ss := strings.TrimSpace(getAttr(c, "srcset")); ss != "" {
-						src = pickSrcFromSrcset(ss)
-					}
-				}
-				if src == "" {
-					// Common lazy-loading attributes
-					src = strings.TrimSpace(getAttr(c, "data-src"))
-					if src == "" {
-						src = strings.TrimSpace(getAttr(c, "data-original"))
-					}
-					if src == "" {
-						src = strings.TrimSpace(getAttr(c, "data-lazy-src"))
-					}
-				}
-				alt := strings.TrimSpace(getAttr(c, "alt"))
-				if alt == "" {
-					alt = "Image"
-				}
-				if !prefs.ImagesOn || src == "" {
-					p.AddText("[" + alt + "]")
-					recurse = false
-					break
-				}
-				abs := resolveLink(base, src)
-				// Try to inline small images; otherwise use a link+placeholder
-				if ib, w, h, ok := fetchAndEncodeImage(abs[2:], prefs); ok { // abs has leading "0/"
-					if len(ib) <= prefs.MaxInlineKB*1024 {
-						p.AddImageInline(w, h, ib)
-					} else {
-						if st.inLink {
-							p.AddImagePlaceholder(w, h)
-						} else {
-							p.addTag('L')
-							p.AddString(abs)
-							p.AddImagePlaceholder(w, h)
-							p.addTag('E')
-						}
-					}
-				} else {
-					// Fallback: clickable image link with placeholder (unknown size)
-					if st.inLink {
-						p.AddImagePlaceholder(0, 0)
-					} else {
-						p.addTag('L')
-						p.AddString(abs)
-						p.AddImagePlaceholder(0, 0)
-						p.addTag('E')
-					}
-				}
-				recurse = false
-			case "caption":
-				if t := findTextNode(c, visited); t != nil {
-					visited[t] = true
-					p.AddPlus()
-					p.AddText(strings.TrimSpace(t.Data))
-					p.AddBreak()
-				}
-				recurse = false
-			case "ul":
-				bul := "• "
-				if st.css != nil {
-					if props := computeStyleFor(c, st.css); props != nil {
-						if v := props["list-style-type"]; v != "" {
-							switch v {
-							case "circle":
-								bul = "○ "
-							case "square":
-								bul = "■ "
-							case "disc":
-								bul = "• "
-							case "none":
-								bul = ""
-							}
-						}
-					}
-				}
-				st.pushList("ul")
-				if top := st.currentList(); top != nil {
-					top.bullet = bul
-				}
-			case "ol":
-				st.pushList("ol")
-			case "li":
-				if top := st.currentList(); top != nil {
-					if top.kind == "ol" {
-						top.counter++
-						p.AddText(strconv.Itoa(top.counter) + ". ")
-					} else {
-						p.AddText("- ")
-					}
+				p.AddBreak()
+				continue
+			}
+			p.AddParagraph()
+		case "b", "strong":
+			st.pushStyle(p, st.curStyle|styleBoldBit)
+			if c.FirstChild != nil {
+				walkRich(c.FirstChild, base, p, visited, st, prefs)
+			}
+			st.popStyle(p)
+			recurse = false
+		case "i", "em":
+			st.pushStyle(p, st.curStyle|styleItalicBit)
+			if c.FirstChild != nil {
+				walkRich(c.FirstChild, base, p, visited, st, prefs)
+			}
+			st.popStyle(p)
+			recurse = false
+		case "u":
+			st.pushStyle(p, st.curStyle|styleUnderBit)
+			if c.FirstChild != nil {
+				walkRich(c.FirstChild, base, p, visited, st, prefs)
+			}
+			st.popStyle(p)
+			recurse = false
+		case "small":
+			st.pushStyle(p, st.curStyle|styleItalicBit)
+			if c.FirstChild != nil {
+				walkRich(c.FirstChild, base, p, visited, st, prefs)
+			}
+			st.popStyle(p)
+			recurse = false
+		case "center":
+			st.pushStyle(p, st.curStyle|styleCenterBit)
+			if c.FirstChild != nil {
+				walkRich(c.FirstChild, base, p, visited, st, prefs)
+			}
+			st.popStyle(p)
+			recurse = false
+		case "big":
+			st.pushStyle(p, st.curStyle|styleBoldBit)
+			if c.FirstChild != nil {
+				walkRich(c.FirstChild, base, p, visited, st, prefs)
+			}
+			st.popStyle(p)
+			recurse = false
+		case "sup":
+			p.AddText("^")
+			if c.FirstChild != nil {
+				walkRich(c.FirstChild, base, p, visited, st, prefs)
+			}
+			p.AddText("^")
+			recurse = false
+		case "sub":
+			p.AddText("_")
+			if c.FirstChild != nil {
+				walkRich(c.FirstChild, base, p, visited, st, prefs)
+			}
+			p.AddText("_")
+			recurse = false
+		case "span":
+			if hasClass(c, "balls") {
+				resetComputedStyles(st, p, &colorPushed, &stylePushed, &alignedPushed)
+				if bgRendered {
+					p.AddText(" ")
 				} else {
 					p.AddText("- ")
 				}
 				if c.FirstChild != nil {
 					walkRich(c.FirstChild, base, p, visited, st, prefs)
 				}
+				continue
+			}
+			if hasClass(c, "br350") {
+				resetComputedStyles(st, p, &colorPushed, &stylePushed, &alignedPushed)
 				p.AddBreak()
+				if c.FirstChild != nil {
+					walkRich(c.FirstChild, base, p, visited, st, prefs)
+				}
+				continue
+			}
+			if hasClass(c, "sepo") {
+				resetComputedStyles(st, p, &colorPushed, &stylePushed, &alignedPushed)
+				st.pushStyle(p, st.curStyle|styleBoldBit)
+				st.pushColor(p, "#060")
+				if c.FirstChild != nil {
+					walkRich(c.FirstChild, base, p, visited, st, prefs)
+				}
+				st.popColor(p)
+				st.popStyle(p)
+				continue
+			}
+			if hasClass(c, "grn") {
+				resetComputedStyles(st, p, &colorPushed, &stylePushed, &alignedPushed)
+				st.pushColor(p, "#aaaaaa")
+				if c.FirstChild != nil {
+					walkRich(c.FirstChild, base, p, visited, st, prefs)
+				}
+				st.popColor(p)
+				continue
+			}
+			if hasClass(c, "red") {
+				resetComputedStyles(st, p, &colorPushed, &stylePushed, &alignedPushed)
+				st.pushColor(p, "#ff4444")
+				if c.FirstChild != nil {
+					walkRich(c.FirstChild, base, p, visited, st, prefs)
+				}
+				st.popColor(p)
+				continue
+			}
+			if hasClass(c, "zm") {
+				resetComputedStyles(st, p, &colorPushed, &stylePushed, &alignedPushed)
+				st.pushStyle(p, st.curStyle|styleBoldBit)
+				if c.FirstChild != nil {
+					walkRich(c.FirstChild, base, p, visited, st, prefs)
+				}
+				st.popStyle(p)
+				continue
+			}
+			if sp := getAttr(c, "style"); sp != "" {
+				aligned := false
+				if ta := parseCssTextAlign(sp); ta == "center" {
+					st.pushStyle(p, st.curStyle|styleCenterBit)
+					aligned = true
+				}
+				if ta := parseCssTextAlign(sp); ta == "right" {
+					st.pushStyle(p, st.curStyle|styleRightBit)
+					aligned = true
+				}
+				pushed := 0
+				if parseCssHas(sp, "font-weight", "bold") {
+					st.pushStyle(p, st.curStyle|styleBoldBit)
+					pushed++
+				}
+				if parseCssHas(sp, "font-style", "italic") {
+					st.pushStyle(p, st.curStyle|styleItalicBit)
+					pushed++
+				}
+				if parseCssHas(sp, "text-decoration", "underline") {
+					st.pushStyle(p, st.curStyle|styleUnderBit)
+					pushed++
+				}
+				colorPushed := false
+				if col := parseCssColor(sp, "color"); col != "" {
+					st.pushColor(p, col)
+					colorPushed = true
+				}
+				if c.FirstChild != nil {
+					walkRich(c.FirstChild, base, p, visited, st, prefs)
+				}
+				for pushed > 0 {
+					pushed--
+					st.popStyle(p)
+				}
+				if colorPushed {
+					st.popColor(p)
+				}
+				if aligned {
+					st.popStyle(p)
+				}
 				recurse = false
-			case "dl":
-				st.pushList("dl")
-			case "dt":
+			}
+		case "font":
+			if col := strings.TrimSpace(getAttr(c, "color")); col != "" {
+				st.pushStyle(p, st.curStyle)
+				p.AddTextcolor(col)
+				if c.FirstChild != nil {
+					walkRich(c.FirstChild, base, p, visited, st, prefs)
+				}
+				st.popStyle(p)
+				recurse = false
+			}
+		case "a":
+			if hasClass(c, "balls") {
+				resetComputedStyles(st, p, &colorPushed, &stylePushed, &alignedPushed)
+				if bgRendered {
+					p.AddText(" ")
+				} else {
+					p.AddText("- ")
+				}
+				if c.FirstChild != nil {
+					walkRich(c.FirstChild, base, p, visited, st, prefs)
+				}
+				continue
+			}
+			if hasClass(c, "opis") {
+				st.pushColor(p, "#151515")
+				colorPushed = true
+			}
+			buttonWrap := hasAnyClass(c, "but", "hud", "tut", "ba", "bmx", "ib-search", "butt")
+			blockWrap := hasAnyClass(c, "opis", "str-up", "str-dw")
+			if blockWrap {
 				p.AddPlus()
-				if c.FirstChild != nil {
-					walkRich(c.FirstChild, base, p, visited, st, prefs)
+			}
+			if buttonWrap {
+				p.AddText("[")
+			}
+			href := getAttr(c, "href")
+			link := resolveLink(base, href)
+			name := "Link"
+			if t := findTextNode(c, visited); t != nil {
+				visited[t] = true
+				if txt := strings.TrimSpace(t.Data); txt != "" {
+					name = txt
 				}
+			}
+			if name == "Link" {
+				if alt := findFirstImgAlt(c); alt != "" {
+					name = alt
+				}
+			}
+			// Render link with children as content
+			p.addTag('L')
+			p.AddString(link)
+			before := p.tagCount
+			prevIn := st.inLink
+			st.inLink = true
+			if c.FirstChild != nil {
+				walkRich(c.FirstChild, base, p, visited, st, prefs)
+			}
+			st.inLink = prevIn
+			if p.tagCount == before {
+				p.AddText(name)
+			}
+			p.addTag('E')
+			if buttonWrap {
+				p.AddText("]")
+				p.AddText(" ")
+			}
+			resetComputedStyles(st, p, &colorPushed, &stylePushed, &alignedPushed)
+			if buttonWrap || blockWrap {
 				p.AddBreak()
-				recurse = false
-			case "dd":
-				p.AddText(": ")
-				if c.FirstChild != nil {
-					walkRich(c.FirstChild, base, p, visited, st, prefs)
-				}
-				p.AddBreak()
-				recurse = false
-			case "pre", "code":
-				child := *st
-				child.pre = true
-				if c.FirstChild != nil {
-					walkRich(c.FirstChild, base, p, visited, &child, prefs)
-				}
-				recurse = false
-			case "blockquote":
-				p.AddParagraph()
-				p.AddText("> ")
-			case "label":
-				if t := findTextNode(c, visited); t != nil {
-					visited[t] = true
-					if txt := condenseSpaces(t.Data); txt != "" {
-						p.AddText(txt + ": ")
-					}
-				}
-				recurse = false
-			case "fieldset":
-				p.AddParagraph()
-			case "legend":
-				if t := findTextNode(c, visited); t != nil {
-					visited[t] = true
-					p.AddPlus()
-					p.AddText(strings.TrimSpace(t.Data))
+			} else {
+				if ns := nextSignificantSibling(c); !(ns != nil && ns.Type == html.TextNode &&
+					hasPrefixAny(strings.TrimLeft(ns.Data, " \t\n"), "]", "|", ")")) {
 					p.AddBreak()
 				}
-				recurse = false
-			case "q":
-				p.AddText("\"")
-				if c.FirstChild != nil {
-					walkRich(c.FirstChild, base, p, visited, st, prefs)
+			}
+			recurse = false
+		case "img":
+			// Images handling based on client prefs
+			src := strings.TrimSpace(getAttr(c, "src"))
+			if src == "" {
+				if ss := strings.TrimSpace(getAttr(c, "srcset")); ss != "" {
+					src = pickSrcFromSrcset(ss)
 				}
-				p.AddText("\"")
-				recurse = false
-			case "tt", "kbd", "samp", "var", "cite", "address":
-				st.pushStyle(p, st.curStyle|styleItalicBit)
-				if c.FirstChild != nil {
-					walkRich(c.FirstChild, base, p, visited, st, prefs)
+			}
+			if src == "" {
+				// Common lazy-loading attributes
+				src = strings.TrimSpace(getAttr(c, "data-src"))
+				if src == "" {
+					src = strings.TrimSpace(getAttr(c, "data-original"))
 				}
-				st.popStyle(p)
-				recurse = false
-			case "iframe":
-				if src := strings.TrimSpace(getAttr(c, "src")); src != "" {
-					p.AddLink(resolveLink(base, src), "[Frame]")
+				if src == "" {
+					src = strings.TrimSpace(getAttr(c, "data-lazy-src"))
 				}
+			}
+			alt := strings.TrimSpace(getAttr(c, "alt"))
+			if alt == "" {
+				alt = "Image"
+			}
+			if !prefs.ImagesOn || src == "" {
+				p.AddText("[" + alt + "]")
 				recurse = false
-			case "object", "embed":
-				data := strings.TrimSpace(getAttr(c, "data"))
-				if data == "" {
-					data = strings.TrimSpace(getAttr(c, "src"))
-				}
-				if data != "" {
-					p.AddLink(resolveLink(base, data), "[Object]")
-				}
-				recurse = false
-			case "s", "strike", "del":
-				p.AddText("~")
-				if c.FirstChild != nil {
-					walkRich(c.FirstChild, base, p, visited, st, prefs)
-				}
-				p.AddText("~")
-				recurse = false
-			case "ins":
-				p.AddText("+")
-				if c.FirstChild != nil {
-					walkRich(c.FirstChild, base, p, visited, st, prefs)
-				}
-				p.AddText("+")
-				recurse = false
-			case "table":
-				if hasFormControls(c) || hasAnchorLinks(c) {
-					// let recursion process interactive content to preserve links
+				break
+			}
+			abs := resolveLink(base, src)
+			// Try to inline small images; otherwise use a link+placeholder
+			if ib, w, h, ok := fetchAndEncodeImage(abs[2:], prefs); ok { // abs has leading "0/"
+				if len(ib) <= prefs.MaxInlineKB*1024 {
+					p.AddImageInline(w, h, ib)
 				} else {
-					// Traverse sections and rows: thead/tbody/tfoot/tr
-					for sec := c.FirstChild; sec != nil; sec = sec.NextSibling {
-						if sec.Type != html.ElementNode {
-							continue
+					if st.inLink {
+						p.AddImagePlaceholder(w, h)
+					} else {
+						p.addTag('L')
+						p.AddString(abs)
+						p.AddImagePlaceholder(w, h)
+						p.addTag('E')
+					}
+				}
+			} else {
+				// Fallback: clickable image link with placeholder (unknown size)
+				if st.inLink {
+					p.AddImagePlaceholder(0, 0)
+				} else {
+					p.addTag('L')
+					p.AddString(abs)
+					p.AddImagePlaceholder(0, 0)
+					p.addTag('E')
+				}
+			}
+			recurse = false
+		case "caption":
+			if t := findTextNode(c, visited); t != nil {
+				visited[t] = true
+				p.AddPlus()
+				p.AddText(strings.TrimSpace(t.Data))
+				p.AddBreak()
+			}
+			recurse = false
+		case "ul":
+			bul := "• "
+			if st.css != nil {
+				if props := computeStyleFor(c, st.css); props != nil {
+					if v := props["list-style-type"]; v != "" {
+						switch v {
+						case "circle":
+							bul = "○ "
+						case "square":
+							bul = "■ "
+						case "disc":
+							bul = "• "
+						case "none":
+							bul = ""
 						}
-						if strings.EqualFold(sec.Data, "tr") {
-							row := make([]string, 0, 8)
-							for cell := sec.FirstChild; cell != nil; cell = cell.NextSibling {
-								if cell.Type == html.ElementNode && (strings.EqualFold(cell.Data, "td") || strings.EqualFold(cell.Data, "th")) {
-									txt := strings.TrimSpace(collectText(cell))
-									if txt != "" {
-										row = append(row, txt)
-									}
+					}
+				}
+			}
+			st.pushList("ul")
+			if top := st.currentList(); top != nil {
+				top.bullet = bul
+			}
+		case "ol":
+			st.pushList("ol")
+		case "li":
+			if top := st.currentList(); top != nil {
+				if top.kind == "ol" {
+					top.counter++
+					p.AddText(strconv.Itoa(top.counter) + ". ")
+				} else {
+					p.AddText("- ")
+				}
+			} else {
+				p.AddText("- ")
+			}
+			if c.FirstChild != nil {
+				walkRich(c.FirstChild, base, p, visited, st, prefs)
+			}
+			p.AddBreak()
+			recurse = false
+		case "dl":
+			st.pushList("dl")
+		case "dt":
+			p.AddPlus()
+			if c.FirstChild != nil {
+				walkRich(c.FirstChild, base, p, visited, st, prefs)
+			}
+			p.AddBreak()
+			recurse = false
+		case "dd":
+			p.AddText(": ")
+			if c.FirstChild != nil {
+				walkRich(c.FirstChild, base, p, visited, st, prefs)
+			}
+			p.AddBreak()
+			recurse = false
+		case "pre", "code":
+			child := *st
+			child.pre = true
+			if c.FirstChild != nil {
+				walkRich(c.FirstChild, base, p, visited, &child, prefs)
+			}
+			recurse = false
+		case "blockquote":
+			p.AddParagraph()
+			p.AddText("> ")
+		case "label":
+			if t := findTextNode(c, visited); t != nil {
+				visited[t] = true
+				if txt := condenseSpaces(t.Data); txt != "" {
+					p.AddText(txt + ": ")
+				}
+			}
+			recurse = false
+		case "fieldset":
+			p.AddParagraph()
+		case "legend":
+			if t := findTextNode(c, visited); t != nil {
+				visited[t] = true
+				p.AddPlus()
+				p.AddText(strings.TrimSpace(t.Data))
+				p.AddBreak()
+			}
+			recurse = false
+		case "q":
+			p.AddText("\"")
+			if c.FirstChild != nil {
+				walkRich(c.FirstChild, base, p, visited, st, prefs)
+			}
+			p.AddText("\"")
+			recurse = false
+		case "tt", "kbd", "samp", "var", "cite", "address":
+			st.pushStyle(p, st.curStyle|styleItalicBit)
+			if c.FirstChild != nil {
+				walkRich(c.FirstChild, base, p, visited, st, prefs)
+			}
+			st.popStyle(p)
+			recurse = false
+		case "iframe":
+			if src := strings.TrimSpace(getAttr(c, "src")); src != "" {
+				p.AddLink(resolveLink(base, src), "[Frame]")
+			}
+			recurse = false
+		case "object", "embed":
+			data := strings.TrimSpace(getAttr(c, "data"))
+			if data == "" {
+				data = strings.TrimSpace(getAttr(c, "src"))
+			}
+			if data != "" {
+				p.AddLink(resolveLink(base, data), "[Object]")
+			}
+			recurse = false
+		case "s", "strike", "del":
+			p.AddText("~")
+			if c.FirstChild != nil {
+				walkRich(c.FirstChild, base, p, visited, st, prefs)
+			}
+			p.AddText("~")
+			recurse = false
+		case "ins":
+			p.AddText("+")
+			if c.FirstChild != nil {
+				walkRich(c.FirstChild, base, p, visited, st, prefs)
+			}
+			p.AddText("+")
+			recurse = false
+		case "table":
+			if hasFormControls(c) || hasAnchorLinks(c) {
+				// let recursion process interactive content to preserve links
+			} else {
+				// Traverse sections and rows: thead/tbody/tfoot/tr
+				for sec := c.FirstChild; sec != nil; sec = sec.NextSibling {
+					if sec.Type != html.ElementNode {
+						continue
+					}
+					if strings.EqualFold(sec.Data, "tr") {
+						row := make([]string, 0, 8)
+						for cell := sec.FirstChild; cell != nil; cell = cell.NextSibling {
+							if cell.Type == html.ElementNode && (strings.EqualFold(cell.Data, "td") || strings.EqualFold(cell.Data, "th")) {
+								txt := strings.TrimSpace(collectText(cell))
+								if txt != "" {
+									row = append(row, txt)
 								}
 							}
-							if len(row) > 0 {
-								p.AddText(strings.Join(row, " | "))
-								p.AddBreak()
-							}
-							continue
 						}
-						if strings.EqualFold(sec.Data, "thead") || strings.EqualFold(sec.Data, "tbody") || strings.EqualFold(sec.Data, "tfoot") {
-							for r := sec.FirstChild; r != nil; r = r.NextSibling {
-								if r.Type == html.ElementNode && strings.EqualFold(r.Data, "tr") {
-									row := make([]string, 0, 8)
-									for cell := r.FirstChild; cell != nil; cell = cell.NextSibling {
-										if cell.Type == html.ElementNode && (strings.EqualFold(cell.Data, "td") || strings.EqualFold(cell.Data, "th")) {
-											txt := strings.TrimSpace(collectText(cell))
-											if txt != "" {
-												row = append(row, txt)
-											}
+						if len(row) > 0 {
+							p.AddText(strings.Join(row, " | "))
+							p.AddBreak()
+						}
+						continue
+					}
+					if strings.EqualFold(sec.Data, "thead") || strings.EqualFold(sec.Data, "tbody") || strings.EqualFold(sec.Data, "tfoot") {
+						for r := sec.FirstChild; r != nil; r = r.NextSibling {
+							if r.Type == html.ElementNode && strings.EqualFold(r.Data, "tr") {
+								row := make([]string, 0, 8)
+								for cell := r.FirstChild; cell != nil; cell = cell.NextSibling {
+									if cell.Type == html.ElementNode && (strings.EqualFold(cell.Data, "td") || strings.EqualFold(cell.Data, "th")) {
+										txt := strings.TrimSpace(collectText(cell))
+										if txt != "" {
+											row = append(row, txt)
 										}
 									}
-									if len(row) > 0 {
-										p.AddText(strings.Join(row, " | "))
-										p.AddBreak()
-									}
+								}
+								if len(row) > 0 {
+									p.AddText(strings.Join(row, " | "))
+									p.AddBreak()
 								}
 							}
 						}
 					}
-					recurse = false
-				}
-			case "details":
-				// Render expanded content inline: summary processed elsewhere
-				if c.FirstChild != nil {
-					walkRich(c.FirstChild, base, p, visited, st, prefs)
 				}
 				recurse = false
-			case "audio", "video":
-				if src := strings.TrimSpace(getAttr(c, "src")); src != "" {
-					p.AddLink(resolveLink(base, src), "[Media]")
-				}
-				for s := c.FirstChild; s != nil; s = s.NextSibling {
-					if s.Type == html.ElementNode && strings.EqualFold(s.Data, "source") {
-						if ss := strings.TrimSpace(getAttr(s, "src")); ss != "" {
-							p.AddLink(resolveLink(base, ss), "[Media]")
-						}
+			}
+		case "details":
+			// Render expanded content inline: summary processed elsewhere
+			if c.FirstChild != nil {
+				walkRich(c.FirstChild, base, p, visited, st, prefs)
+			}
+			recurse = false
+		case "audio", "video":
+			if src := strings.TrimSpace(getAttr(c, "src")); src != "" {
+				p.AddLink(resolveLink(base, src), "[Media]")
+			}
+			for s := c.FirstChild; s != nil; s = s.NextSibling {
+				if s.Type == html.ElementNode && strings.EqualFold(s.Data, "source") {
+					if ss := strings.TrimSpace(getAttr(s, "src")); ss != "" {
+						p.AddLink(resolveLink(base, ss), "[Media]")
 					}
 				}
-				recurse = false
-			case "picture":
-				chosen := ""
-				for s := c.FirstChild; s != nil && chosen == ""; s = s.NextSibling {
-					if s.Type == html.ElementNode && strings.EqualFold(s.Data, "source") {
-						if ss := strings.TrimSpace(getAttr(s, "srcset")); ss != "" {
-							chosen = pickSrcFromSrcset(ss)
-						}
-						if chosen == "" {
-							chosen = strings.TrimSpace(getAttr(s, "src"))
-						}
+			}
+			recurse = false
+		case "picture":
+			chosen := ""
+			for s := c.FirstChild; s != nil && chosen == ""; s = s.NextSibling {
+				if s.Type == html.ElementNode && strings.EqualFold(s.Data, "source") {
+					if ss := strings.TrimSpace(getAttr(s, "srcset")); ss != "" {
+						chosen = pickSrcFromSrcset(ss)
+					}
+					if chosen == "" {
+						chosen = strings.TrimSpace(getAttr(s, "src"))
 					}
 				}
-				if chosen == "" {
-					if img := findFirstChild(c, "img"); img != nil {
-						chosen = strings.TrimSpace(getAttr(img, "src"))
-					}
+			}
+			if chosen == "" {
+				if img := findFirstChild(c, "img"); img != nil {
+					chosen = strings.TrimSpace(getAttr(img, "src"))
 				}
-				if chosen != "" {
-					p.AddLink(resolveLink(base, chosen), "[Image]")
-				}
-				recurse = false
-			case "form":
-				action := getAttr(c, "action")
-				p.AddForm(action)
-			case "button":
-				typ := strings.ToLower(getAttr(c, "type"))
-				if typ == "" {
-					typ = "submit"
-				}
+			}
+			if chosen != "" {
+				p.AddLink(resolveLink(base, chosen), "[Image]")
+			}
+			recurse = false
+		case "form":
+			action := getAttr(c, "action")
+			p.AddForm(action)
+		case "button":
+			typ := strings.ToLower(getAttr(c, "type"))
+			if typ == "" {
+				typ = "submit"
+			}
+			name := getAttr(c, "name")
+			if name == "" {
+				name = "dname"
+			}
+			value := getAttr(c, "value")
+			label := strings.TrimSpace(collectText(c))
+			if value == "" {
+				value = label
+			}
+			markTextNodes(c, visited)
+			switch typ {
+			case "submit":
+				p.AddSubmit(name, value)
+			case "reset":
+				p.AddReset(name, value)
+			default:
+				p.AddButton(name, value)
+			}
+			recurse = false
+		case "textarea":
+			stl := getAttr(c, "style")
+			if stl == "" || !strings.Contains(stl, "display:none") {
 				name := getAttr(c, "name")
 				if name == "" {
 					name = "dname"
 				}
 				value := getAttr(c, "value")
-				label := strings.TrimSpace(collectText(c))
+				p.AddTextInput(name, value)
+			}
+		case "input":
+			typ := strings.ToLower(getAttr(c, "type"))
+			if typ == "" {
+				typ = "text"
+			}
+			name := getAttr(c, "name")
+			if name == "" {
+				name = "dname"
+			}
+			value := getAttr(c, "value")
+			switch typ {
+			case "text":
+				p.AddTextInput(name, value)
+			case "password":
+				p.AddPassInput(name, value)
+			case "submit":
+				p.AddSubmit(name, value)
+			case "checkbox":
+				checked := strings.EqualFold(getAttr(c, "checked"), "true")
 				if value == "" {
-					value = label
+					value = "on"
 				}
-				markTextNodes(c, visited)
-				switch typ {
-				case "submit":
-					p.AddSubmit(name, value)
-				case "reset":
-					p.AddReset(name, value)
-				default:
-					p.AddButton(name, value)
+				p.AddCheckbox(name, value, checked)
+			case "radio":
+				checked := strings.EqualFold(getAttr(c, "checked"), "true")
+				if value == "" {
+					value = "on"
 				}
-				recurse = false
-			case "textarea":
-				stl := getAttr(c, "style")
-				if stl == "" || !strings.Contains(stl, "display:none") {
-					name := getAttr(c, "name")
-					if name == "" {
-						name = "dname"
-					}
-					value := getAttr(c, "value")
-					p.AddTextInput(name, value)
-				}
-			case "input":
-				typ := strings.ToLower(getAttr(c, "type"))
-				if typ == "" {
-					typ = "text"
-				}
-				name := getAttr(c, "name")
-				if name == "" {
-					name = "dname"
-				}
-				value := getAttr(c, "value")
-				switch typ {
-				case "text":
-					p.AddTextInput(name, value)
-				case "password":
-					p.AddPassInput(name, value)
-				case "submit":
-					p.AddSubmit(name, value)
-				case "checkbox":
-					checked := strings.EqualFold(getAttr(c, "checked"), "true")
-					if value == "" {
-						value = "on"
-					}
-					p.AddCheckbox(name, value, checked)
-				case "radio":
-					checked := strings.EqualFold(getAttr(c, "checked"), "true")
-					if value == "" {
-						value = "on"
-					}
-					p.AddRadio(name, value, checked)
-				case "hidden":
-					p.AddHidden(name, value)
-				case "button":
-					p.AddButton(name, value)
-				case "reset":
-					p.AddReset(name, value)
-				}
-			case "select":
-				name := getAttr(c, "name")
-				if name == "" {
-					name = "dname"
-				}
-				multiple := strings.EqualFold(getAttr(c, "multiple"), "true") || getAttr(c, "multiple") != ""
-				type option struct {
-					label, value string
-					selected     bool
-					textNode     *html.Node
-				}
-				opts := make([]option, 0, 8)
-				for oc := c.FirstChild; oc != nil; oc = oc.NextSibling {
-					if oc.Type == html.ElementNode && strings.EqualFold(oc.Data, "option") {
-						txt := findTextNode(oc, visited)
-						label := ""
-						if txt != nil {
-							label = strings.TrimSpace(txt.Data)
-						}
-						val := getAttr(oc, "value")
-						if val == "" {
-							val = label
-						}
-						sel := strings.EqualFold(getAttr(oc, "selected"), "true") || getAttr(oc, "selected") != ""
-						opts = append(opts, option{label: label, value: val, selected: sel, textNode: txt})
-					}
-				}
-				p.BeginSelect(name, multiple, len(opts))
-				for _, opt := range opts {
-					if opt.textNode != nil {
-						visited[opt.textNode] = true
-					}
-					p.AddOption(opt.value, opt.label, opt.selected)
-				}
-				p.EndSelect()
+				p.AddRadio(name, value, checked)
+			case "hidden":
+				p.AddHidden(name, value)
+			case "button":
+				p.AddButton(name, value)
+			case "reset":
+				p.AddReset(name, value)
 			}
+		case "select":
+			name := getAttr(c, "name")
+			if name == "" {
+				name = "dname"
+			}
+			multiple := strings.EqualFold(getAttr(c, "multiple"), "true") || getAttr(c, "multiple") != ""
+			type option struct {
+				label, value string
+				selected     bool
+				textNode     *html.Node
+			}
+			opts := make([]option, 0, 8)
+			for oc := c.FirstChild; oc != nil; oc = oc.NextSibling {
+				if oc.Type == html.ElementNode && strings.EqualFold(oc.Data, "option") {
+					txt := findTextNode(oc, visited)
+					label := ""
+					if txt != nil {
+						label = strings.TrimSpace(txt.Data)
+					}
+					val := getAttr(oc, "value")
+					if val == "" {
+						val = label
+					}
+					sel := strings.EqualFold(getAttr(oc, "selected"), "true") || getAttr(oc, "selected") != ""
+					opts = append(opts, option{label: label, value: val, selected: sel, textNode: txt})
+				}
+			}
+			p.BeginSelect(name, multiple, len(opts))
+			for _, opt := range opts {
+				if opt.textNode != nil {
+					visited[opt.textNode] = true
+				}
+				p.AddOption(opt.value, opt.label, opt.selected)
+			}
+			p.EndSelect()
+		}
 
-			if colorPushed {
-				st.popColor(p)
-			}
-			if alignedPushed {
-				st.popStyle(p)
-			}
-
+		if stylePushed {
+			st.popStyle(p)
+		}
+		if colorPushed {
+			st.popColor(p)
+		}
+		if alignedPushed {
+			st.popStyle(p)
 		} else if c.Type == html.TextNode {
 			if !visited[c] {
 				// Skip any stray text nodes under head/style/script/meta/link/noscript
@@ -2801,8 +2483,6 @@ func buildCompactPage(oURL, title string) *Page {
 	}
 	p := NewPage()
 	p.AddString("1/" + oURL)
-	p.AddAuthcode("c37c206d2c235978d086b64c39a2fc17df68dbdd5dc04dd8b199177f95be6181")
-	p.AddAuthprefix("t19-12")
 	p.AddStyle(styleDefault)
 	p.AddPlus()
 	p.AddText(title)
@@ -3302,22 +2982,26 @@ func LoadPageWithHeadersAndOptions(oURL string, hdr http.Header, opts *RenderOpt
 	if err != nil {
 		return errorPage(effectiveURL, "Internal server error while parsing"), nil
 	}
-	p := NewPage()
-	p.AddString("1/" + effectiveURL)
-	p.AddAuthcode("c37c206d2c235978d086b64c39a2fc17df68dbdd5dc04dd8b199177f95be6181")
-	p.AddAuthprefix("t19-12")
-	p.AddStyle(styleDefault)
-	base := effectiveURL
-	if i := strings.Index(base, "?"); i != -1 {
-		base = base[:i]
-	}
-	base = findBaseURL(doc, base)
 	rp := defaultRenderPrefs()
 	var jar http.CookieJar
 	if opts != nil {
 		rp = *opts
 		jar = opts.Jar
 	}
+	p := NewPage()
+	p.AddString("1/" + effectiveURL)
+	if rp.AuthCode != "" {
+		p.AddAuthcode(rp.AuthCode)
+	}
+	if rp.AuthPrefix != "" {
+		p.AddAuthprefix(rp.AuthPrefix)
+	}
+	p.AddStyle(styleDefault)
+	base := effectiveURL
+	if i := strings.Index(base, "?"); i != -1 {
+		base = base[:i]
+	}
+	base = findBaseURL(doc, base)
 	rp.ReqHeaders = hdr
 	rp.Referrer = effectiveURL
 	rp.Styles = buildStylesheet(doc, base, hdr, jar)
@@ -3514,6 +3198,7 @@ func LoadPageWithHeadersAndOptions(oURL string, hdr http.Header, opts *RenderOpt
 	p.Data = sel
 	p.partCur = pageIdx
 	p.partCnt = len(parts)
+	p.SetTransport(rp.ClientVersion, rp.Compression)
 	p.finalize()
 	return p, nil
 }
@@ -3662,100 +3347,33 @@ func looksLikeActionKey(key string) bool {
 	return strings.HasPrefix(key, "/")
 }
 
-// SetPart allows external callers to set pagination metadata on the page.
-func (p *Page) SetPart(cur, cnt int) {
-	if cur < 0 {
-		cur = 0
-	}
-	if cnt < 0 {
-		cnt = 0
-	}
-	p.partCur = cur
-	p.partCnt = cnt
-}
-
-// NormalizeOMSWithStag adjusts an OMS response bytes and sets stag_count to the provided value.
-// stag is written as a swapped little-endian field.
-func NormalizeOMSWithStag(b []byte, stag int) ([]byte, error) {
-	if len(b) < 6 {
-		return b, nil
-	}
-	if binary.LittleEndian.Uint16(b[:2]) != Version {
-		return b, nil
-	}
-	fr := flate.NewReader(bytes.NewReader(b[6:]))
-	dec, err := io.ReadAll(fr)
-	fr.Close()
-	if err != nil {
-		return b, nil
-	}
-	if len(dec) < 35 {
-		return b, nil
-	}
-	if dec[len(dec)-1] != 'Q' {
-		dec = append(dec, 'Q')
-	}
-	parsed := parseTagCountFromDec(dec)
-	if parsed < 1 {
-		parsed = 1
-	}
-	wantCnt := parsed + 1
-	swap := func(v uint16) uint16 { return (v<<8)&0xFF00 | (v>>8)&0x00FF }
-	binary.LittleEndian.PutUint16(dec[18:20], swap(uint16(wantCnt)))
-	if stag < 0 {
-		stag = 0
-	}
-	binary.LittleEndian.PutUint16(dec[26:28], swap(uint16(stag)))
-	var comp bytes.Buffer
-	w, _ := flate.NewWriter(&comp, flate.DefaultCompression)
-	_, _ = w.Write(dec)
-	_ = w.Close()
-	size := 6 + comp.Len()
-	header := make([]byte, 6)
-	binary.LittleEndian.PutUint16(header[:2], Version)
-	binary.BigEndian.PutUint32(header[2:], uint32(size))
-	out := append(header, comp.Bytes()...)
-	return out, nil
-}
-
-// SelectOMSPartFromPacked returns a selected part from a packed OMS payload. Stub: returns whole payload.
-func SelectOMSPartFromPacked(data []byte, page, maxTags int) ([]byte, int, int, error) {
-	if page <= 0 {
-		page = 1
-	}
-	if maxTags <= 0 {
-		return data, 1, 1, nil
-	}
-	return data, 1, 1, nil
-}
-
 func nextSignificantSibling(n *html.Node) *html.Node {
-    for s := n.NextSibling; s != nil; s = s.NextSibling {
-        if s.Type == html.TextNode {
-            if strings.TrimSpace(s.Data) == "" {
-                continue
-            }
-            return s
-        }
-        if s.Type == html.ElementNode {
-            return s
-        }
-    }
-    return nil
+	for s := n.NextSibling; s != nil; s = s.NextSibling {
+		if s.Type == html.TextNode {
+			if strings.TrimSpace(s.Data) == "" {
+				continue
+			}
+			return s
+		}
+		if s.Type == html.ElementNode {
+			return s
+		}
+	}
+	return nil
 }
 
 func hasPrefixAny(s string, prefixes ...string) bool {
-    for _, p := range prefixes {
-        if strings.HasPrefix(s, p) {
-            return true
-        }
-    }
-    return false
+	for _, p := range prefixes {
+		if strings.HasPrefix(s, p) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *walkState) currentStyle() uint32 {
-    if len(s.styleStack) > 0 {
-        return s.styleStack[len(s.styleStack)-1]
-    }
-    return s.curStyle
+	if len(s.styleStack) > 0 {
+		return s.styleStack[len(s.styleStack)-1]
+	}
+	return s.curStyle
 }

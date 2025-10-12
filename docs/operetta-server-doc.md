@@ -1,24 +1,25 @@
 # Operetta Server Documentation
+- **Community OBML spec** — [grawity/obml-parser – obml-format.md](https://github.com/grawity/obml-parser/blob/master/obml-format.md) documents later OBML versions for comparison.
+# Operetta Server Documentation
 
 ## Overview
 Operetta is a Go-based reimplementation of the Opera Mini 1.x–3.x gateway, tuned for the 2.06 modded client. It accepts legacy Opera Mini (OM) POST handshakes, fetches upstream HTML, and produces OMS/OBML v2 byte streams that the client can render. This guide explains the server architecture, the OBML encoding it emits, and the specifics of the Opera Mini ↔ Operetta protocol.
 
 ## Repository Layout
-- `README.md` — Short project summary and feature list.
-- `PROTOCOL.txt` — Annotated capture of a legacy Opera Mini POST handshake and the binary OMS reply.
-- `main.go` — HTTP entrypoint that registers handlers (`/`, `/fetch`, `/validate`, `/ping`), parses Opera Mini payloads, coordinates caching/pagination, and invokes the `oms` renderer.
-- `url.go` — Helpers for URL normalization, bookmark fallbacks, cache keys, and query composition.
-- `oms/oms.go` — Core rendering engine: HTML fetch/decode, CSS heuristics, DOM walker, OBML tag emitters, pagination helpers, image pipeline, and OMS finalisation.
-- `config/sites/` — Host-specific overrides (`mode`, `headers`) loaded per target; override the directory via `OMS_SITES_DIR`.
-- `docs/` — Background notes (`OBML.md`, `oms_protocol.md`) plus this guide.
-- `dist/`, `build.ps1`, `build.sh`, `Makefile` — Build artifacts and helper scripts.
+- `cmd/operetta/` – CLI entry point that instantiates `proxy.New(...)` and wires it into `net/http.Server`.
+- `internal/proxy/` – Modular HTTP server: configuration (`config.go`), handlers (`handlers.go`), logging, render-preference store, per-client cookie jars, pagination cache, and site-config loader.
+- `internal/proxy/url.go` – URL helpers (Opera-style /obml rewriting, action/build logic) with tests.
+- `oms/` – Rendering engine split into focused files (`page.go`, `normalize.go`, `cache_disk.go`, etc.) covering HTML fetch, CSS heuristics, DOM walking, image pipeline and OMS finalisation.
+- `config/sites/` – Host-specific overrides (`mode`, `headers`) loaded per target; override the directory via `OMS_SITES_DIR`.
+- `docs/` – Background notes (`OBML.md`, `oms_protocol.md`) plus this guide.
+- `dist/`, `build.ps1`, `build.sh`, `Makefile` – Build artefacts and helper scripts.
 
 ## Runtime Architecture
-1. `main()` reads the `-addr` flag or `PORT`, configures logging, constructs the HTTP mux via `newServer()`, and starts `net/http.Server`.
-2. The mux routes Opera Mini POST requests to `rootHandler`, manual fetches to `fetchHandler`, diagnostics to `validateHandler`, and health checks to `pingHandler`.
-3. `rootHandler` parses the null-separated key/value payload (`parseNullKV`), normalises the requested URL (`normalizeObmlURL`), prepares `oms.RenderOptions` from client hints (`k`, `d`, `j`, auth tokens), and calls `loadWithSiteConfig`.
-4. `loadWithSiteConfig` merges per-site overrides, selects between `oms.LoadPageWithHeadersAndOptions` and `oms.LoadCompactPageWithHeaders`, and hands control to the renderer which produces an `*oms.Page`.
-5. The handler finalises response headers (`Content-Type: application/octet-stream`, explicit `Content-Length`, `Connection: close`), logs abbreviated OMS diagnostics via `dumpOMS`, writes cookies from `page.SetCookies`, and streams the packed OMS binary back to the client.
+1. `cmd/operetta/main.go` reads the `-addr` flag (or `PORT`), builds a `proxy.Config` via `proxy.DefaultConfig()`, and passes it to `proxy.New(cfg)`. The returned `*proxy.Server` implements `http.Handler`.
+2. `Server` registers four routes: `/` (Opera Mini POST ingress), `/fetch` (manual/debug fetch), `/validate` (diagnostics) and `/ping` (health check). Request logging is applied via `withLogging`.
+3. `handleRoot` parses the null-separated key/value payload (`parseNullKV`), normalises the requested URL (`normalizeObmlURL`), prepares `oms.RenderOptions` from client hints (`k`, `d`, `j`, auth tokens), and delegates to `loadPage`.
+4. `loadPage` merges per-site overrides from `site_config.go`, selects between `oms.LoadPageWithHeadersAndOptions` and `oms.LoadCompactPageWithHeaders`, and hands control to the renderer which produces an `*oms.Page`. Per-client cookie jars and render-preference stores ensure continuity between requests.
+5. The handler finalises response headers (`Content-Type: application/octet-stream`, explicit `Content-Length`, `Connection: close`), logs abbreviated OMS diagnostics via `dumpOMS`, writes cookies from `page.SetCookies`, updates the pagination cache, and streams the packed OMS binary back to the client.
 
 ## Opera Mini Handshake
 Opera Mini 2.x sends `Content-Type: application/xml`, but the body is a null-delimited list of `key=value` pairs. Operetta reads them directly, applies device hints, and echoes Opera’s authentication tokens in the response.
@@ -81,7 +82,7 @@ j=opf=1&q=Yukaba&btnG=Search+in+Google
 - **Text & styles.** Text nodes become `T` tags with UTF-8 payload; `walkState` tracks style bits (`styleBoldBit`, `styleItalicBit`, `styleUnderBit`, `styleCenterBit`, `styleRightBit`) and emits `S` tags when the active style changes.
 - **Forms & controls.** `<form>` (`h`), `<input>` (`x`, `p`, `i`, `u`, `b`, `e`, `c`, `r`), and `<select>` (`s`, `o`, optional `l`) are rendered, mirroring Opera’s expectations and echoing submitted payload via `RenderOptions.FormBody`.
 - **Images.** `fetchAndEncodeImage` obeys `RenderOptions.ImagesOn`, uses in-memory and optional disk LRU caches (`OMS_IMG_CACHE_DIR`, `OMS_IMG_CACHE_MB`), converts to JPEG/PNG as requested, rescales with `golang.org/x/image/draw`, and emits `I` tags; oversized or disabled images fall back to `J` placeholders.
-- **Pagination & navigation.** `RenderOptions.MaxTagsPerPage` (defaulted by `OMS_PAGINATE_TAGS`) splits payloads via `splitByTags`; navigation fragments are appended when `RenderOptions.ServerBase` is known. Packed snapshots land in `Page.CachePacked` for reuse by `SelectOMSPartFromPacked`.
+- **Pagination & navigation.** `RenderOptions.MaxTagsPerPage` splits payloads via `splitByTags`; navigation fragments are appended when `RenderOptions.ServerBase` is known. Packed snapshots land in `Page.CachePacked` for reuse by `SelectOMSPartFromPacked`.
 - **Finalisation & normalisation.** `Page.finalize()` appends the terminal `Q`, computes conservative tag/string counts (tunable via `OMS_TAGCOUNT_MODE` / `OMS_TAGCOUNT_DELTA`), writes the V2 header, deflates the payload, and prefixes the transport header. `NormalizeOMS` / `NormalizeOMSWithStag` repack responses to stabilise counts (e.g., force `stag_count = 0x0400`).
 - **Auth echo & cookies.** The renderer mirrors `AuthCode` / `AuthPrefix` into `k` tags, records origin `Set-Cookie` values, and exposes them through `page.SetCookies` so the HTTP layer forwards them to the client.
 
@@ -135,12 +136,12 @@ j=opf=1&q=Yukaba&btnG=Search+in+Google
 | `OMS_BOOKMARKS` | Comma-separated `name|url` pairs for the local bookmark page. |
 | `OMS_SITES_DIR` | Custom directory with per-host JSON configs. |
 | `OMS_IMG_CACHE_DIR` | Path for on-disk image cache. |
-| `OMS_IMG_CACHE_MB` | Memory/disk cache budget in megabytes (default 200). |
+| `OMS_IMG_CACHE_MB` | Memory/disk cache budget in megabytes (default 100). |
 | `OMS_IMG_DEBUG` | When `1`, logs image download/conversion failures. |
 | `OMS_TAGCOUNT_MODE` | Tag-count strategy (`exact`, `exclude_q`, `plus1`, `plus2`). |
 | `OMS_TAGCOUNT_DELTA` | Numeric delta added to the computed tag count. |
-| `OMS_PAGINATE_TAGS` | Default maximum tags per OMS part when pagination is enabled. |
 
+In code, `proxy.DefaultConfig()` exposes the same defaults while letting you override bookmarks, logging, the clock source and site-config directory before calling `proxy.New(cfg)`.
 `/fetch` also honours `img`, `hq`, `mime`, `maxkb`, `pp`, `page`, `ua`, and `lang`, which map directly onto `RenderOptions`. Per-site JSON files accept `{"mode":"full|compact","headers":{...}}`.
 
 ## Debugging and Tooling

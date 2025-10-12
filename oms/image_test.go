@@ -50,7 +50,10 @@ func TestEncodeImageRespectsScreenWidth(t *testing.T) {
 		}
 	}
 
-	data, w, h, mime, _, err := encodeImage(src, RenderOptions{ImageMIME: "image/jpeg", ScreenW: 120})
+	opts := defaultRenderPrefs()
+	opts.ImageMIME = "image/jpeg"
+	opts.ScreenW = 120
+	data, w, h, mime, _, err := encodeImage(src, opts)
 	if err != nil {
 		t.Fatalf("encodeImage returned error: %v", err)
 	}
