@@ -1,60 +1,89 @@
 package proxy
 
 import (
-	"encoding/json"
-	"io"
-	"net/http"
-	"strconv"
-	"strings"
+    "encoding/json"
+    "io"
+    "net/http"
+    "strconv"
+    "strings"
 
-	"operetta/oms"
+    "operetta/oms"
 )
 
 func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
-	if r.Method == http.MethodPost {
-		body, _ := io.ReadAll(r.Body)
-		r.Body.Close()
-		params := parseNullKV(body)
-		if raw := params["u"]; raw != "" {
-			target := normalizeObmlURL(raw)
-			hdr := s.headersFromParams(r, params)
-			opt := s.renderOptionsFromParams(r, params, hdr)
-			if s.isInternalAboutRequest(raw, target) {
-				page := s.renderAboutPage(params)
-				s.writeOMS(w, page.Data, page.SetCookies)
-				return
-			}
-			if s.shouldServeLocalBookmarks() && looksLikeBookmarksPortal(target) {
-				if page := s.renderLocalBookmarks(params["c"], params["h"], opt); page != nil {
-					page.Normalize()
-					s.writeOMS(w, page.Data, page.SetCookies)
-					return
-				}
-			}
-			s.renderPrefs.Remember(s.renderPrefKey(r, params["u"]), opt)
-			cacheHit := s.serveFromCache(w, target, opt)
-			if cacheHit {
-				return
-			}
-			page, err := s.loadPage(target, hdr, opt)
-			if err != nil {
-				http.Error(w, err.Error(), http.StatusBadGateway)
-				return
-			}
-			for _, sc := range page.SetCookies {
-				w.Header().Add("Set-Cookie", sc)
-			}
-			page.Normalize()
-			s.cache.Store(target, opt, hdr, page)
-			s.writeOMS(w, page.Data, page.SetCookies)
-			return
-		}
-		w.Header().Set("Content-Type", "application/xml; charset=utf-8")
-		w.Header().Set("Connection", "close")
-		w.Header().Set("Content-Length", "0")
-		w.WriteHeader(http.StatusOK)
-		return
-	}
+    if r.Method == http.MethodPost {
+        body, _ := io.ReadAll(r.Body)
+        r.Body.Close()
+        params := parseNullKV(body)
+        // Ensure per-client auth tokens are present or create them.
+        clientKey := clientAuthKeyFromRequest(r)
+        hadCookie := false
+        if _, err := r.Cookie(authCookieName); err == nil {
+            hadCookie = true
+        }
+        tok := s.auth.ensure(clientKey)
+        if strings.TrimSpace(params["c"]) == "" {
+            params["c"] = tok.Code
+        }
+        if strings.TrimSpace(params["h"]) == "" {
+            params["h"] = tok.Prefix
+        }
+        // If no URL was provided, reply with a minimal valid OMS page so clients don't show an error dialog.
+        if raw := params["u"]; raw == "" {
+            // set association cookie if needed
+            if !hadCookie {
+                http.SetCookie(w, s.auth.cookieFor(clientKey))
+            }
+            page := s.renderBootstrapPage(tok.Code, tok.Prefix)
+            s.writeOMS(w, page.Data, page.SetCookies)
+            return
+        }
+        if raw := params["u"]; raw != "" {
+            target := normalizeObmlURL(raw)
+            hdr := s.headersFromParams(r, params)
+            opt := s.renderOptionsFromParams(r, params, hdr)
+            if s.isInternalAboutRequest(raw, target) {
+                page := s.renderAboutPage(params)
+                s.writeOMS(w, page.Data, page.SetCookies)
+                return
+            }
+            if s.shouldServeLocalBookmarks() && looksLikeBookmarksPortal(target) {
+                if page := s.renderLocalBookmarks(params["c"], params["h"], opt); page != nil {
+                    page.Normalize()
+                    if !hadCookie {
+                        http.SetCookie(w, s.auth.cookieFor(clientKey))
+                    }
+                    s.writeOMS(w, page.Data, page.SetCookies)
+                    return
+                }
+            }
+            s.renderPrefs.Remember(s.renderPrefKey(r, params["u"]), opt)
+            cacheHit := s.serveFromCache(w, target, opt)
+            if cacheHit {
+                return
+            }
+            page, err := s.loadPage(target, hdr, opt)
+            if err != nil {
+                http.Error(w, err.Error(), http.StatusBadGateway)
+                return
+            }
+            for _, sc := range page.SetCookies {
+                w.Header().Add("Set-Cookie", sc)
+            }
+            page.Normalize()
+            s.cache.Store(target, opt, hdr, page)
+            if !hadCookie {
+                http.SetCookie(w, s.auth.cookieFor(clientKey))
+            }
+            s.writeOMS(w, page.Data, page.SetCookies)
+            return
+        }
+        w.Header().Set("Content-Type", "application/xml; charset=utf-8")
+        w.Header().Set("Connection", "close")
+        w.Header().Set("Content-Length", "0")
+        w.WriteHeader(http.StatusOK)
+        return
+    }
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Content-Length", strconv.Itoa(len(s.cfg.IndexHTML)))
 	w.Header().Set("Connection", "close")
@@ -408,6 +437,29 @@ func (s *Server) renderAboutPage(params map[string]string) *oms.Page {
 	page.Finalize()
 	page.Normalize()
 	return page
+}
+
+func (s *Server) renderBootstrapPage(authCode, authPrefix string) *oms.Page {
+    page := oms.NewPage()
+    // Use a canonical HTTP URL string as first field to satisfy legacy clients
+    page.AddString("1/http://opera-mini.ru/bndex.php")
+    if strings.TrimSpace(authCode) != "" {
+        page.AddAuthcode(authCode)
+    }
+    if strings.TrimSpace(authPrefix) != "" {
+        page.AddAuthprefix(authPrefix)
+    }
+    page.AddStyle(oms.StyleDefault)
+    page.AddPlus()
+    page.AddText("OK")
+    page.Finalize()
+    // Conservative normalize with a small stag value, matching simple portal-like pages
+    if nb, err := oms.NormalizeOMSWithStag(page.Data, 4); err == nil && nb != nil {
+        page.Data = nb
+    } else {
+        page.Normalize()
+    }
+    return page
 }
 
 func looksLikeBookmarksPortal(target string) bool {

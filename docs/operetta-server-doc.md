@@ -1,18 +1,18 @@
-# Operetta Server Documentation
-- **Community OBML spec** — [grawity/obml-parser – obml-format.md](https://github.com/grawity/obml-parser/blob/master/obml-format.md) documents later OBML versions for comparison.
+﻿# Operetta Server Documentation
+- **Community OBML spec** вЂ” [grawity/obml-parser вЂ“ obml-format.md](https://github.com/grawity/obml-parser/blob/master/obml-format.md) documents later OBML versions for comparison.
 # Operetta Server Documentation
 
 ## Overview
-Operetta is a Go-based reimplementation of the Opera Mini 1.x–3.x gateway, tuned for the 2.06 modded client. It accepts legacy Opera Mini (OM) POST handshakes, fetches upstream HTML, and produces OMS/OBML v2 byte streams that the client can render. This guide explains the server architecture, the OBML encoding it emits, and the specifics of the Opera Mini ↔ Operetta protocol.
+Operetta is a Go-based reimplementation of the Opera Mini 1.xвЂ“3.x gateway, tuned for the 2.06 modded client. It accepts legacy Opera Mini (OM) POST handshakes, fetches upstream HTML, and produces OMS/OBML v2 byte streams that the client can render. This guide explains the server architecture, the OBML encoding it emits, and the specifics of the Opera Mini в†” Operetta protocol.
 
 ## Repository Layout
-- `cmd/operetta/` – CLI entry point that instantiates `proxy.New(...)` and wires it into `net/http.Server`.
-- `internal/proxy/` – Modular HTTP server: configuration (`config.go`), handlers (`handlers.go`), logging, render-preference store, per-client cookie jars, pagination cache, and site-config loader.
-- `internal/proxy/url.go` – URL helpers (Opera-style /obml rewriting, action/build logic) with tests.
-- `oms/` – Rendering engine split into focused files (`page.go`, `normalize.go`, `cache_disk.go`, etc.) covering HTML fetch, CSS heuristics, DOM walking, image pipeline and OMS finalisation.
-- `config/sites/` – Host-specific overrides (`mode`, `headers`) loaded per target; override the directory via `OMS_SITES_DIR`.
-- `docs/` – Background notes (`OBML.md`, `oms_protocol.md`) plus this guide.
-- `dist/`, `build.ps1`, `build.sh`, `Makefile` – Build artefacts and helper scripts.
+- `cmd/operetta/` вЂ“ CLI entry point that instantiates `proxy.New(...)` and wires it into `net/http.Server`.
+- `internal/proxy/` вЂ“ Modular HTTP server: configuration (`config.go`), handlers (`handlers.go`), logging, render-preference store, per-client cookie jars, pagination cache, and site-config loader.
+- `internal/proxy/url.go` вЂ“ URL helpers (Opera-style /obml rewriting, action/build logic) with tests.
+- `oms/` вЂ“ Rendering engine split into focused files (`page.go`, `normalize.go`, `cache_disk.go`, etc.) covering HTML fetch, CSS heuristics, DOM walking, image pipeline and OMS finalisation.
+- `config/sites/` вЂ“ Host-specific overrides (`mode`, `headers`) loaded per target; override the directory via `OMS_SITES_DIR`.
+- `docs/` вЂ“ Background notes (`OBML.md`, `oms_protocol.md`) plus this guide.
+- `dist/`, `build.ps1`, `build.sh`, `Makefile` вЂ“ Build artefacts and helper scripts.
 
 ## Runtime Architecture
 1. `cmd/operetta/main.go` reads the `-addr` flag (or `PORT`), builds a `proxy.Config` via `proxy.DefaultConfig()`, and passes it to `proxy.New(cfg)`. The returned `*proxy.Server` implements `http.Handler`.
@@ -22,7 +22,7 @@ Operetta is a Go-based reimplementation of the Opera Mini 1.x–3.x gateway, tun
 5. The handler finalises response headers (`Content-Type: application/octet-stream`, explicit `Content-Length`, `Connection: close`), logs abbreviated OMS diagnostics via `dumpOMS`, writes cookies from `page.SetCookies`, updates the pagination cache, and streams the packed OMS binary back to the client.
 
 ## Opera Mini Handshake
-Opera Mini 2.x sends `Content-Type: application/xml`, but the body is a null-delimited list of `key=value` pairs. Operetta reads them directly, applies device hints, and echoes Opera’s authentication tokens in the response.
+Opera Mini 2.x sends `Content-Type: application/xml`, but the body is a null-delimited list of `key=value` pairs. Operetta reads them directly, applies device hints, and echoes OperaвЂ™s authentication tokens in the response.
 
 ```text
 POST / HTTP/1.1
@@ -64,15 +64,25 @@ j=opf=1&q=Yukaba&btnG=Search+in+Google
 | `t` | Phone-number auto-detection toggle (`0` disables linking). |
 | `w` | Multipart indicator `partCurrent;isLast` for paginated pages. |
 | `e` | Compression hint: `def` (deflate) or `none`. |
+### Two-Phase POST on First Launch
+
+Some clients perform a short bootstrap POST right after startup when they lack local configuration or auth tokens. This bootstrap response carries transport and format hints (e.g., preferred gateway mode, optional proxy host/port, feature flags, and format version). After applying these values, the client immediately sends a second, full POST that requests the page content.
+
+Server expectations:
+- Always return a complete and consistent bootstrap payload so the client can proceed without manual retries.
+- Treat the second POST as a normal page fetch with the same connection semantics (explicit Content-Length, Connection: close).
+- Expect the bootstrap to repeat after cache resets, transport changes, or session loss — this is normal protocol behaviour.
+
+Operationally this explains why the first request you see is small (~hundreds of bytes), followed by a larger one that contains the full set of device and rendering parameters.
 | `j` | URL-encoded form payload appended on submission. |
 
 **Response.** Operetta replies with `HTTP/1.1 200 OK`, sets `Content-Type: application/octet-stream`, always provides `Content-Length`, and closes the connection to satisfy MIDP client expectations. The body is the packed OMS binary described below.
 
 ## HTTP Endpoints
-- `POST /` — Primary Opera Mini ingress: handles the handshake, internal `server:` pages, local bookmark fallbacks, and OBML generation.
-- `GET /fetch` — Diagnostic/manual entry point that mirrors proxy behaviour for a given URL; accepts `url`, `action`, `get`, `ua`, `lang`, `img`, `hq`, `mime`, `maxkb`, `pp`, and `page` parameters.
-- `GET /validate` — Fetches the target twice (full and compact), normalises both, and returns JSON with `analyzeOMS` metrics.
-- `GET /ping` — Lightweight liveness probe that returns `pong`.
+- `POST /` вЂ” Primary Opera Mini ingress: handles the handshake, internal `server:` pages, local bookmark fallbacks, and OBML generation.
+- `GET /fetch` вЂ” Diagnostic/manual entry point that mirrors proxy behaviour for a given URL; accepts `url`, `action`, `get`, `ua`, `lang`, `img`, `hq`, `mime`, `maxkb`, `pp`, and `page` parameters.
+- `GET /validate` вЂ” Fetches the target twice (full and compact), normalises both, and returns JSON with `analyzeOMS` metrics.
+- `GET /ping` вЂ” Lightweight liveness probe that returns `pong`.
 
 ## Rendering Pipeline
 - **Fetch & request shaping.** `LoadPageWithHeadersAndOptions` / `LoadCompactPageWithHeaders` build the origin request, apply per-site header overrides, forward cookies and referer, switch to POST when `RenderOptions.FormBody` is present, and force gzip-only `Accept-Encoding` to avoid Brotli.
@@ -80,7 +90,7 @@ j=opf=1&q=Yukaba&btnG=Search+in+Google
 - **Stylesheet assembly.** `buildStylesheet` collects inline `<style>` blocks and up to three linked stylesheets, normalises simple CSS properties, and feeds them to `computeStyleFor` for decisions such as `display:none` and colours.
 - **DOM traversal.** The recursive `walkRich` walker skips hidden nodes, recognises structure (`p`, headings, lists, `hr`/`br`), emits OBML tags, and ensures headings become bold separators via `AddPlus` and style flags.
 - **Text & styles.** Text nodes become `T` tags with UTF-8 payload; `walkState` tracks style bits (`styleBoldBit`, `styleItalicBit`, `styleUnderBit`, `styleCenterBit`, `styleRightBit`) and emits `S` tags when the active style changes.
-- **Forms & controls.** `<form>` (`h`), `<input>` (`x`, `p`, `i`, `u`, `b`, `e`, `c`, `r`), and `<select>` (`s`, `o`, optional `l`) are rendered, mirroring Opera’s expectations and echoing submitted payload via `RenderOptions.FormBody`.
+- **Forms & controls.** `<form>` (`h`), `<input>` (`x`, `p`, `i`, `u`, `b`, `e`, `c`, `r`), and `<select>` (`s`, `o`, optional `l`) are rendered, mirroring OperaвЂ™s expectations and echoing submitted payload via `RenderOptions.FormBody`.
 - **Images.** `fetchAndEncodeImage` obeys `RenderOptions.ImagesOn`, uses in-memory and optional disk LRU caches (`OMS_IMG_CACHE_DIR`, `OMS_IMG_CACHE_MB`), converts to JPEG/PNG as requested, rescales with `golang.org/x/image/draw`, and emits `I` tags; oversized or disabled images fall back to `J` placeholders.
 - **Pagination & navigation.** `RenderOptions.MaxTagsPerPage` splits payloads via `splitByTags`; navigation fragments are appended when `RenderOptions.ServerBase` is known. Packed snapshots land in `Page.CachePacked` for reuse by `SelectOMSPartFromPacked`.
 - **Finalisation & normalisation.** `Page.finalize()` appends the terminal `Q`, computes conservative tag/string counts (tunable via `OMS_TAGCOUNT_MODE` / `OMS_TAGCOUNT_DELTA`), writes the V2 header, deflates the payload, and prefixes the transport header. `NormalizeOMS` / `NormalizeOMSWithStag` repack responses to stabilise counts (e.g., force `stag_count = 0x0400`).
@@ -91,7 +101,7 @@ j=opf=1&q=Yukaba&btnG=Search+in+Google
 - **V2 header fields.** The deflated stream starts with a 35-byte V2 header containing byte-swapped `TagCount`, `PartCurrent`, `PartCount`, `StagCount`, and `Cachable=0xFFFF`. Operetta mirrors the legacy C implementation by swapping bytes (`swap16`) and counting the trailing `Q`.
 - **Strings & encoding.** Strings are big-endian length-prefixed UTF-8 blobs; the first string after the header is the canonical page URL (for example `1/http://...`).
 - **Colours & styles.** Colours use 16-bit BGR565 (`calcColor`), while styles use 32-bit masks stored big-endian. `AddBgcolor`, `AddTextcolor`, and `AddStyle` emit `R`, `D`, and `S` tags.
-- **Compatibility.** Operetta targets OMS/OBML v2 as used by Opera Mini 2.x. Later OBML variants (v12–v16) with chunked sections, ARGB colours, or relative coordinates are not emitted.
+- **Compatibility.** Operetta targets OMS/OBML v2 as used by Opera Mini 2.x. Later OBML variants (v12вЂ“v16) with chunked sections, ARGB colours, or relative coordinates are not emitted.
 
 | Tag | Payload | Meaning |
 | --- | --- | --- |
@@ -158,6 +168,6 @@ In code, `proxy.DefaultConfig()` exposes the same defaults while letting you ove
 - **Transport.** Responses are always unchunked HTTP/1.1 with `Connection: close`; HTTPS support relies on external termination (reverse proxy or stunnel).
 
 ## Further Reading
-- **`docs/OBML.md`** — Deep dive into tag layout, pagination, and transport header nuances used by Operetta.
-- **`docs/oms_protocol.md`** — Legacy C/Java protocol reference that informed the Go port.
-- **Community OBML spec** — [grawity/obml-parser – obml-format.md](https://github.com/grawity/obml-parser/blob/master/obml-format.md) documents later OBML versions for comparison.
+- **`docs/OBML.md`** вЂ” Deep dive into tag layout, pagination, and transport header nuances used by Operetta.
+- **`docs/oms_protocol.md`** вЂ” Legacy C/Java protocol reference that informed the Go port.
+- **Community OBML spec** вЂ” [grawity/obml-parser вЂ“ obml-format.md](https://github.com/grawity/obml-parser/blob/master/obml-format.md) documents later OBML versions for comparison.

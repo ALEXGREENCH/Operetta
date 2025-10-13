@@ -101,15 +101,16 @@ func parseBookmarks(raw string) []Bookmark {
 
 // Server exposes the HTTP handlers implementing the proxy behaviour.
 type Server struct {
-	cfg         Config
-	mux         *http.ServeMux
-	handler     http.Handler
-	logger      *log.Logger
-	renderPrefs *renderPrefStore
-	cookieJars  *cookieJarStore
-	cache       *pageCache
-	sites       *siteConfigStore
-	clock       func() time.Time
+    cfg         Config
+    mux         *http.ServeMux
+    handler     http.Handler
+    logger      *log.Logger
+    renderPrefs *renderPrefStore
+    cookieJars  *cookieJarStore
+    auth        *authStore
+    cache       *pageCache
+    sites       *siteConfigStore
+    clock       func() time.Time
 }
 
 // New wires a new proxy server with the provided configuration.
@@ -126,16 +127,17 @@ func New(cfg Config) *Server {
 	if cfg.SitesDir == "" {
 		cfg.SitesDir = defaultSitesDir
 	}
-	s := &Server{
-		cfg:         cfg,
-		mux:         http.NewServeMux(),
-		logger:      cfg.Logger,
-		renderPrefs: newRenderPrefStore(),
-		cookieJars:  newCookieJarStore(),
-		cache:       newPageCache(cfg.Clock),
-		sites:       newSiteConfigStore(cfg.SitesDir),
-		clock:       cfg.Clock,
-	}
+    s := &Server{
+        cfg:         cfg,
+        mux:         http.NewServeMux(),
+        logger:      cfg.Logger,
+        renderPrefs: newRenderPrefStore(),
+        cookieJars:  newCookieJarStore(),
+        auth:        newAuthStore(cfg.Clock),
+        cache:       newPageCache(cfg.Clock),
+        sites:       newSiteConfigStore(cfg.SitesDir),
+        clock:       cfg.Clock,
+    }
 	s.registerRoutes()
 	s.handler = withLogging(s.logger, s.mux)
 	return s
