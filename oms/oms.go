@@ -297,23 +297,131 @@ func cssToHex(v string) string {
 
 // splitByTags splits a raw payload (without V2 header) into parts with at most
 // maxTags tags each. Each part starts with the original leading OMS string (URL).
+// maxBytesBudget returns the per-part byte budget used for pagination.
+// Default is 32KB, optionally overridden by OMS_PAGINATE_BYTES (min 1KB).
+func maxBytesBudget() int {
+    maxBytes := defaultPaginationBytes
+    if s := strings.TrimSpace(os.Getenv("OMS_PAGINATE_BYTES")); s != "" {
+        if v, err := strconv.Atoi(s); err == nil {
+            if v <= 0 {
+                maxBytes = 0
+            } else {
+                maxBytes = v
+            }
+        }
+    }
+    if maxBytes > 0 && maxBytes < 1024 {
+        maxBytes = 1024
+    }
+    return maxBytes
+}
+
+// shrinkPartToMaxBytes trims a single part (prefix + tagged body) so that its
+// total raw size does not exceed limit. Trimming respects tag boundaries.
+func shrinkPartToMaxBytes(part []byte, limit int) []byte {
+    if limit <= 0 || len(part) <= limit || len(part) < 2 {
+        return part
+    }
+    // Prefix: initial OMS string
+    l := int(binary.BigEndian.Uint16(part[0:2]))
+    if 2+l > len(part) {
+        return part
+    }
+    // Ensure limit is at least room for prefix
+    if limit <= 2+l {
+        // Cannot fit any body; return only prefix; finalize() will add 'Q'.
+        return append([]byte{}, part[:2+l]...)
+    }
+    allowedBody := limit - (2 + l)
+    start := 2 + l
+    p := start
+    limitAll := len(part)
+    for p < limitAll {
+        tag := part[p]
+        // Prospective new position after including this tag fully
+        np := p + 1
+        switch tag {
+        case 'T', 'L':
+            if np+2 > limitAll { np = limitAll; break }
+            ln := int(binary.BigEndian.Uint16(part[np : np+2]))
+            np += 2 + ln
+        case 'E', 'B', '+', 'V', 'Q', 'l':
+            // no payload
+        case 'D', 'R':
+            np += 2
+        case 'S', 'J':
+            np += 4
+        case 'I':
+            if np+8 > limitAll { np = limitAll; break }
+            dl := int(binary.BigEndian.Uint16(part[np+4 : np+6]))
+            np += 8 + dl
+        case 'k':
+            // type + string
+            if np+1 > limitAll { np = limitAll; break }
+            np += 1
+            if np+2 > limitAll { np = limitAll; break }
+            ln := int(binary.BigEndian.Uint16(part[np : np+2]))
+            np += 2 + ln
+        case 'h':
+            for i := 0; i < 2; i++ {
+                if np+2 > limitAll { np = limitAll; break }
+                ln := int(binary.BigEndian.Uint16(part[np : np+2]))
+                np += 2 + ln
+            }
+        case 'x':
+            np += 1
+            for i := 0; i < 2; i++ {
+                if np+2 > limitAll { np = limitAll; break }
+                ln := int(binary.BigEndian.Uint16(part[np : np+2]))
+                np += 2 + ln
+            }
+        case 'p', 'u', 'i', 'b', 'e':
+            for i := 0; i < 2; i++ {
+                if np+2 > limitAll { np = limitAll; break }
+                ln := int(binary.BigEndian.Uint16(part[np : np+2]))
+                np += 2 + ln
+            }
+        case 'c', 'r':
+            for i := 0; i < 2; i++ {
+                if np+2 > limitAll { np = limitAll; break }
+                ln := int(binary.BigEndian.Uint16(part[np : np+2]))
+                np += 2 + ln
+            }
+            np += 1
+        case 's':
+            if np+2 > limitAll { np = limitAll; break }
+            ln := int(binary.BigEndian.Uint16(part[np : np+2]))
+            np += 2 + ln
+            if np+1 > limitAll { np = limitAll; break }
+            np += 1
+            if np+2 > limitAll { np = limitAll; break }
+            np += 2
+        case 'o':
+            for i := 0; i < 2; i++ {
+                if np+2 > limitAll { np = limitAll; break }
+                ln := int(binary.BigEndian.Uint16(part[np : np+2]))
+                np += 2 + ln
+            }
+            np += 1
+        default:
+            // Unknown tag: stop
+            np = limitAll
+        }
+        nextBody := (np - start)
+        if nextBody > allowedBody { break }
+        p = np
+    }
+    if p <= start { // nothing fits beyond prefix
+        return append([]byte{}, part[:2+l]...)
+    }
+    return append([]byte{}, part[:p]...)
+}
+
 func splitByTags(b []byte, maxTags int) [][]byte {
 	if maxTags <= 0 || len(b) < 2 {
 		return [][]byte{b}
 	}
-	maxBytes := defaultPaginationBytes
-	if s := strings.TrimSpace(os.Getenv("OMS_PAGINATE_BYTES")); s != "" {
-		if v, err := strconv.Atoi(s); err == nil {
-			if v <= 0 {
-				maxBytes = 0
-			} else {
-				maxBytes = v
-			}
-		}
-	}
-	if maxBytes > 0 && maxBytes < 1024 {
-		maxBytes = 1024
-	}
+    maxBytes := maxBytesBudget()
 	// Prefix is initial page URL string (len + bytes)
 	if len(b) < 2 {
 		return [][]byte{b}
@@ -445,10 +553,10 @@ func splitByTags(b []byte, maxTags int) [][]byte {
 		part := append(append([]byte(nil), prefix...), b[start:limit]...)
 		parts = append(parts, part)
 	}
-	if len(parts) == 0 {
-		return [][]byte{b}
-	}
-	return parts
+    if len(parts) == 0 {
+        return [][]byte{b}
+    }
+    return parts
 }
 
 // ---------------------- Image cache (LRU by bytes) ----------------------
@@ -3189,11 +3297,19 @@ func LoadPageWithHeadersAndOptions(oURL string, hdr http.Header, opts *RenderOpt
 		if rp.MaxInlineKB > 0 {
 			nav.AddHidden("maxkb", strconv.Itoa(rp.MaxInlineKB))
 		}
-		nav.AddTextInput("page", "")
-		nav.AddText(" ")
-		nav.AddSubmit("go", "OK")
-		nav.AddHr("")
-		sel = append(sel, nav.Data...)
+        nav.AddTextInput("page", "")
+        nav.AddText(" ")
+        nav.AddSubmit("go", "OK")
+        nav.AddHr("")
+        // Ensure final raw page (content + nav) does not exceed per-part byte budget.
+        // Shrink the selected chunk before appending nav.
+        budget := maxBytesBudget()
+        allowed := budget - len(nav.Data)
+        if allowed < 1024 { // keep a sane minimal room for content
+            allowed = 1024
+        }
+        sel = shrinkPartToMaxBytes(sel, allowed)
+        sel = append(sel, nav.Data...)
 	}
 	p.Data = sel
 	p.partCur = pageIdx
