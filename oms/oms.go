@@ -430,13 +430,96 @@ func splitByTags(b []byte, maxTags int) [][]byte {
 	if 2+l > len(b) {
 		return [][]byte{b}
 	}
-	prefix := make([]byte, 2+l)
-	copy(prefix, b[:2+l])
-	p := 2 + l
-	start := p
+    prefix := make([]byte, 2+l)
+    copy(prefix, b[:2+l])
+    p := 2 + l
+    // Capture a short prelude of global tags (style/bg/auth) to prepend to
+    // all parts after the first, so style/fg/bg persist across pages for OM2.
+    preludeStart := p
+    pp := p
+    for pp < len(b) {
+        tag := b[pp]
+        pp++
+        switch tag {
+        case 'S':
+            if pp+4 > len(b) { pp = len(b); break }
+            pp += 4
+        case 'D':
+            if pp+2 > len(b) { pp = len(b); break }
+            pp += 2
+        case 'k':
+            // type + string
+            if pp+1 > len(b) { pp = len(b); break }
+            pp += 1
+            if pp+2 > len(b) { pp = len(b); break }
+            ln := int(binary.BigEndian.Uint16(b[pp : pp+2]))
+            pp += 2 + ln
+        default:
+            // stop at first non-global tag
+            pp--
+            goto PreludeDone
+        }
+        // continue scanning next tag
+    }
+PreludeDone:
+    preludeRaw := append([]byte(nil), b[preludeStart:pp]...)
+    // Normalize prelude so it preserves bg and text color without resetting it
+    // back to default. Keep all 'k' tags, keep the last 'D' (bgcolor) and the
+    // last 'S' that carries a non-zero color component; drop trailing plain 'S'
+    // that would override color on subsequent pages.
+    normalizePrelude := func(src []byte) []byte {
+        var outK [][]byte
+        var haveD bool
+        var dTag []byte
+        var sColor []byte
+        pz := 0
+        for pz < len(src) {
+            tag := src[pz]
+            start := pz
+            pz++
+            switch tag {
+            case 'S':
+                if pz+4 > len(src) { pz = len(src); break }
+                val := src[pz : pz+4]
+                pz += 4
+                // style color lives in bits 8..23 (uint32 big-endian)
+                sv := binary.BigEndian.Uint32(val)
+                if (sv & 0x00FFFF00) != 0 { // has color component
+                    buf := make([]byte, 1+4)
+                    buf[0] = 'S'
+                    copy(buf[1:], val)
+                    sColor = buf
+                }
+            case 'D':
+                if pz+2 > len(src) { pz = len(src); break }
+                dTag = append([]byte(nil), src[start:pz+2]...)
+                haveD = true
+                pz += 2
+            case 'k':
+                if pz+1 > len(src) { pz = len(src); break }
+                pz += 1 // type
+                if pz+2 > len(src) { pz = len(src); break }
+                ln := int(binary.BigEndian.Uint16(src[pz : pz+2]))
+                pz += 2 + ln
+                outK = append(outK, append([]byte(nil), src[start:pz]...))
+            default:
+                // stop parsing unknowns in prelude area
+                pz = len(src)
+            }
+        }
+        var out []byte
+        for _, k := range outK { out = append(out, k...) }
+        if haveD { out = append(out, dTag...) }
+        if sColor != nil { out = append(out, sColor...) }
+        return out
+    }
+    prelude := normalizePrelude(preludeRaw)
+    // Keep first part intact (with prelude). Later parts will get prelude inserted.
+    start := p
 	tags := 0
 	limit := len(b)
-	parts := make([][]byte, 0, 2)
+    parts := make([][]byte, 0, 2)
+    partIdx := 0
 	for p < limit {
 		tag := b[p]
 		p++
@@ -542,17 +625,26 @@ func splitByTags(b []byte, maxTags int) [][]byte {
 		chunkBytes := p - start
 		if tags >= maxTags || (maxBytes > 0 && chunkBytes >= maxBytes) {
 			// Cut part [start:p)
-			chunk := append([]byte(nil), b[start:p]...)
-			part := append(append([]byte(nil), prefix...), chunk...)
-			parts = append(parts, part)
-			start = p
-			tags = 0
-		}
-	}
-	if start < limit {
-		part := append(append([]byte(nil), prefix...), b[start:limit]...)
-		parts = append(parts, part)
-	}
+            chunk := append([]byte(nil), b[start:p]...)
+            part := append([]byte(nil), prefix...)
+            if partIdx > 0 && len(prelude) > 0 {
+                part = append(part, prelude...)
+            }
+            part = append(part, chunk...)
+            parts = append(parts, part)
+            start = p
+            tags = 0
+            partIdx++
+        }
+    }
+    if start < limit {
+        part := append([]byte(nil), prefix...)
+        if partIdx > 0 && len(prelude) > 0 {
+            part = append(part, prelude...)
+        }
+        part = append(part, b[start:limit]...)
+        parts = append(parts, part)
+    }
     if len(parts) == 0 {
         return [][]byte{b}
     }
@@ -1047,29 +1139,65 @@ type RenderOptions struct {
 
 // BuildPaginationQuery encodes paging parameters while preserving render options that affect output quality.
 func BuildPaginationQuery(target string, opts *RenderOptions, page, maxTags int) string {
-	vals := url.Values{}
-	vals.Set("url", target)
-	if maxTags > 0 {
-		vals.Set("pp", strconv.Itoa(maxTags))
-	}
-	if page > 0 {
-		vals.Set("page", strconv.Itoa(page))
-	}
-	if opts != nil {
-		if opts.ImagesOn {
-			vals.Set("img", "1")
-		}
-		if opts.HighQuality {
-			vals.Set("hq", "1")
-		}
-		if opts.ImageMIME != "" {
-			vals.Set("mime", opts.ImageMIME)
-		}
-		if opts.MaxInlineKB > 0 {
-			vals.Set("maxkb", strconv.Itoa(opts.MaxInlineKB))
-		}
-	}
-	return vals.Encode()
+    // For page 1, return a minimal query and strip our internal paging marker
+    // from target ("__p=") so the first page opens exactly like the initial
+    // load and can be satisfied from client cache.
+    if page <= 1 {
+        t := target
+        if u, err := url.Parse(target); err == nil {
+            q := u.Query()
+            if q.Has("__p") {
+                q.Del("__p")
+                u.RawQuery = q.Encode()
+                t = u.String()
+            }
+        }
+        vals := url.Values{}
+        vals.Set("url", t)
+        return vals.Encode()
+    }
+    vals := url.Values{}
+    vals.Set("url", target)
+    if maxTags > 0 {
+        vals.Set("pp", strconv.Itoa(maxTags))
+    }
+    vals.Set("page", strconv.Itoa(page))
+    if opts != nil {
+        if opts.ImagesOn {
+            vals.Set("img", "1")
+        }
+        if opts.HighQuality {
+            vals.Set("hq", "1")
+        }
+        if opts.ImageMIME != "" {
+            vals.Set("mime", opts.ImageMIME)
+        }
+        if opts.MaxInlineKB > 0 { vals.Set("maxkb", strconv.Itoa(opts.MaxInlineKB)) }
+        if opts.ScreenW > 0 { vals.Set("w", strconv.Itoa(opts.ScreenW)) }
+        if opts.ScreenH > 0 { vals.Set("h", strconv.Itoa(opts.ScreenH)) }
+        // Only propagate memory/alpha when client explicitly provided them (>0)
+        if opts.HeapBytes > 0 { vals.Set("m", strconv.Itoa(opts.HeapBytes)) }
+        if opts.AlphaLevels > 0 { vals.Set("l", strconv.Itoa(opts.AlphaLevels)) }
+        // Preserve Opera Mini auth echo and client discriminator so
+        // subsequent navigations render with the same context as the first load.
+        if strings.TrimSpace(opts.AuthCode) != "" {
+            vals.Set("c", opts.AuthCode)
+        }
+        if strings.TrimSpace(opts.AuthPrefix) != "" {
+            vals.Set("h", opts.AuthPrefix)
+        }
+        if opts.GatewayVersion > 0 {
+            vals.Set("o", strconv.Itoa(opts.GatewayVersion))
+        }
+        // Some clients pass explicit protocol version; keep it if caller set it.
+        switch normalizeClientVersion(opts.ClientVersion) {
+        case ClientVersion1:
+            vals.Set("version", "1")
+        case ClientVersion3:
+            vals.Set("version", "3")
+        }
+    }
+    return vals.Encode()
 }
 
 func ensureUpstreamUserAgent(hdr http.Header) {
@@ -3209,6 +3337,17 @@ func LoadPageWithHeadersAndOptions(oURL string, hdr http.Header, opts *RenderOpt
 	if pageIdx < 1 {
 		pageIdx = 1
 	}
+	// Pack full raw page once for cache so later selections (page>1) operate on
+	// the complete document, not on the already-sliced first page with nav.
+	// This fixes the issue where clicking page=2 could return page 1 from cache.
+	{
+		fullRaw := append([]byte(nil), p.Data...)
+		packed := NewPage()
+		packed.Data = fullRaw
+		packed.SetTransport(rp.ClientVersion, rp.Compression)
+		packed.finalize()
+		p.CachePacked = append([]byte(nil), packed.Data...)
+	}
 	parts := splitByTags(p.Data, maxTags)
 	if len(parts) == 0 {
 		p.finalize()
@@ -3217,7 +3356,12 @@ func LoadPageWithHeadersAndOptions(oURL string, hdr http.Header, opts *RenderOpt
 	if pageIdx > len(parts) {
 		pageIdx = len(parts)
 	}
-	sel := parts[pageIdx-1]
+    sel := parts[pageIdx-1]
+    // Rewrite only for pages >1 so OM2 history treats them as distinct.
+    // Do NOT rewrite page 1 to avoid style regressions on return.
+    if pageIdx > 1 {
+        sel = rewriteInitialURLRaw(sel, pageIdx)
+    }
 	serverBase := ""
 	if opts != nil {
 		serverBase = opts.ServerBase
