@@ -434,7 +434,11 @@ func (p *Page) finalize() {
 	binary.LittleEndian.PutUint16(header[:2], headerWord)
 	binary.BigEndian.PutUint32(header[2:], uint32(size))
 	p.Data = append(header, payload...)
-	p.CachePacked = append([]byte(nil), p.Data...)
+    // Preserve pre-set packed full-page if caller prepared it earlier.
+    // Otherwise, default to caching the finalized data.
+    if len(p.CachePacked) == 0 {
+        p.CachePacked = append([]byte(nil), p.Data...)
+    }
 }
 
 // Normalize ensures the final OMS payload strictly follows conservative

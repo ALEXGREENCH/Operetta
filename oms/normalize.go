@@ -1,11 +1,15 @@
 package oms
 
 import (
-	"bytes"
-	"compress/flate"
-	"compress/gzip"
-	"encoding/binary"
-	"io"
+    "bytes"
+    "compress/flate"
+    "compress/gzip"
+    "encoding/binary"
+    "fmt"
+    "io"
+    "sort"
+    "strconv"
+    "strings"
 )
 
 func decompressPayload(method CompressionMethod, payload []byte) ([]byte, error) {
@@ -180,14 +184,224 @@ func SelectOMSPartFromPacked(data []byte, page, maxTags int) ([]byte, int, int, 
 	if page > total {
 		page = total
 	}
-	selected := append([]byte(nil), parts[page-1]...)
-	partPage := NewPage()
-	partPage.Data = selected
-	partPage.partCur = page
-	partPage.partCnt = total
-	partPage.SetTransport(version, compression)
-	partPage.finalize()
-	return partPage.Data, page, total, nil
+    selected := append([]byte(nil), parts[page-1]...)
+    // Ensure legacy clients treat parts as distinct pages by rewriting the
+    // first OMS string to include a page discriminator.
+    if page > 1 {
+        selected = rewriteInitialURLRaw(selected, page)
+    }
+    partPage := NewPage()
+    partPage.Data = selected
+    partPage.partCur = page
+    partPage.partCnt = total
+    partPage.SetTransport(version, compression)
+    partPage.finalize()
+    // Normalize to enforce conservative header fields (e.g., stag_count=0x0400)
+    // that some OM 2.x builds expect for pagination to work correctly.
+    partPage.Normalize()
+    return partPage.Data, page, total, nil
+}
+
+// rewriteInitialURLRaw rewrites the very first OMS string ("1/<url>") inside a raw part
+// to include a page discriminator so legacy clients (OM 2.x) treat different parts
+// as different pages in history/cache. It appends "__p=<page>" as a query parameter.
+func rewriteInitialURLRaw(raw []byte, page int) []byte {
+    if page <= 1 || len(raw) < 2 {
+        return raw
+    }
+    ln := int(binary.BigEndian.Uint16(raw[0:2]))
+    if 2+ln > len(raw) {
+        return raw
+    }
+    s := string(raw[2 : 2+ln])
+    if len(s) < 2 || s[0] != '1' || s[1] != '/' {
+        return raw
+    }
+    base := s[2:]
+    sep := "?"
+    for i := 0; i < len(base); i++ { if base[i] == '?' { sep = "&"; break } }
+    // Build new string
+    nb := []byte("1/" + base + sep + "__p=" + strconv.Itoa(page))
+    out := make([]byte, 2+len(nb))
+    binary.BigEndian.PutUint16(out[0:2], uint16(len(nb)))
+    copy(out[2:], nb)
+    out = append(out, raw[2+ln:]...)
+    return out
+}
+
+// SelectOMSPartFromPackedWithNav selects a part from a packed OMS payload and
+// injects navigation (top and bottom) similar to classic WAP portals.
+// It preserves render options that affect output via URL parameters to keep
+// cache keys stable between clicks.
+func SelectOMSPartFromPackedWithNav(data []byte, page, maxTags int, serverBase, target string, opts *RenderOptions) ([]byte, int, int, error) {
+    if page <= 0 { page = 1 }
+    if maxTags <= 0 { return data, 1, 1, nil }
+    if len(data) < 6 { return data, 1, 1, io.ErrUnexpectedEOF }
+
+    headerWord := binary.LittleEndian.Uint16(data[:2])
+    version := clientVersionFromHeaderByte(byte(headerWord & 0xFF))
+    compression := compressionFromHeaderByte(byte(headerWord >> 8))
+    decoded, err := decompressPayload(compression, data[6:])
+    if err != nil { return data, 1, 1, err }
+    headerLen := 35
+    if version == ClientVersion1 { headerLen = 33 }
+    if len(decoded) < headerLen { return data, 1, 1, io.ErrUnexpectedEOF }
+    raw := decoded[headerLen:]
+    parts := splitByTags(raw, maxTags)
+    if len(parts) == 0 { return data, 1, 1, nil }
+    total := len(parts)
+    if page > total { page = total }
+    selected := append([]byte(nil), parts[page-1]...)
+
+    // Rewrite initial URL for unique client history/cache.
+    if page > 1 { selected = rewriteInitialURLRaw(selected, page) }
+
+    // Build navigation controls
+    rp := defaultRenderPrefs()
+    if opts != nil {
+        rp.ImagesOn = opts.ImagesOn
+        rp.HighQuality = opts.HighQuality
+        rp.ImageMIME = opts.ImageMIME
+        rp.MaxInlineKB = opts.MaxInlineKB
+        rp.ScreenW = opts.ScreenW
+        rp.ScreenH = opts.ScreenH
+        rp.AuthCode = opts.AuthCode
+        rp.AuthPrefix = opts.AuthPrefix
+        rp.GatewayVersion = opts.GatewayVersion
+        rp.ClientVersion = opts.ClientVersion
+    }
+    buildNav := func(cur, total int) []byte {
+        nav := NewPage()
+        // Compact, finger-friendly: [<<] [<] 1 2 … N [>] [>>]
+        nav.AddHr("")
+        // Prev block
+        if cur > 1 {
+            prevURL := serverBase + "/fetch?" + BuildPaginationQuery(target, &rp, cur-1, maxTags)
+            firstURL := serverBase + "/fetch?" + BuildPaginationQuery(target, &rp, 1, maxTags)
+            nav.AddLink("0/"+firstURL, "[<<]")
+            nav.AddText(" ")
+            nav.AddLink("0/"+prevURL, "[<]")
+        } else {
+            nav.AddText("[<<] [<]")
+        }
+        nav.AddText(" ")
+        // Numeric page list (window around current + ends)
+        pageSet := map[int]struct{}{}
+        add := func(n int) { if n >= 1 && n <= total { pageSet[n] = struct{}{} } }
+        for i := 1; i <= 3; i++ { add(i) }
+        for i := cur-2; i <= cur+2; i++ { add(i) }
+        for i := total-2; i <= total; i++ { add(i) }
+        var ordered []int
+        for n := range pageSet { ordered = append(ordered, n) }
+        sort.Ints(ordered)
+        last := 0
+        for _, n := range ordered {
+            if last != 0 && n-last > 1 {
+                nav.AddText("…")
+            }
+            label := fmt.Sprintf("[%d]", n)
+            if n == cur {
+                nav.AddText("·" + label) // mark current
+            } else {
+                url := serverBase + "/fetch?" + BuildPaginationQuery(target, &rp, n, maxTags)
+                nav.AddLink("0/"+url, label)
+            }
+            nav.AddText(" ")
+            last = n
+        }
+        // Next block
+        if cur < total {
+            nextURL := serverBase + "/fetch?" + BuildPaginationQuery(target, &rp, cur+1, maxTags)
+            lastURL := serverBase + "/fetch?" + BuildPaginationQuery(target, &rp, total, maxTags)
+            nav.AddLink("0/"+nextURL, "[>]")
+            nav.AddText(" ")
+            nav.AddLink("0/"+lastURL, "[>>]")
+        } else {
+            nav.AddText("[>] [>>]")
+        }
+        nav.AddBreak()
+        nav.AddText(fmt.Sprintf("Page %d/%d", cur, total))
+        nav.AddBreak()
+        // Quick jump form
+        formAction := "0/" + serverBase + "/fetch"
+        nav.AddForm(formAction)
+        nav.AddHidden("url", target)
+        nav.AddHidden("pp", strconv.Itoa(maxTags))
+        if rp.ImagesOn { nav.AddHidden("img", "1") }
+        if rp.HighQuality { nav.AddHidden("hq", "1") }
+        if rp.ImageMIME != "" { nav.AddHidden("mime", rp.ImageMIME) }
+        if rp.MaxInlineKB > 0 { nav.AddHidden("maxkb", strconv.Itoa(rp.MaxInlineKB)) }
+        if rp.ScreenW > 0 { nav.AddHidden("w", strconv.Itoa(rp.ScreenW)) }
+        if rp.ScreenH > 0 { nav.AddHidden("h", strconv.Itoa(rp.ScreenH)) }
+        if strings.TrimSpace(rp.AuthCode) != "" { nav.AddHidden("c", rp.AuthCode) }
+        if strings.TrimSpace(rp.AuthPrefix) != "" { nav.AddHidden("h", rp.AuthPrefix) }
+        if rp.GatewayVersion > 0 { nav.AddHidden("o", strconv.Itoa(rp.GatewayVersion)) }
+        switch normalizeClientVersion(rp.ClientVersion) {
+        case ClientVersion1:
+            nav.AddHidden("version", "1")
+        case ClientVersion3:
+            nav.AddHidden("version", "3")
+        }
+        nav.AddTextInput("page", "")
+        nav.AddText(" ")
+        nav.AddSubmit("go", "OK")
+        nav.AddHr("")
+        return nav.Data
+    }
+    // Build top and bottom navs
+    topNav := buildNav(page, total)
+    bottomNav := buildNav(page, total)
+
+    // Respect page byte budget (~32KB): shrink content first
+    budget := maxBytesBudget()
+    allowed := budget - (len(topNav) + len(bottomNav))
+    if allowed < 1024 { allowed = 1024 }
+    selected = shrinkPartToMaxBytes(selected, allowed)
+
+    // Insert top nav after initial string and prelude tags ('S','D','k')
+    // Compute splice position
+    pos := 0
+    if len(selected) >= 2 {
+        l := int(binary.BigEndian.Uint16(selected[0:2]))
+        pos = 2 + l
+        for pos < len(selected) {
+            tag := selected[pos]
+            pos++
+            switch tag {
+            case 'S':
+                if pos+4 > len(selected) { pos = len(selected); break }
+                pos += 4
+            case 'D':
+                if pos+2 > len(selected) { pos = len(selected); break }
+                pos += 2
+            case 'k':
+                if pos+1 > len(selected) { pos = len(selected); break }
+                pos += 1
+                if pos+2 > len(selected) { pos = len(selected); break }
+                ln := int(binary.BigEndian.Uint16(selected[pos : pos+2]))
+                pos += 2 + ln
+            default:
+                pos--
+                goto Splice
+            }
+        }
+    }
+Splice:
+    withTop := make([]byte, 0, len(selected)+len(topNav)+len(bottomNav))
+    withTop = append(withTop, selected[:pos]...)
+    withTop = append(withTop, topNav...)
+    withTop = append(withTop, selected[pos:]...)
+    withTop = append(withTop, bottomNav...)
+
+    // Finalize
+    partPage := NewPage()
+    partPage.Data = withTop
+    partPage.partCur = page
+    partPage.partCnt = total
+    partPage.SetTransport(version, compression)
+    partPage.finalize()
+    partPage.Normalize()
+    return partPage.Data, page, total, nil
 }
 
 // parseTagCountFromDec walks the inflated stream (starting with V2 header) and returns number of tags.

@@ -293,11 +293,24 @@ func (s *Server) renderOptionsFromQuery(r *http.Request, hdr http.Header) *oms.R
 	if v := strings.TrimSpace(q.Get("e")); v != "" {
 		opt.Compression = oms.CompressionFromParam(v)
 	}
-	if v := strings.TrimSpace(q.Get("maxkb")); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			opt.MaxInlineKB = n
-		}
-	}
+    if v := strings.TrimSpace(q.Get("maxkb")); v != "" {
+        if n, err := strconv.Atoi(v); err == nil && n > 0 {
+            opt.MaxInlineKB = n
+        }
+    }
+    // Preserve device characteristics when passed on query to keep cache keys stable
+    if v := strings.TrimSpace(q.Get("w")); v != "" {
+        if n, err := strconv.Atoi(v); err == nil && n > 0 { opt.ScreenW = n }
+    }
+    if v := strings.TrimSpace(q.Get("h")); v != "" {
+        if n, err := strconv.Atoi(v); err == nil && n > 0 { opt.ScreenH = n }
+    }
+    if v := strings.TrimSpace(q.Get("m")); v != "" {
+        if n, err := strconv.Atoi(v); err == nil && n >= 0 { opt.HeapBytes = n }
+    }
+    if v := strings.TrimSpace(q.Get("l")); v != "" {
+        if n, err := strconv.Atoi(v); err == nil && n >= 0 { opt.AlphaLevels = n }
+    }
 	if v := strings.TrimSpace(q.Get("page")); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			opt.Page = n
@@ -332,7 +345,7 @@ func (s *Server) renderOptionsFromQuery(r *http.Request, hdr http.Header) *oms.R
 	if v := strings.TrimSpace(q.Get("h")); v != "" {
 		opt.AuthPrefix = v
 	}
-	opt.ServerBase = serverBase(r)
+    opt.ServerBase = serverBase(r)
 	opt.ReqHeaders = hdr
 	opt.Referrer = q.Get("ref")
 	opt.Jar = s.cookieJars.Get(deriveClientKey(r))
