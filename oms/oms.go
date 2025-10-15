@@ -1096,14 +1096,16 @@ type listCtx struct {
 	bullet  string
 }
 type walkState struct {
-	pre        bool
-	lists      []listCtx
-	styleStack []uint32
-	curStyle   uint32
-	inLink     bool
-	css        *Stylesheet
-	colorStack []string
-	curColor   string
+    pre        bool
+    lists      []listCtx
+    styleStack []uint32
+    curStyle   uint32
+    inLink     bool
+    css        *Stylesheet
+    colorStack []string
+    curColor   string
+    bgStack    []string
+    curBg      string
 }
 
 // RenderOptions define client rendering preferences relevant to OBML generation.
@@ -1199,6 +1201,9 @@ func BuildPaginationQuery(target string, opts *RenderOptions, page, maxTags int)
     }
     return vals.Encode()
 }
+
+// GetAttr is an exported helper for debug code paths.
+func GetAttr(n *html.Node, name string) string { return getAttr(n, name) }
 
 func ensureUpstreamUserAgent(hdr http.Header) {
 	if hdr == nil {
@@ -1515,70 +1520,179 @@ func hasTextContent(n *html.Node) bool {
 }
 
 func renderBackgroundImage(n *html.Node, props map[string]string, base string, p *Page, prefs RenderOptions) bool {
-	if n == nil || p == nil || !prefs.ImagesOn {
-		return false
-	}
-	inlineStyle := getAttr(n, "style")
-	bgVal := cssPropValue(props, inlineStyle, "background-image")
-	if bgVal == "" {
-		bgVal = cssPropValue(props, inlineStyle, "background")
-	}
-	if bgVal == "" {
-		return false
-	}
-	urlVal := extractBackgroundImageURL(bgVal)
-	if urlVal == "" {
-		return false
-	}
-	tag := strings.ToLower(n.Data)
-	inlineCandidate := tag == "span" || tag == "a" || tag == "i" || tag == "b" || tag == "strong" || tag == "em"
-	if !inlineCandidate && !hasClass(n, "balls") {
-		return false
-	}
-	if hasTextContent(n) {
-		return false
-	}
-	repeat := strings.ToLower(cssPropValue(props, inlineStyle, "background-repeat"))
-	if repeat != "" && repeat != "no-repeat" && repeat != "initial" {
-		return false
-	}
-	widthHint := cssValueToPx(cssPropValue(props, inlineStyle, "width"), prefs.ScreenW)
-	heightHint := cssValueToPx(cssPropValue(props, inlineStyle, "height"), prefs.ScreenH)
-	if (widthHint > maxInlineBackgroundSize || heightHint > maxInlineBackgroundSize) && !hasClass(n, "balls") {
-		return false
-	}
-	abs := urlVal
-	if !strings.HasPrefix(urlVal, "data:") {
-		if base != "" {
-			if resolved := resolveAbsURL(base, urlVal); resolved != "" {
-				abs = resolved
-			}
-		}
-		if !strings.Contains(abs, "://") && !strings.HasPrefix(abs, "data:") {
-			return false
-		}
-	}
-	data, w, h, ok := fetchAndEncodeImage(abs, prefs)
-	if !ok {
-		return false
-	}
-	if widthHint <= 0 {
-		widthHint = w
-	}
-	if heightHint <= 0 {
-		heightHint = h
-	}
-	if widthHint <= 0 || heightHint <= 0 {
-		return false
-	}
-	if widthHint > maxInlineBackgroundSize || heightHint > maxInlineBackgroundSize {
-		return false
-	}
-	if prefs.MaxInlineKB > 0 && len(data) > prefs.MaxInlineKB*1024 {
-		return false
-	}
-	p.AddImageInline(widthHint, heightHint, data)
-	return true
+    if n == nil || p == nil {
+        return false
+    }
+    // Render small decorative backgrounds even when images are globally off
+    // (icons, sprites). We keep hard limit by dimensions below.
+    allowWhenImagesOff := true
+    if !prefs.ImagesOn && !allowWhenImagesOff {
+        return false
+    }
+    // Never draw background sprites directly on form controls to avoid
+    // covering native widgets (search button/inputs etc.).
+    if n.Type == html.ElementNode && isFormControlTag(n.Data) {
+        return false
+    }
+    // Also avoid background images for containers that include form controls.
+    if containsFormControl(n) {
+        return false
+    }
+    inlineStyle := getAttr(n, "style")
+    bgVal := cssPropValue(props, inlineStyle, "background-image")
+    if bgVal == "" {
+        bgVal = cssPropValue(props, inlineStyle, "background")
+    }
+    if bgVal == "" {
+        return false
+    }
+    urlVal := extractBackgroundImageURL(bgVal)
+    if urlVal == "" {
+        return false
+    }
+    // No tag restriction: any element can carry a small decorative background
+    if hasTextContent(n) {
+        return false
+    }
+    repeat := strings.ToLower(cssPropValue(props, inlineStyle, "background-repeat"))
+    if repeat != "" && repeat != "no-repeat" && repeat != "initial" {
+        return false
+    }
+    widthHint := cssValueToPx(cssPropValue(props, inlineStyle, "width"), prefs.ScreenW)
+    heightHint := cssValueToPx(cssPropValue(props, inlineStyle, "height"), prefs.ScreenH)
+    if (widthHint > maxInlineBackgroundSize || heightHint > maxInlineBackgroundSize) {
+        return false
+    }
+    abs := urlVal
+    if !strings.HasPrefix(urlVal, "data:") {
+        if base != "" {
+            if resolved := resolveAbsURL(base, urlVal); resolved != "" {
+                abs = resolved
+            }
+        }
+        if !strings.Contains(abs, "://") && !strings.HasPrefix(abs, "data:") {
+            return false
+        }
+    }
+    // Parse background-position for sprite cropping if present
+    posX, posY, hasPos := parseBackgroundPosition(cssPropValue(props, inlineStyle, "background-position"))
+
+    data, w, h, ok := fetchAndEncodeImage(abs, prefs)
+    if !ok {
+        return false
+    }
+    if widthHint <= 0 {
+        widthHint = w
+    }
+    if heightHint <= 0 {
+        heightHint = h
+    }
+    if widthHint <= 0 || heightHint <= 0 {
+        return false
+    }
+    if widthHint > maxInlineBackgroundSize || heightHint > maxInlineBackgroundSize {
+        return false
+    }
+    if prefs.MaxInlineKB > 0 && len(data) > prefs.MaxInlineKB*1024 {
+        return false
+    }
+    if hasPos {
+        // CSS background-position offsets shift the image relative to the box.
+        // Negative values mean the sprite is shifted left/up, so visible region starts at -pos.
+        cropX := -posX
+        cropY := -posY
+        if cropped, ok := fetchAndEncodeImageRegion(abs, prefs, cropX, cropY, widthHint, heightHint); ok {
+            if prefs.MaxInlineKB <= 0 || len(cropped) <= prefs.MaxInlineKB*1024 {
+                p.AddImageInline(widthHint, heightHint, cropped)
+                return true
+            }
+        }
+        // If cropping fails, fall back to full image rendering.
+    }
+    p.AddImageInline(widthHint, heightHint, data)
+    return true
+}
+
+// isBgPaintableTag returns true for structural/container tags where a
+// block background-color makes sense to render as a segment. Inline
+// controls and phrasing content are excluded to avoid painting over
+// buttons/inputs/links.
+func isBgPaintableTag(tag string) bool {
+    switch strings.ToLower(tag) {
+    case "div", "section", "article", "header", "footer", "main", "nav", "aside",
+        "ul", "ol", "li", "table", "tbody", "thead", "tr", "td", "th":
+        return true
+    }
+    return false
+}
+
+// isFormControlTag returns true for form controls which should not get
+// background overlays (neither color nor sprite) applied directly or by
+// container heuristics around them.
+func isFormControlTag(tag string) bool {
+    switch strings.ToLower(tag) {
+    case "input", "button", "select", "textarea", "label":
+        return true
+    }
+    return false
+}
+
+// containsFormControl reports whether subtree n contains any form controls.
+func containsFormControl(n *html.Node) bool {
+    if n == nil { return false }
+    var dfs func(*html.Node) bool
+    dfs = func(x *html.Node) bool {
+        if x.Type == html.ElementNode && isFormControlTag(x.Data) { return true }
+        for c := x.FirstChild; c != nil; c = c.NextSibling {
+            if dfs(c) { return true }
+        }
+        return false
+    }
+    return dfs(n)
+}
+
+// cssEffectiveProp returns node's CSS property or nearest inherited ancestor value
+// for a small set of inheritable properties used by the renderer.
+func cssEffectiveProp(n *html.Node, ss *Stylesheet, self map[string]string, prop string) string {
+    if self != nil {
+        if v := strings.TrimSpace(self[strings.ToLower(prop)]); v != "" {
+            return v
+        }
+    }
+    switch strings.ToLower(prop) {
+    case "color", "text-align", "font-weight", "font-style", "text-decoration", "list-style-type":
+        depth := 0
+        for p := n.Parent; p != nil && depth < 12; p = p.Parent {
+            if p.Type != html.ElementNode { continue }
+            if props := computeStyleFor(p, ss); props != nil {
+                if v := strings.TrimSpace(props[strings.ToLower(prop)]); v != "" {
+                    return v
+                }
+            }
+            depth++
+        }
+    }
+    return ""
+}
+
+func (s *walkState) pushBgcolor(p *Page, hex string) {
+    s.bgStack = append(s.bgStack, s.curBg)
+    s.curBg = hex
+    if hex != "" {
+        p.AddBgcolor(hex)
+    }
+}
+
+func (s *walkState) popBgcolor(p *Page) {
+    if len(s.bgStack) == 0 {
+        return
+    }
+    prev := s.bgStack[len(s.bgStack)-1]
+    s.bgStack = s.bgStack[:len(s.bgStack)-1]
+    s.curBg = prev
+    if prev != "" {
+        p.AddBgcolor(prev)
+    }
 }
 
 func resetComputedStyles(st *walkState, p *Page, colorPushed *bool, stylePushed *bool, alignedPushed *bool) {
@@ -1618,12 +1732,161 @@ func condenseSpaces(s string) string {
 	return strings.TrimSpace(b.String())
 }
 
+// parseBackgroundPosition parses simple background-position values like "-24px 0" or "0 0".
+// Returns x, y pixel offsets; boolean indicates if any value was parsed.
+func parseBackgroundPosition(val string) (int, int, bool) {
+    v := strings.TrimSpace(val)
+    if v == "" {
+        return 0, 0, false
+    }
+    lower := strings.ToLower(v)
+    lower = condenseSpaces(strings.ReplaceAll(lower, ",", " "))
+    parts := strings.Fields(lower)
+    if len(parts) == 0 {
+        return 0, 0, false
+    }
+    parse := func(s string) (int, bool) {
+        s = strings.TrimSpace(s)
+        switch s {
+        case "left", "top", "center":
+            return 0, true
+        case "right", "bottom":
+            return 0, true
+        }
+        if strings.HasSuffix(s, "px") {
+            s = strings.TrimSpace(s[:len(s)-2])
+        }
+        if f, err := strconv.ParseFloat(s, 64); err == nil {
+            if f >= 0 {
+                return int(f + 0.5), true
+            }
+            return int(f - 0.5), true
+        }
+        return 0, false
+    }
+    if len(parts) == 1 {
+        if x, ok := parse(parts[0]); ok {
+            return x, 0, true
+        }
+        return 0, 0, false
+    }
+    x, okx := parse(parts[0])
+    y, oky := parse(parts[1])
+    if okx || oky {
+        return x, y, true
+    }
+    return 0, 0, false
+}
+
+// fetchAndEncodeImageRegion fetches an image, crops the (x,y,w,h) rectangle and encodes it.
+// Uses existing caches with a region-specific key.
+func fetchAndEncodeImageRegion(absURL string, prefs RenderOptions, x, y, w, h int) ([]byte, bool) {
+    if w <= 0 || h <= 0 {
+        return nil, false
+    }
+    // Region cache key
+    regionKey := absURL + "#rect=" + strconv.Itoa(x) + "," + strconv.Itoa(y) + "," + strconv.Itoa(w) + "," + strconv.Itoa(h)
+    candidates := cacheCandidatesFor(prefs)
+    for _, cand := range candidates {
+        if data, _, _, ok := imgCacheGet(cand.format, cand.quality, regionKey); ok {
+            return data, true
+        }
+        if data, _, _, ok := diskCacheGet(cand.format, cand.quality, regionKey); ok {
+            imgCachePut(cand.format, cand.quality, regionKey, data, w, h)
+            return data, true
+        }
+    }
+
+    // Attempt to reuse cached full image first
+    var srcBytes []byte
+    var have bool
+    for _, cand := range candidates {
+        if data, _, _, ok := imgCacheGet(cand.format, cand.quality, absURL); ok {
+            srcBytes = data
+            have = true
+            break
+        }
+        if data, _, _, ok := diskCacheGet(cand.format, cand.quality, absURL); ok {
+            srcBytes = data
+            have = true
+            break
+        }
+    }
+    if !have {
+        // Fallback to fetching from network
+        req, err := http.NewRequest(http.MethodGet, absURL, nil)
+        if err != nil {
+            return nil, false
+        }
+        req.Header.Set("Accept", "image/*")
+        if prefs.ReqHeaders != nil {
+            if ua := prefs.ReqHeaders.Get("User-Agent"); ua != "" { req.Header.Set("User-Agent", ua) }
+            if al := prefs.ReqHeaders.Get("Accept-Language"); al != "" { req.Header.Set("Accept-Language", al) }
+            var cookieParts []string
+            if ck := prefs.ReqHeaders.Get("Cookie"); ck != "" { cookieParts = append(cookieParts, ck) }
+            if oc := prefs.OriginCookies; oc != "" { cookieParts = append(cookieParts, oc) }
+            if len(cookieParts) > 0 { req.Header.Set("Cookie", strings.Join(cookieParts, "; ")) }
+        }
+        if req.Header.Get("User-Agent") == "" { req.Header.Set("User-Agent", "OMS-ImageFetcher/1.0") }
+        if prefs.Referrer != "" { req.Header.Set("Referer", prefs.Referrer) }
+        client := &http.Client{Timeout: 8 * time.Second}
+        if prefs.Jar != nil { client.Jar = prefs.Jar }
+        resp, err := client.Do(req)
+        if err != nil { return nil, false }
+        defer resp.Body.Close()
+        var rc io.ReadCloser = resp.Body
+        switch strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Encoding"))) {
+        case "gzip":
+            if gr, e := gzip.NewReader(resp.Body); e == nil { rc = gr; defer gr.Close() }
+        case "deflate":
+            if zr, e := zlib.NewReader(resp.Body); e == nil { rc = zr; defer zr.Close() } else if fr := flate.NewReader(resp.Body); fr != nil { rc = io.NopCloser(fr); defer fr.Close() }
+        }
+        b, err := io.ReadAll(rc)
+        if err != nil || len(b) == 0 { return nil, false }
+        srcBytes = b
+    }
+
+    // Decode and crop
+    img, _, err := image.Decode(bytes.NewReader(srcBytes))
+    if err != nil {
+        return nil, false
+    }
+    b := img.Bounds()
+    if x < 0 { x = 0 }
+    if y < 0 { y = 0 }
+    if x > b.Dx()-1 { x = b.Dx() - 1 }
+    if y > b.Dy()-1 { y = b.Dy() - 1 }
+    if x+w > b.Dx() { w = b.Dx() - x }
+    if y+h > b.Dy() { h = b.Dy() - y }
+    if w <= 0 || h <= 0 { return nil, false }
+    rect := image.Rect(b.Min.X+x, b.Min.Y+y, b.Min.X+x+w, b.Min.Y+y+h)
+
+    type subImager interface{ SubImage(r image.Rectangle) image.Image }
+    var region image.Image
+    if si, ok := img.(subImager); ok {
+        region = si.SubImage(rect)
+    } else {
+        dst := image.NewRGBA(image.Rect(0, 0, w, h))
+        draw.Draw(dst, dst.Bounds(), img, rect.Min, draw.Src)
+        region = dst
+    }
+
+    data, _, _, format, quality, err := encodeImage(region, prefs)
+    if err != nil {
+        return nil, false
+    }
+    imgCachePut(format, quality, regionKey, data, w, h)
+    diskCachePut(format, quality, regionKey, data, w, h)
+    return data, true
+}
+
 func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool, st *walkState, prefs RenderOptions) {
 	for c := cur; c != nil; c = c.NextSibling {
 		recurse := true
 		var colorPushed bool
 		var stylePushed bool
 		var alignedPushed bool
+		var bgColorPushed bool
 		var bgRendered bool
 		if c.Type == html.ElementNode {
 			// Skip hidden elements
@@ -1634,13 +1897,28 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 			var props map[string]string
 			if st.css != nil {
 				props = computeStyleFor(c, st.css)
-				if props != nil && strings.Contains(props["display"], "none") {
+				if props != nil && strings.Contains(strings.ToLower(props["display"]), "none") {
+					continue
+				}
+				if props != nil && strings.Contains(strings.ToLower(props["visibility"]), "hidden") {
 					continue
 				}
 			}
-			bgRendered = renderBackgroundImage(c, props, base, p, prefs)
-			if props != nil {
-				switch strings.ToLower(strings.TrimSpace(props["text-align"])) {
+            bgRendered = renderBackgroundImage(c, props, base, p, prefs)
+            if props != nil {
+                // Block background color support: only for container/structural elements
+                // and only when subtree does not contain form controls to avoid flooding
+                // input areas with container backgrounds.
+                if isBgPaintableTag(strings.ToLower(c.Data)) && !containsFormControl(c) {
+                    if bgc := strings.TrimSpace(props["background-color"]); bgc != "" {
+                        if hx := cssToHex(bgc); hx != "" {
+                            st.pushBgcolor(p, hx)
+                            bgColorPushed = true
+                        }
+                    }
+                }
+				align := strings.ToLower(strings.TrimSpace(cssEffectiveProp(c, st.css, props, "text-align")))
+				switch align {
 				case "center":
 					st.pushStyle(p, st.curStyle|styleCenterBit)
 					alignedPushed = true
@@ -1650,7 +1928,7 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 				}
 				styleOverride := st.curStyle
 				styleChanged := false
-				if weight := strings.TrimSpace(props["font-weight"]); weight != "" {
+				if weight := strings.TrimSpace(cssEffectiveProp(c, st.css, props, "font-weight")); weight != "" {
 					lw := strings.ToLower(weight)
 					switch {
 					case strings.Contains(lw, "bold"), strings.Contains(lw, "bolder"):
@@ -1677,7 +1955,7 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 						}
 					}
 				}
-				if fs := strings.ToLower(strings.TrimSpace(props["font-style"])); fs != "" {
+				if fs := strings.ToLower(strings.TrimSpace(cssEffectiveProp(c, st.css, props, "font-style"))); fs != "" {
 					if strings.Contains(fs, "italic") || strings.Contains(fs, "oblique") {
 						if styleOverride&styleItalicBit == 0 {
 							styleOverride |= styleItalicBit
@@ -1690,7 +1968,7 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 						}
 					}
 				}
-				if td := strings.ToLower(strings.TrimSpace(props["text-decoration"])); td != "" {
+				if td := strings.ToLower(strings.TrimSpace(cssEffectiveProp(c, st.css, props, "text-decoration"))); td != "" {
 					if strings.Contains(td, "underline") {
 						if styleOverride&styleUnderBit == 0 {
 							styleOverride |= styleUnderBit
@@ -1707,7 +1985,7 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 					st.pushStyle(p, styleOverride)
 					stylePushed = true
 				}
-				if col := strings.TrimSpace(props["color"]); col != "" {
+				if col := strings.TrimSpace(cssEffectiveProp(c, st.css, props, "color")); col != "" {
 					st.pushColor(p, col)
 					colorPushed = true
 				}
@@ -1771,7 +2049,7 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 			}
 			// Do not recurse into heading children to avoid duplicate text
 			recurse = false
-		case "div", "section", "article", "header", "footer", "main", "nav", "aside":
+	case "div", "section", "article", "header", "footer", "main", "nav", "aside":
 			if hasClass(c, "p") {
 				resetComputedStyles(st, p, &colorPushed, &stylePushed, &alignedPushed)
 				st.pushColor(p, "#007700")
@@ -1943,14 +2221,10 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 			}
 			p.AddText("_")
 			recurse = false
-		case "span":
-			if hasClass(c, "balls") {
+	case "span":
+			// Avoid textual placeholders for decorative sprite spans; rely on background renderer.
+			if bgRendered {
 				resetComputedStyles(st, p, &colorPushed, &stylePushed, &alignedPushed)
-				if bgRendered {
-					p.AddText(" ")
-				} else {
-					p.AddText("- ")
-				}
 				if c.FirstChild != nil {
 					walkRich(c.FirstChild, base, p, visited, st, prefs)
 				}
@@ -2056,18 +2330,6 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 				recurse = false
 			}
 		case "a":
-			if hasClass(c, "balls") {
-				resetComputedStyles(st, p, &colorPushed, &stylePushed, &alignedPushed)
-				if bgRendered {
-					p.AddText(" ")
-				} else {
-					p.AddText("- ")
-				}
-				if c.FirstChild != nil {
-					walkRich(c.FirstChild, base, p, visited, st, prefs)
-				}
-				continue
-			}
 			if hasClass(c, "opis") {
 				st.pushColor(p, "#151515")
 				colorPushed = true
@@ -2514,6 +2776,9 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 		}
 		if alignedPushed {
 			st.popStyle(p)
+		}
+		if bgColorPushed {
+			st.popBgcolor(p)
 		} else if c.Type == html.TextNode {
 			if !visited[c] {
 				// Skip any stray text nodes under head/style/script/meta/link/noscript
@@ -3242,6 +3507,7 @@ func LoadPageWithHeadersAndOptions(oURL string, hdr http.Header, opts *RenderOpt
 	rp.Referrer = effectiveURL
 	rp.Styles = buildStylesheet(doc, base, hdr, jar)
 	chosenCol := ""
+	chosenBg := ""
 	if body := findFirstByTag(doc, "body"); body != nil {
 		var bgHex, fgHex string
 		if rp.Styles != nil {
@@ -3280,6 +3546,7 @@ func LoadPageWithHeadersAndOptions(oURL string, hdr http.Header, opts *RenderOpt
 		if bgHex != "" {
 			p.AddBgcolor(bgHex)
 		}
+		chosenBg = bgHex
 		chosenCol = ""
 		if fgHex != "" {
 			p.AddTextcolor(fgHex)
@@ -3293,6 +3560,9 @@ func LoadPageWithHeadersAndOptions(oURL string, hdr http.Header, opts *RenderOpt
 	st := walkState{curStyle: styleDefault}
 	if chosenCol != "" {
 		st.curColor = chosenCol
+	}
+	if chosenBg != "" {
+		st.curBg = chosenBg
 	}
 	st.css = rp.Styles
 	p.AddStyle(styleDefault)

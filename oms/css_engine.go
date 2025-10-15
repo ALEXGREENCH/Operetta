@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+    "os"
 	"strconv"
 	"strings"
 	"time"
@@ -40,8 +41,16 @@ type cssRule struct {
 }
 
 type Stylesheet struct {
-	rules []cssRule
+    rules []cssRule
 }
+
+// Expose limited helpers for debug tools.
+func BuildStylesheetForDebug(doc *html.Node, base string, hdr http.Header, jar http.CookieJar) *Stylesheet {
+    return buildStylesheet(doc, base, hdr, jar)
+}
+
+func ComputeStyleForDebug(n *html.Node, ss *Stylesheet) map[string]string { return computeStyleFor(n, ss) }
+
 
 type cssParseContext struct {
 	baseURL string
@@ -166,23 +175,28 @@ func buildStylesheet(
 }
 
 func parseCSSText(txt string, startOrder int, ctx *cssParseContext) ([]cssRule, int) {
-	trimmed := strings.TrimSpace(txt)
-	if trimmed == "" {
-		return nil, startOrder
-	}
-	if ctx != nil && ctx.depth >= 16 {
-		return nil, startOrder
-	}
-	sheet, err := parser.Parse(trimmed)
-	if err != nil {
-		fmt.Println("Error parsing CSS text:", err)
-		return nil, startOrder
-	}
+    trimmed := strings.TrimSpace(txt)
+    if trimmed == "" {
+        return nil, startOrder
+    }
+    if ctx != nil && ctx.depth >= 16 {
+        return nil, startOrder
+    }
+    sheet, err := parser.Parse(trimmed)
+    if err != nil && (sheet == nil || len(sheet.Rules) == 0) {
+        // Douceur failed hard; try very simple fallback parser so we can at least
+        // extract straightforward class selectors like `.balls { ... }`.
+        if fr, ord := parseSimpleCSSFallback(trimmed, startOrder); len(fr) > 0 {
+            return fr, ord
+        }
+        fmt.Println("Error parsing CSS text:", err)
+        return nil, startOrder
+    }
 
-	rules := make([]cssRule, 0, len(sheet.Rules)*2)
-	order := startOrder
+    rules := make([]cssRule, 0, len(sheet.Rules)*2)
+    order := startOrder
 
-	var walk func([]*cssast.Rule, *cssParseContext)
+    var walk func([]*cssast.Rule, *cssParseContext)
 	walk = func(list []*cssast.Rule, cur *cssParseContext) {
 		if cur != nil && cur.depth >= 16 {
 			return
@@ -237,19 +251,23 @@ func parseCSSText(txt string, startOrder int, ctx *cssParseContext) ([]cssRule, 
 						walk(rule.Rules, cur)
 					}
 				}
-			case cssast.QualifiedRule:
-				decls := convertDeclarations(rule.Declarations)
-				if len(decls) == 0 || len(rule.Selectors) == 0 {
-					continue
-				}
-				group, err := cascadia.ParseGroup(strings.Join(rule.Selectors, ","))
-				if err != nil {
-					fmt.Println("Error parsing CSS group:", err)
-					continue
-				}
-				for _, sel := range group {
-					if sel == nil || sel.PseudoElement() != "" {
-						continue
+            case cssast.QualifiedRule:
+                decls := convertDeclarations(rule.Declarations, curBase(cur))
+                if len(decls) == 0 || len(rule.Selectors) == 0 {
+                    continue
+                }
+                // Sanitize unsupported pseudo selectors to avoid parser errors
+                sanitized := make([]string, 0, len(rule.Selectors))
+                for _, s := range rule.Selectors { if ss := sanitizeSelectorForCascadia(s); ss != "" { sanitized = append(sanitized, ss) } }
+                if len(sanitized) == 0 { continue }
+                group, err := cascadia.ParseGroup(strings.Join(sanitized, ","))
+                if err != nil {
+                    if cssDebug() { fmt.Println("Error parsing CSS group:", err) }
+                    continue
+                }
+                for _, sel := range group {
+                    if sel == nil || sel.PseudoElement() != "" {
+                        continue
 					}
 					rules = append(rules, cssRule{selector: sel, specificity: sel.Specificity(), declarations: cloneDecls(decls), order: order})
 					order++
@@ -258,36 +276,247 @@ func parseCSSText(txt string, startOrder int, ctx *cssParseContext) ([]cssRule, 
 		}
 	}
 
-	walk(sheet.Rules, ctx)
-	return rules, order
+    walk(sheet.Rules, ctx)
+    return rules, order
 }
+
+// parseSimpleCSSFallback implements a best-effort CSS extractor that handles only
+// flat rule-sets: selector-list '{' declarations '}'. It ignores at-rules and
+// nested constructs. It's intentionally conservative but robust against most
+// minified CSS.
+func parseSimpleCSSFallback(txt string, startOrder int) ([]cssRule, int) {
+    s := txt
+    // Strip comments
+    for {
+        i := strings.Index(s, "/*")
+        if i == -1 { break }
+        j := strings.Index(s[i+2:], "*/")
+        if j == -1 { s = s[:i]; break }
+        s = s[:i] + s[i+2+j+2:]
+    }
+    out := []cssRule{}
+    order := startOrder
+    i := 0
+    for i < len(s) {
+        // Skip whitespace
+        for i < len(s) && (s[i] == ' ' || s[i] == '\n' || s[i] == '\r' || s[i] == '\t') { i++ }
+        if i >= len(s) { break }
+        // Skip at-rules entirely (until next '{' then balanced '}')
+        if s[i] == '@' {
+            // consume until block end
+            // find first '{'
+            open := strings.IndexByte(s[i:], '{')
+            if open == -1 { break }
+            open += i
+            depth := 0
+            j := open
+            for j < len(s) {
+                if s[j] == '{' { depth++ }
+                if s[j] == '}' { depth--; if depth == 0 { j++; break } }
+                j++
+            }
+            if j <= open { break }
+            i = j
+            continue
+        }
+        // Read selector prelude up to '{'
+        j := strings.IndexByte(s[i:], '{')
+        if j == -1 { break }
+        pre := strings.TrimSpace(s[i : i+j])
+        i = i + j + 1
+        // Read declarations up to matching '}'
+        depth := 1
+        start := i
+        for i < len(s) && depth > 0 {
+            if s[i] == '{' { depth++ }
+            if s[i] == '}' { depth-- }
+            i++
+        }
+        if depth != 0 { break }
+        block := strings.TrimSpace(s[start : i-1])
+        // Parse declarations
+        var decls []cssDeclaration
+        for _, part := range strings.Split(block, ";") {
+            kv := strings.SplitN(part, ":", 2)
+            if len(kv) != 2 { continue }
+            nd := normalizeDecl(kv[0], kv[1], false, "")
+            if len(nd) > 0 { decls = append(decls, nd...) }
+        }
+        if len(decls) == 0 { continue }
+        // Build rules for each selector in group
+        for _, sel := range strings.Split(pre, ",") {
+            sel = strings.TrimSpace(sanitizeSelectorForCascadia(sel))
+            if sel == "" { continue }
+            // Ignore complex combinators; keep simple selectors (.class, tag.class, #id)
+            gr, err := cascadia.ParseGroup(sel)
+            if err != nil || len(gr) == 0 { continue }
+            for _, ssel := range gr {
+                if ssel == nil || ssel.PseudoElement() != "" { continue }
+                out = append(out, cssRule{selector: ssel, specificity: ssel.Specificity(), declarations: cloneDecls(decls), order: order})
+                order++
+            }
+        }
+    }
+    if len(out) == 0 { return nil, startOrder }
+    return out, order
+}
+
+// sanitizeSelectorForCascadia removes pseudo-classes/elements (including vendor-specific)
+// that cascadia may not understand, producing a simplified selector.
+func sanitizeSelectorForCascadia(s string) string {
+    if s == "" { return s }
+    b := strings.Builder{}
+    // Copy while stripping any ':' pseudo segment and its optional (..)
+    i := 0
+    for i < len(s) {
+        if s[i] == ':' { // start of pseudo
+            // skip any successive ':' and ident
+            j := i + 1
+            for j < len(s) && (isCSSIdentChar(s[j]) || s[j] == '-') { j++ }
+            // optional functional pseudo
+            if j < len(s) && s[j] == '(' {
+                depth := 1
+                j++
+                for j < len(s) && depth > 0 {
+                    if s[j] == '(' { depth++ }
+                    if s[j] == ')' { depth-- }
+                    j++
+                }
+            }
+            i = j
+            continue
+        }
+        b.WriteByte(s[i])
+        i++
+    }
+    out := strings.TrimSpace(b.String())
+    // Collapse accidental multiple spaces
+    out = strings.Join(strings.Fields(out), " ")
+    return out
+}
+
+func isCSSIdentChar(c byte) bool {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '_' || c == '\\'
+}
+
+func cssDebug() bool { return os.Getenv("OMS_CSS_DEBUG") == "1" }
 
 func cloneDecls(src []cssDeclaration) []cssDeclaration {
-	out := make([]cssDeclaration, len(src))
-	copy(out, src)
-	return out
+    out := make([]cssDeclaration, len(src))
+    copy(out, src)
+    return out
 }
 
-func convertDeclarations(list []*cssast.Declaration) []cssDeclaration {
-	if len(list) == 0 {
-		return nil
-	}
-	out := make([]cssDeclaration, 0, len(list))
-	for _, decl := range list {
-		if decl == nil {
-			continue
-		}
-		prop := strings.ToLower(strings.TrimSpace(decl.Property))
-		if prop == "" {
-			continue
-		}
-		val := strings.TrimSpace(decl.Value)
-		if val == "" {
-			continue
-		}
-		out = append(out, cssDeclaration{property: prop, value: val, important: decl.Important})
-	}
-	return out
+// normalizeDecl expands shorthands and absolutizes URL-bearing values relative to base.
+func normalizeDecl(prop, val string, important bool, base string) []cssDeclaration {
+    p := strings.ToLower(strings.TrimSpace(prop))
+    v := strings.TrimSpace(val)
+    if p == "" || v == "" {
+        return nil
+    }
+    if p == "background" {
+        return expandBackgroundShorthand(v, important, base)
+    }
+    if (p == "background-image" || p == "list-style-image") && strings.Contains(strings.ToLower(v), "url(") {
+        return []cssDeclaration{{property: p, value: absolutizeCSSURLs(v, base), important: important}}
+    }
+    return []cssDeclaration{{property: p, value: v, important: important}}
+}
+
+func convertDeclarations(list []*cssast.Declaration, base string) []cssDeclaration {
+    if len(list) == 0 {
+        return nil
+    }
+    out := make([]cssDeclaration, 0, len(list))
+    for _, decl := range list {
+        if decl == nil {
+            continue
+        }
+        nd := normalizeDecl(decl.Property, decl.Value, decl.Important, base)
+        if len(nd) > 0 {
+            out = append(out, nd...)
+        }
+    }
+    return out
+}
+
+// expandBackgroundShorthand extracts image, position, repeat and color from background shorthand.
+func expandBackgroundShorthand(val string, important bool, base string) []cssDeclaration {
+    v := strings.TrimSpace(val)
+    if v == "" { return nil }
+    lower := strings.ToLower(v)
+    out := []cssDeclaration{}
+    // image
+    if strings.Contains(lower, "url(") {
+        out = append(out, cssDeclaration{property: "background-image", value: absolutizeCSSURLs(v, base), important: important})
+    }
+    // repeat
+    if strings.Contains(lower, "no-repeat") {
+        out = append(out, cssDeclaration{property: "background-repeat", value: "no-repeat", important: important})
+    } else if strings.Contains(lower, "repeat-x") {
+        out = append(out, cssDeclaration{property: "background-repeat", value: "repeat-x", important: important})
+    } else if strings.Contains(lower, "repeat-y") {
+        out = append(out, cssDeclaration{property: "background-repeat", value: "repeat-y", important: important})
+    } else if strings.Contains(lower, "repeat") {
+        out = append(out, cssDeclaration{property: "background-repeat", value: "repeat", important: important})
+    }
+    // position
+    posTokens := []string{}
+    for _, tok := range strings.Fields(lower) {
+        if tok == "/" { break }
+        if strings.HasPrefix(tok, "url(") { continue }
+        if strings.Contains(tok, "repeat") { continue }
+        if cssToHex(tok) != "" { continue }
+        if tok == "left" || tok == "right" || tok == "top" || tok == "bottom" || tok == "center" || strings.HasSuffix(tok, "px") || strings.HasSuffix(tok, "%") {
+            posTokens = append(posTokens, tok)
+        }
+        if len(posTokens) >= 2 { break }
+    }
+    if len(posTokens) > 0 {
+        out = append(out, cssDeclaration{property: "background-position", value: strings.Join(posTokens, " "), important: important})
+    }
+    // color
+    if col := extractColorFromValue(lower); col != "" {
+        out = append(out, cssDeclaration{property: "background-color", value: col, important: important})
+    }
+    if len(out) == 0 {
+        return []cssDeclaration{{property: "background", value: v, important: important}}
+    }
+    return out
+}
+
+// absolutizeCSSURLs converts url(...) inside a value to absolute using base.
+func absolutizeCSSURLs(val, base string) string {
+    if base == "" || !strings.Contains(strings.ToLower(val), "url(") {
+        return val
+    }
+    out := val
+    i := 0
+    for i < len(out) {
+        j := strings.Index(strings.ToLower(out[i:]), "url(")
+        if j == -1 { break }
+        j += i
+        k := j + 4
+        depth := 1
+        for k < len(out) && depth > 0 {
+            if out[k] == '(' { depth++ } else if out[k] == ')' { depth-- }
+            k++
+        }
+        if depth != 0 { break }
+        inside := strings.TrimSpace(out[j+4 : k-1])
+        unq := trimCSSString(inside)
+        if unq != "" && !strings.HasPrefix(unq, "data:") && !strings.Contains(unq, "://") {
+            abs := resolveAbsURL(base, unq)
+            if abs != "" {
+                newv := "url(" + abs + ")"
+                out = out[:j] + newv + out[k:]
+                i = j + len(newv)
+                continue
+            }
+        }
+        i = k
+    }
+    return out
 }
 
 func curOpts(ctx *cssParseContext) *RenderOptions {
