@@ -9,7 +9,7 @@ import (
 	"io"
 	"sort"
 	"strconv"
-	"strings"
+	//"strings"
 )
 
 func decompressPayload(method CompressionMethod, payload []byte) ([]byte, error) {
@@ -363,47 +363,49 @@ func SelectOMSPartFromPackedWithNav(data []byte, page, maxTags int, serverBase, 
 		nav.AddText(fmt.Sprintf("Page %d/%d", cur, total))
 		nav.AddBreak()
 		// Quick jump form
-		formAction := "0/" + serverBase + "/fetch"
-		nav.AddForm(formAction)
-		nav.AddHidden("url", target)
-		nav.AddHidden("pp", strconv.Itoa(maxTags))
-		if rp.ImagesOn {
-			nav.AddHidden("img", "1")
-		}
-		if rp.HighQuality {
-			nav.AddHidden("hq", "1")
-		}
-		if rp.ImageMIME != "" {
-			nav.AddHidden("mime", rp.ImageMIME)
-		}
-		if rp.MaxInlineKB > 0 {
-			nav.AddHidden("maxkb", strconv.Itoa(rp.MaxInlineKB))
-		}
-		if rp.ScreenW > 0 {
-			nav.AddHidden("w", strconv.Itoa(rp.ScreenW))
-		}
-		if rp.ScreenH > 0 {
-			nav.AddHidden("h", strconv.Itoa(rp.ScreenH))
-		}
-		if strings.TrimSpace(rp.AuthCode) != "" {
-			nav.AddHidden("c", rp.AuthCode)
-		}
-		if strings.TrimSpace(rp.AuthPrefix) != "" {
-			nav.AddHidden("h", rp.AuthPrefix)
-		}
-		if rp.GatewayVersion > 0 {
-			nav.AddHidden("o", strconv.Itoa(rp.GatewayVersion))
-		}
-		switch normalizeClientVersion(rp.ClientVersion) {
-		case ClientVersion1:
-			nav.AddHidden("version", "1")
-		case ClientVersion3:
-			nav.AddHidden("version", "3")
-		}
-		nav.AddTextInput("page", "")
-		nav.AddText(" ")
-		nav.AddSubmit("go", "OK")
-		nav.AddHr("")
+		/*
+			formAction := "0/" + serverBase + "/fetch"
+			nav.AddForm(formAction)
+			nav.AddHidden("url", target)
+			nav.AddHidden("pp", strconv.Itoa(maxTags))
+			if rp.ImagesOn {
+				nav.AddHidden("img", "1")
+			}
+			if rp.HighQuality {
+				nav.AddHidden("hq", "1")
+			}
+			if rp.ImageMIME != "" {
+				nav.AddHidden("mime", rp.ImageMIME)
+			}
+			if rp.MaxInlineKB > 0 {
+				nav.AddHidden("maxkb", strconv.Itoa(rp.MaxInlineKB))
+			}
+			if rp.ScreenW > 0 {
+				nav.AddHidden("w", strconv.Itoa(rp.ScreenW))
+			}
+			if rp.ScreenH > 0 {
+				nav.AddHidden("h", strconv.Itoa(rp.ScreenH))
+			}
+			if strings.TrimSpace(rp.AuthCode) != "" {
+				nav.AddHidden("c", rp.AuthCode)
+			}
+			if strings.TrimSpace(rp.AuthPrefix) != "" {
+				nav.AddHidden("h", rp.AuthPrefix)
+			}
+			if rp.GatewayVersion > 0 {
+				nav.AddHidden("o", strconv.Itoa(rp.GatewayVersion))
+			}
+			switch normalizeClientVersion(rp.ClientVersion) {
+			case ClientVersion1:
+				nav.AddHidden("version", "1")
+			case ClientVersion3:
+				nav.AddHidden("version", "3")
+			}
+			nav.AddTextInput("page", "")
+			nav.AddText(" ")
+			nav.AddSubmit("go", "OK")
+			nav.AddHr("")
+		*/
 		return nav.Data
 	}
 	// Build top and bottom navs

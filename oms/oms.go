@@ -300,128 +300,166 @@ func cssToHex(v string) string {
 // maxBytesBudget returns the per-part byte budget used for pagination.
 // Default is 32KB, optionally overridden by OMS_PAGINATE_BYTES (min 1KB).
 func maxBytesBudget() int {
-    maxBytes := defaultPaginationBytes
-    if s := strings.TrimSpace(os.Getenv("OMS_PAGINATE_BYTES")); s != "" {
-        if v, err := strconv.Atoi(s); err == nil {
-            if v <= 0 {
-                maxBytes = 0
-            } else {
-                maxBytes = v
-            }
-        }
-    }
-    if maxBytes > 0 && maxBytes < 1024 {
-        maxBytes = 1024
-    }
-    return maxBytes
+	maxBytes := defaultPaginationBytes
+	if s := strings.TrimSpace(os.Getenv("OMS_PAGINATE_BYTES")); s != "" {
+		if v, err := strconv.Atoi(s); err == nil {
+			if v <= 0 {
+				maxBytes = 0
+			} else {
+				maxBytes = v
+			}
+		}
+	}
+	if maxBytes > 0 && maxBytes < 1024 {
+		maxBytes = 1024
+	}
+	return maxBytes
 }
 
 // shrinkPartToMaxBytes trims a single part (prefix + tagged body) so that its
 // total raw size does not exceed limit. Trimming respects tag boundaries.
 func shrinkPartToMaxBytes(part []byte, limit int) []byte {
-    if limit <= 0 || len(part) <= limit || len(part) < 2 {
-        return part
-    }
-    // Prefix: initial OMS string
-    l := int(binary.BigEndian.Uint16(part[0:2]))
-    if 2+l > len(part) {
-        return part
-    }
-    // Ensure limit is at least room for prefix
-    if limit <= 2+l {
-        // Cannot fit any body; return only prefix; finalize() will add 'Q'.
-        return append([]byte{}, part[:2+l]...)
-    }
-    allowedBody := limit - (2 + l)
-    start := 2 + l
-    p := start
-    limitAll := len(part)
-    for p < limitAll {
-        tag := part[p]
-        // Prospective new position after including this tag fully
-        np := p + 1
-        switch tag {
-        case 'T', 'L':
-            if np+2 > limitAll { np = limitAll; break }
-            ln := int(binary.BigEndian.Uint16(part[np : np+2]))
-            np += 2 + ln
-        case 'E', 'B', '+', 'V', 'Q', 'l':
-            // no payload
-        case 'D', 'R':
-            np += 2
-        case 'S', 'J':
-            np += 4
-        case 'I':
-            if np+8 > limitAll { np = limitAll; break }
-            dl := int(binary.BigEndian.Uint16(part[np+4 : np+6]))
-            np += 8 + dl
-        case 'k':
-            // type + string
-            if np+1 > limitAll { np = limitAll; break }
-            np += 1
-            if np+2 > limitAll { np = limitAll; break }
-            ln := int(binary.BigEndian.Uint16(part[np : np+2]))
-            np += 2 + ln
-        case 'h':
-            for i := 0; i < 2; i++ {
-                if np+2 > limitAll { np = limitAll; break }
-                ln := int(binary.BigEndian.Uint16(part[np : np+2]))
-                np += 2 + ln
-            }
-        case 'x':
-            np += 1
-            for i := 0; i < 2; i++ {
-                if np+2 > limitAll { np = limitAll; break }
-                ln := int(binary.BigEndian.Uint16(part[np : np+2]))
-                np += 2 + ln
-            }
-        case 'p', 'u', 'i', 'b', 'e':
-            for i := 0; i < 2; i++ {
-                if np+2 > limitAll { np = limitAll; break }
-                ln := int(binary.BigEndian.Uint16(part[np : np+2]))
-                np += 2 + ln
-            }
-        case 'c', 'r':
-            for i := 0; i < 2; i++ {
-                if np+2 > limitAll { np = limitAll; break }
-                ln := int(binary.BigEndian.Uint16(part[np : np+2]))
-                np += 2 + ln
-            }
-            np += 1
-        case 's':
-            if np+2 > limitAll { np = limitAll; break }
-            ln := int(binary.BigEndian.Uint16(part[np : np+2]))
-            np += 2 + ln
-            if np+1 > limitAll { np = limitAll; break }
-            np += 1
-            if np+2 > limitAll { np = limitAll; break }
-            np += 2
-        case 'o':
-            for i := 0; i < 2; i++ {
-                if np+2 > limitAll { np = limitAll; break }
-                ln := int(binary.BigEndian.Uint16(part[np : np+2]))
-                np += 2 + ln
-            }
-            np += 1
-        default:
-            // Unknown tag: stop
-            np = limitAll
-        }
-        nextBody := (np - start)
-        if nextBody > allowedBody { break }
-        p = np
-    }
-    if p <= start { // nothing fits beyond prefix
-        return append([]byte{}, part[:2+l]...)
-    }
-    return append([]byte{}, part[:p]...)
+	if limit <= 0 || len(part) <= limit || len(part) < 2 {
+		return part
+	}
+	// Prefix: initial OMS string
+	l := int(binary.BigEndian.Uint16(part[0:2]))
+	if 2+l > len(part) {
+		return part
+	}
+	// Ensure limit is at least room for prefix
+	if limit <= 2+l {
+		// Cannot fit any body; return only prefix; finalize() will add 'Q'.
+		return append([]byte{}, part[:2+l]...)
+	}
+	allowedBody := limit - (2 + l)
+	start := 2 + l
+	p := start
+	limitAll := len(part)
+	for p < limitAll {
+		tag := part[p]
+		// Prospective new position after including this tag fully
+		np := p + 1
+		switch tag {
+		case 'T', 'L':
+			if np+2 > limitAll {
+				np = limitAll
+				break
+			}
+			ln := int(binary.BigEndian.Uint16(part[np : np+2]))
+			np += 2 + ln
+		case 'E', 'B', '+', 'V', 'Q', 'l':
+			// no payload
+		case 'D', 'R':
+			np += 2
+		case 'S', 'J':
+			np += 4
+		case 'I':
+			if np+8 > limitAll {
+				np = limitAll
+				break
+			}
+			dl := int(binary.BigEndian.Uint16(part[np+4 : np+6]))
+			np += 8 + dl
+		case 'k':
+			// type + string
+			if np+1 > limitAll {
+				np = limitAll
+				break
+			}
+			np += 1
+			if np+2 > limitAll {
+				np = limitAll
+				break
+			}
+			ln := int(binary.BigEndian.Uint16(part[np : np+2]))
+			np += 2 + ln
+		case 'h':
+			for i := 0; i < 2; i++ {
+				if np+2 > limitAll {
+					np = limitAll
+					break
+				}
+				ln := int(binary.BigEndian.Uint16(part[np : np+2]))
+				np += 2 + ln
+			}
+		case 'x':
+			np += 1
+			for i := 0; i < 2; i++ {
+				if np+2 > limitAll {
+					np = limitAll
+					break
+				}
+				ln := int(binary.BigEndian.Uint16(part[np : np+2]))
+				np += 2 + ln
+			}
+		case 'p', 'u', 'i', 'b', 'e':
+			for i := 0; i < 2; i++ {
+				if np+2 > limitAll {
+					np = limitAll
+					break
+				}
+				ln := int(binary.BigEndian.Uint16(part[np : np+2]))
+				np += 2 + ln
+			}
+		case 'c', 'r':
+			for i := 0; i < 2; i++ {
+				if np+2 > limitAll {
+					np = limitAll
+					break
+				}
+				ln := int(binary.BigEndian.Uint16(part[np : np+2]))
+				np += 2 + ln
+			}
+			np += 1
+		case 's':
+			if np+2 > limitAll {
+				np = limitAll
+				break
+			}
+			ln := int(binary.BigEndian.Uint16(part[np : np+2]))
+			np += 2 + ln
+			if np+1 > limitAll {
+				np = limitAll
+				break
+			}
+			np += 1
+			if np+2 > limitAll {
+				np = limitAll
+				break
+			}
+			np += 2
+		case 'o':
+			for i := 0; i < 2; i++ {
+				if np+2 > limitAll {
+					np = limitAll
+					break
+				}
+				ln := int(binary.BigEndian.Uint16(part[np : np+2]))
+				np += 2 + ln
+			}
+			np += 1
+		default:
+			// Unknown tag: stop
+			np = limitAll
+		}
+		nextBody := (np - start)
+		if nextBody > allowedBody {
+			break
+		}
+		p = np
+	}
+	if p <= start { // nothing fits beyond prefix
+		return append([]byte{}, part[:2+l]...)
+	}
+	return append([]byte{}, part[:p]...)
 }
 
 func splitByTags(b []byte, maxTags int) [][]byte {
 	if maxTags <= 0 || len(b) < 2 {
 		return [][]byte{b}
 	}
-    maxBytes := maxBytesBudget()
+	maxBytes := maxBytesBudget()
 	// Prefix is initial page URL string (len + bytes)
 	if len(b) < 2 {
 		return [][]byte{b}
@@ -430,96 +468,126 @@ func splitByTags(b []byte, maxTags int) [][]byte {
 	if 2+l > len(b) {
 		return [][]byte{b}
 	}
-    prefix := make([]byte, 2+l)
-    copy(prefix, b[:2+l])
-    p := 2 + l
-    // Capture a short prelude of global tags (style/bg/auth) to prepend to
-    // all parts after the first, so style/fg/bg persist across pages for OM2.
-    preludeStart := p
-    pp := p
-    for pp < len(b) {
-        tag := b[pp]
-        pp++
-        switch tag {
-        case 'S':
-            if pp+4 > len(b) { pp = len(b); break }
-            pp += 4
-        case 'D':
-            if pp+2 > len(b) { pp = len(b); break }
-            pp += 2
-        case 'k':
-            // type + string
-            if pp+1 > len(b) { pp = len(b); break }
-            pp += 1
-            if pp+2 > len(b) { pp = len(b); break }
-            ln := int(binary.BigEndian.Uint16(b[pp : pp+2]))
-            pp += 2 + ln
-        default:
-            // stop at first non-global tag
-            pp--
-            goto PreludeDone
-        }
-        // continue scanning next tag
-    }
+	prefix := make([]byte, 2+l)
+	copy(prefix, b[:2+l])
+	p := 2 + l
+	// Capture a short prelude of global tags (style/bg/auth) to prepend to
+	// all parts after the first, so style/fg/bg persist across pages for OM2.
+	preludeStart := p
+	pp := p
+	for pp < len(b) {
+		tag := b[pp]
+		pp++
+		switch tag {
+		case 'S':
+			if pp+4 > len(b) {
+				pp = len(b)
+				break
+			}
+			pp += 4
+		case 'D':
+			if pp+2 > len(b) {
+				pp = len(b)
+				break
+			}
+			pp += 2
+		case 'k':
+			// type + string
+			if pp+1 > len(b) {
+				pp = len(b)
+				break
+			}
+			pp += 1
+			if pp+2 > len(b) {
+				pp = len(b)
+				break
+			}
+			ln := int(binary.BigEndian.Uint16(b[pp : pp+2]))
+			pp += 2 + ln
+		default:
+			// stop at first non-global tag
+			pp--
+			goto PreludeDone
+		}
+		// continue scanning next tag
+	}
 PreludeDone:
-    preludeRaw := append([]byte(nil), b[preludeStart:pp]...)
-    // Normalize prelude so it preserves bg and text color without resetting it
-    // back to default. Keep all 'k' tags, keep the last 'D' (bgcolor) and the
-    // last 'S' that carries a non-zero color component; drop trailing plain 'S'
-    // that would override color on subsequent pages.
-    normalizePrelude := func(src []byte) []byte {
-        var outK [][]byte
-        var haveD bool
-        var dTag []byte
-        var sColor []byte
-        pz := 0
-        for pz < len(src) {
-            tag := src[pz]
-            start := pz
-            pz++
-            switch tag {
-            case 'S':
-                if pz+4 > len(src) { pz = len(src); break }
-                val := src[pz : pz+4]
-                pz += 4
-                // style color lives in bits 8..23 (uint32 big-endian)
-                sv := binary.BigEndian.Uint32(val)
-                if (sv & 0x00FFFF00) != 0 { // has color component
-                    buf := make([]byte, 1+4)
-                    buf[0] = 'S'
-                    copy(buf[1:], val)
-                    sColor = buf
-                }
-            case 'D':
-                if pz+2 > len(src) { pz = len(src); break }
-                dTag = append([]byte(nil), src[start:pz+2]...)
-                haveD = true
-                pz += 2
-            case 'k':
-                if pz+1 > len(src) { pz = len(src); break }
-                pz += 1 // type
-                if pz+2 > len(src) { pz = len(src); break }
-                ln := int(binary.BigEndian.Uint16(src[pz : pz+2]))
-                pz += 2 + ln
-                outK = append(outK, append([]byte(nil), src[start:pz]...))
-            default:
-                // stop parsing unknowns in prelude area
-                pz = len(src)
-            }
-        }
-        var out []byte
-        for _, k := range outK { out = append(out, k...) }
-        if haveD { out = append(out, dTag...) }
-        if sColor != nil { out = append(out, sColor...) }
-        return out
-    }
-    prelude := normalizePrelude(preludeRaw)
-    // Keep first part intact (with prelude). Later parts will get prelude inserted.
-    start := p
+	preludeRaw := append([]byte(nil), b[preludeStart:pp]...)
+	// Normalize prelude so it preserves bg and text color without resetting it
+	// back to default. Keep all 'k' tags, keep the last 'D' (bgcolor) and the
+	// last 'S' that carries a non-zero color component; drop trailing plain 'S'
+	// that would override color on subsequent pages.
+	normalizePrelude := func(src []byte) []byte {
+		var outK [][]byte
+		var haveD bool
+		var dTag []byte
+		var sColor []byte
+		pz := 0
+		for pz < len(src) {
+			tag := src[pz]
+			start := pz
+			pz++
+			switch tag {
+			case 'S':
+				if pz+4 > len(src) {
+					pz = len(src)
+					break
+				}
+				val := src[pz : pz+4]
+				pz += 4
+				// style color lives in bits 8..23 (uint32 big-endian)
+				sv := binary.BigEndian.Uint32(val)
+				if (sv & 0x00FFFF00) != 0 { // has color component
+					buf := make([]byte, 1+4)
+					buf[0] = 'S'
+					copy(buf[1:], val)
+					sColor = buf
+				}
+			case 'D':
+				if pz+2 > len(src) {
+					pz = len(src)
+					break
+				}
+				dTag = append([]byte(nil), src[start:pz+2]...)
+				haveD = true
+				pz += 2
+			case 'k':
+				if pz+1 > len(src) {
+					pz = len(src)
+					break
+				}
+				pz += 1 // type
+				if pz+2 > len(src) {
+					pz = len(src)
+					break
+				}
+				ln := int(binary.BigEndian.Uint16(src[pz : pz+2]))
+				pz += 2 + ln
+				outK = append(outK, append([]byte(nil), src[start:pz]...))
+			default:
+				// stop parsing unknowns in prelude area
+				pz = len(src)
+			}
+		}
+		var out []byte
+		for _, k := range outK {
+			out = append(out, k...)
+		}
+		if haveD {
+			out = append(out, dTag...)
+		}
+		if sColor != nil {
+			out = append(out, sColor...)
+		}
+		return out
+	}
+	prelude := normalizePrelude(preludeRaw)
+	// Keep first part intact (with prelude). Later parts will get prelude inserted.
+	start := p
 	tags := 0
 	limit := len(b)
-    parts := make([][]byte, 0, 2)
-    partIdx := 0
+	parts := make([][]byte, 0, 2)
+	partIdx := 0
 	for p < limit {
 		tag := b[p]
 		p++
@@ -625,30 +693,30 @@ PreludeDone:
 		chunkBytes := p - start
 		if tags >= maxTags || (maxBytes > 0 && chunkBytes >= maxBytes) {
 			// Cut part [start:p)
-            chunk := append([]byte(nil), b[start:p]...)
-            part := append([]byte(nil), prefix...)
-            if partIdx > 0 && len(prelude) > 0 {
-                part = append(part, prelude...)
-            }
-            part = append(part, chunk...)
-            parts = append(parts, part)
-            start = p
-            tags = 0
-            partIdx++
-        }
-    }
-    if start < limit {
-        part := append([]byte(nil), prefix...)
-        if partIdx > 0 && len(prelude) > 0 {
-            part = append(part, prelude...)
-        }
-        part = append(part, b[start:limit]...)
-        parts = append(parts, part)
-    }
-    if len(parts) == 0 {
-        return [][]byte{b}
-    }
-    return parts
+			chunk := append([]byte(nil), b[start:p]...)
+			part := append([]byte(nil), prefix...)
+			if partIdx > 0 && len(prelude) > 0 {
+				part = append(part, prelude...)
+			}
+			part = append(part, chunk...)
+			parts = append(parts, part)
+			start = p
+			tags = 0
+			partIdx++
+		}
+	}
+	if start < limit {
+		part := append([]byte(nil), prefix...)
+		if partIdx > 0 && len(prelude) > 0 {
+			part = append(part, prelude...)
+		}
+		part = append(part, b[start:limit]...)
+		parts = append(parts, part)
+	}
+	if len(parts) == 0 {
+		return [][]byte{b}
+	}
+	return parts
 }
 
 // ---------------------- Image cache (LRU by bytes) ----------------------
@@ -1096,16 +1164,16 @@ type listCtx struct {
 	bullet  string
 }
 type walkState struct {
-    pre        bool
-    lists      []listCtx
-    styleStack []uint32
-    curStyle   uint32
-    inLink     bool
-    css        *Stylesheet
-    colorStack []string
-    curColor   string
-    bgStack    []string
-    curBg      string
+	pre        bool
+	lists      []listCtx
+	styleStack []uint32
+	curStyle   uint32
+	inLink     bool
+	css        *Stylesheet
+	colorStack []string
+	curColor   string
+	bgStack    []string
+	curBg      string
 }
 
 // RenderOptions define client rendering preferences relevant to OBML generation.
@@ -1141,65 +1209,75 @@ type RenderOptions struct {
 
 // BuildPaginationQuery encodes paging parameters while preserving render options that affect output quality.
 func BuildPaginationQuery(target string, opts *RenderOptions, page, maxTags int) string {
-    // For page 1, return a minimal query and strip our internal paging marker
-    // from target ("__p=") so the first page opens exactly like the initial
-    // load and can be satisfied from client cache.
-    if page <= 1 {
-        t := target
-        if u, err := url.Parse(target); err == nil {
-            q := u.Query()
-            if q.Has("__p") {
-                q.Del("__p")
-                u.RawQuery = q.Encode()
-                t = u.String()
-            }
-        }
-        vals := url.Values{}
-        vals.Set("url", t)
-        return vals.Encode()
-    }
-    vals := url.Values{}
-    vals.Set("url", target)
-    if maxTags > 0 {
-        vals.Set("pp", strconv.Itoa(maxTags))
-    }
-    vals.Set("page", strconv.Itoa(page))
-    if opts != nil {
-        if opts.ImagesOn {
-            vals.Set("img", "1")
-        }
-        if opts.HighQuality {
-            vals.Set("hq", "1")
-        }
-        if opts.ImageMIME != "" {
-            vals.Set("mime", opts.ImageMIME)
-        }
-        if opts.MaxInlineKB > 0 { vals.Set("maxkb", strconv.Itoa(opts.MaxInlineKB)) }
-        if opts.ScreenW > 0 { vals.Set("w", strconv.Itoa(opts.ScreenW)) }
-        if opts.ScreenH > 0 { vals.Set("h", strconv.Itoa(opts.ScreenH)) }
-        // Only propagate memory/alpha when client explicitly provided them (>0)
-        if opts.HeapBytes > 0 { vals.Set("m", strconv.Itoa(opts.HeapBytes)) }
-        if opts.AlphaLevels > 0 { vals.Set("l", strconv.Itoa(opts.AlphaLevels)) }
-        // Preserve Opera Mini auth echo and client discriminator so
-        // subsequent navigations render with the same context as the first load.
-        if strings.TrimSpace(opts.AuthCode) != "" {
-            vals.Set("c", opts.AuthCode)
-        }
-        if strings.TrimSpace(opts.AuthPrefix) != "" {
-            vals.Set("h", opts.AuthPrefix)
-        }
-        if opts.GatewayVersion > 0 {
-            vals.Set("o", strconv.Itoa(opts.GatewayVersion))
-        }
-        // Some clients pass explicit protocol version; keep it if caller set it.
-        switch normalizeClientVersion(opts.ClientVersion) {
-        case ClientVersion1:
-            vals.Set("version", "1")
-        case ClientVersion3:
-            vals.Set("version", "3")
-        }
-    }
-    return vals.Encode()
+	// For page 1, return a minimal query and strip our internal paging marker
+	// from target ("__p=") so the first page opens exactly like the initial
+	// load and can be satisfied from client cache.
+	if page <= 1 {
+		t := target
+		if u, err := url.Parse(target); err == nil {
+			q := u.Query()
+			if q.Has("__p") {
+				q.Del("__p")
+				u.RawQuery = q.Encode()
+				t = u.String()
+			}
+		}
+		vals := url.Values{}
+		vals.Set("url", t)
+		return vals.Encode()
+	}
+	vals := url.Values{}
+	vals.Set("url", target)
+	if maxTags > 0 {
+		vals.Set("pp", strconv.Itoa(maxTags))
+	}
+	vals.Set("page", strconv.Itoa(page))
+	if opts != nil {
+		if opts.ImagesOn {
+			vals.Set("img", "1")
+		}
+		if opts.HighQuality {
+			vals.Set("hq", "1")
+		}
+		if opts.ImageMIME != "" {
+			vals.Set("mime", opts.ImageMIME)
+		}
+		if opts.MaxInlineKB > 0 {
+			vals.Set("maxkb", strconv.Itoa(opts.MaxInlineKB))
+		}
+		if opts.ScreenW > 0 {
+			vals.Set("w", strconv.Itoa(opts.ScreenW))
+		}
+		if opts.ScreenH > 0 {
+			vals.Set("h", strconv.Itoa(opts.ScreenH))
+		}
+		// Only propagate memory/alpha when client explicitly provided them (>0)
+		if opts.HeapBytes > 0 {
+			vals.Set("m", strconv.Itoa(opts.HeapBytes))
+		}
+		if opts.AlphaLevels > 0 {
+			vals.Set("l", strconv.Itoa(opts.AlphaLevels))
+		}
+		// Preserve Opera Mini auth echo and client discriminator so
+		// subsequent navigations render with the same context as the first load.
+		if strings.TrimSpace(opts.AuthCode) != "" {
+			vals.Set("c", opts.AuthCode)
+		}
+		if strings.TrimSpace(opts.AuthPrefix) != "" {
+			vals.Set("h", opts.AuthPrefix)
+		}
+		if opts.GatewayVersion > 0 {
+			vals.Set("o", strconv.Itoa(opts.GatewayVersion))
+		}
+		// Some clients pass explicit protocol version; keep it if caller set it.
+		switch normalizeClientVersion(opts.ClientVersion) {
+		case ClientVersion1:
+			vals.Set("version", "1")
+		case ClientVersion3:
+			vals.Set("version", "3")
+		}
+	}
+	return vals.Encode()
 }
 
 // GetAttr is an exported helper for debug code paths.
@@ -1520,97 +1598,97 @@ func hasTextContent(n *html.Node) bool {
 }
 
 func renderBackgroundImage(n *html.Node, props map[string]string, base string, p *Page, prefs RenderOptions) bool {
-    if n == nil || p == nil {
-        return false
-    }
-    // Render small decorative backgrounds even when images are globally off
-    // (icons, sprites). We keep hard limit by dimensions below.
-    allowWhenImagesOff := true
-    if !prefs.ImagesOn && !allowWhenImagesOff {
-        return false
-    }
-    // Never draw background sprites directly on form controls to avoid
-    // covering native widgets (search button/inputs etc.).
-    if n.Type == html.ElementNode && isFormControlTag(n.Data) {
-        return false
-    }
-    // Also avoid background images for containers that include form controls.
-    if containsFormControl(n) {
-        return false
-    }
-    inlineStyle := getAttr(n, "style")
-    bgVal := cssPropValue(props, inlineStyle, "background-image")
-    if bgVal == "" {
-        bgVal = cssPropValue(props, inlineStyle, "background")
-    }
-    if bgVal == "" {
-        return false
-    }
-    urlVal := extractBackgroundImageURL(bgVal)
-    if urlVal == "" {
-        return false
-    }
-    // No tag restriction: any element can carry a small decorative background
-    if hasTextContent(n) {
-        return false
-    }
-    repeat := strings.ToLower(cssPropValue(props, inlineStyle, "background-repeat"))
-    if repeat != "" && repeat != "no-repeat" && repeat != "initial" {
-        return false
-    }
-    widthHint := cssValueToPx(cssPropValue(props, inlineStyle, "width"), prefs.ScreenW)
-    heightHint := cssValueToPx(cssPropValue(props, inlineStyle, "height"), prefs.ScreenH)
-    if (widthHint > maxInlineBackgroundSize || heightHint > maxInlineBackgroundSize) {
-        return false
-    }
-    abs := urlVal
-    if !strings.HasPrefix(urlVal, "data:") {
-        if base != "" {
-            if resolved := resolveAbsURL(base, urlVal); resolved != "" {
-                abs = resolved
-            }
-        }
-        if !strings.Contains(abs, "://") && !strings.HasPrefix(abs, "data:") {
-            return false
-        }
-    }
-    // Parse background-position for sprite cropping if present
-    posX, posY, hasPos := parseBackgroundPosition(cssPropValue(props, inlineStyle, "background-position"))
+	if n == nil || p == nil {
+		return false
+	}
+	// Render small decorative backgrounds even when images are globally off
+	// (icons, sprites). We keep hard limit by dimensions below.
+	allowWhenImagesOff := true
+	if !prefs.ImagesOn && !allowWhenImagesOff {
+		return false
+	}
+	// Never draw background sprites directly on form controls to avoid
+	// covering native widgets (search button/inputs etc.).
+	if n.Type == html.ElementNode && isFormControlTag(n.Data) {
+		return false
+	}
+	// Also avoid background images for containers that include form controls.
+	if containsFormControl(n) {
+		return false
+	}
+	inlineStyle := getAttr(n, "style")
+	bgVal := cssPropValue(props, inlineStyle, "background-image")
+	if bgVal == "" {
+		bgVal = cssPropValue(props, inlineStyle, "background")
+	}
+	if bgVal == "" {
+		return false
+	}
+	urlVal := extractBackgroundImageURL(bgVal)
+	if urlVal == "" {
+		return false
+	}
+	// No tag restriction: any element can carry a small decorative background
+	if hasTextContent(n) {
+		return false
+	}
+	repeat := strings.ToLower(cssPropValue(props, inlineStyle, "background-repeat"))
+	if repeat != "" && repeat != "no-repeat" && repeat != "initial" {
+		return false
+	}
+	widthHint := cssValueToPx(cssPropValue(props, inlineStyle, "width"), prefs.ScreenW)
+	heightHint := cssValueToPx(cssPropValue(props, inlineStyle, "height"), prefs.ScreenH)
+	if widthHint > maxInlineBackgroundSize || heightHint > maxInlineBackgroundSize {
+		return false
+	}
+	abs := urlVal
+	if !strings.HasPrefix(urlVal, "data:") {
+		if base != "" {
+			if resolved := resolveAbsURL(base, urlVal); resolved != "" {
+				abs = resolved
+			}
+		}
+		if !strings.Contains(abs, "://") && !strings.HasPrefix(abs, "data:") {
+			return false
+		}
+	}
+	// Parse background-position for sprite cropping if present
+	posX, posY, hasPos := parseBackgroundPosition(cssPropValue(props, inlineStyle, "background-position"))
 
-    data, w, h, ok := fetchAndEncodeImage(abs, prefs)
-    if !ok {
-        return false
-    }
-    if widthHint <= 0 {
-        widthHint = w
-    }
-    if heightHint <= 0 {
-        heightHint = h
-    }
-    if widthHint <= 0 || heightHint <= 0 {
-        return false
-    }
-    if widthHint > maxInlineBackgroundSize || heightHint > maxInlineBackgroundSize {
-        return false
-    }
-    if prefs.MaxInlineKB > 0 && len(data) > prefs.MaxInlineKB*1024 {
-        return false
-    }
-    if hasPos {
-        // CSS background-position offsets shift the image relative to the box.
-        // Negative values mean the sprite is shifted left/up, so visible region starts at -pos.
-        cropX := -posX
-        cropY := -posY
-        if cropped, ok := fetchAndEncodeImageRegion(abs, prefs, cropX, cropY, widthHint, heightHint); ok {
-            if prefs.MaxInlineKB <= 0 || len(cropped) <= prefs.MaxInlineKB*1024 {
-                p.AddImageInline(widthHint, heightHint, cropped)
-                return true
-            }
-        }
-        // If cropping fails, fall back to full image rendering.
-    }
-    p.AddImageInline(widthHint, heightHint, data)
-    return true
+	data, w, h, ok := fetchAndEncodeImage(abs, prefs)
+	if !ok {
+		return false
+	}
+	if widthHint <= 0 {
+		widthHint = w
+	}
+	if heightHint <= 0 {
+		heightHint = h
+	}
+	if widthHint <= 0 || heightHint <= 0 {
+		return false
+	}
+	if widthHint > maxInlineBackgroundSize || heightHint > maxInlineBackgroundSize {
+		return false
+	}
+	if prefs.MaxInlineKB > 0 && len(data) > prefs.MaxInlineKB*1024 {
+		return false
+	}
+	if hasPos {
+		// CSS background-position offsets shift the image relative to the box.
+		// Negative values mean the sprite is shifted left/up, so visible region starts at -pos.
+		cropX := -posX
+		cropY := -posY
+		if cropped, ok := fetchAndEncodeImageRegion(abs, prefs, cropX, cropY, widthHint, heightHint); ok {
+			if prefs.MaxInlineKB <= 0 || len(cropped) <= prefs.MaxInlineKB*1024 {
+				p.AddImageInline(widthHint, heightHint, cropped)
+				return true
+			}
+		}
+		// If cropping fails, fall back to full image rendering.
+	}
+	p.AddImageInline(widthHint, heightHint, data)
+	return true
 }
 
 // isBgPaintableTag returns true for structural/container tags where a
@@ -1618,81 +1696,89 @@ func renderBackgroundImage(n *html.Node, props map[string]string, base string, p
 // controls and phrasing content are excluded to avoid painting over
 // buttons/inputs/links.
 func isBgPaintableTag(tag string) bool {
-    switch strings.ToLower(tag) {
-    case "div", "section", "article", "header", "footer", "main", "nav", "aside",
-        "ul", "ol", "li", "table", "tbody", "thead", "tr", "td", "th":
-        return true
-    }
-    return false
+	switch strings.ToLower(tag) {
+	case "div", "section", "article", "header", "footer", "main", "nav", "aside",
+		"ul", "ol", "li", "table", "tbody", "thead", "tr", "td", "th":
+		return true
+	}
+	return false
 }
 
 // isFormControlTag returns true for form controls which should not get
 // background overlays (neither color nor sprite) applied directly or by
 // container heuristics around them.
 func isFormControlTag(tag string) bool {
-    switch strings.ToLower(tag) {
-    case "input", "button", "select", "textarea", "label":
-        return true
-    }
-    return false
+	switch strings.ToLower(tag) {
+	case "input", "button", "select", "textarea", "label":
+		return true
+	}
+	return false
 }
 
 // containsFormControl reports whether subtree n contains any form controls.
 func containsFormControl(n *html.Node) bool {
-    if n == nil { return false }
-    var dfs func(*html.Node) bool
-    dfs = func(x *html.Node) bool {
-        if x.Type == html.ElementNode && isFormControlTag(x.Data) { return true }
-        for c := x.FirstChild; c != nil; c = c.NextSibling {
-            if dfs(c) { return true }
-        }
-        return false
-    }
-    return dfs(n)
+	if n == nil {
+		return false
+	}
+	var dfs func(*html.Node) bool
+	dfs = func(x *html.Node) bool {
+		if x.Type == html.ElementNode && isFormControlTag(x.Data) {
+			return true
+		}
+		for c := x.FirstChild; c != nil; c = c.NextSibling {
+			if dfs(c) {
+				return true
+			}
+		}
+		return false
+	}
+	return dfs(n)
 }
 
 // cssEffectiveProp returns node's CSS property or nearest inherited ancestor value
 // for a small set of inheritable properties used by the renderer.
 func cssEffectiveProp(n *html.Node, ss *Stylesheet, self map[string]string, prop string) string {
-    if self != nil {
-        if v := strings.TrimSpace(self[strings.ToLower(prop)]); v != "" {
-            return v
-        }
-    }
-    switch strings.ToLower(prop) {
-    case "color", "text-align", "font-weight", "font-style", "text-decoration", "list-style-type":
-        depth := 0
-        for p := n.Parent; p != nil && depth < 12; p = p.Parent {
-            if p.Type != html.ElementNode { continue }
-            if props := computeStyleFor(p, ss); props != nil {
-                if v := strings.TrimSpace(props[strings.ToLower(prop)]); v != "" {
-                    return v
-                }
-            }
-            depth++
-        }
-    }
-    return ""
+	if self != nil {
+		if v := strings.TrimSpace(self[strings.ToLower(prop)]); v != "" {
+			return v
+		}
+	}
+	switch strings.ToLower(prop) {
+	case "color", "text-align", "font-weight", "font-style", "text-decoration", "list-style-type":
+		depth := 0
+		for p := n.Parent; p != nil && depth < 12; p = p.Parent {
+			if p.Type != html.ElementNode {
+				continue
+			}
+			if props := computeStyleFor(p, ss); props != nil {
+				if v := strings.TrimSpace(props[strings.ToLower(prop)]); v != "" {
+					return v
+				}
+			}
+			depth++
+		}
+	}
+	return ""
 }
 
 func (s *walkState) pushBgcolor(p *Page, hex string) {
-    s.bgStack = append(s.bgStack, s.curBg)
-    s.curBg = hex
-    if hex != "" {
-        p.AddBgcolor(hex)
-    }
+	s.bgStack = append(s.bgStack, s.curBg)
+	s.curBg = hex
+	if hex != "" {
+		p.AddBgcolor(hex)
+	}
 }
 
 func (s *walkState) popBgcolor(p *Page) {
-    if len(s.bgStack) == 0 {
-        return
-    }
-    prev := s.bgStack[len(s.bgStack)-1]
-    s.bgStack = s.bgStack[:len(s.bgStack)-1]
-    s.curBg = prev
-    if prev != "" {
-        p.AddBgcolor(prev)
-    }
+	if len(s.bgStack) == 0 {
+		return
+	}
+	prev := s.bgStack[len(s.bgStack)-1]
+	s.bgStack = s.bgStack[:len(s.bgStack)-1]
+	s.curBg = prev
+	if prev != "" {
+		p.AddBgcolor(prev)
+	}
 }
 
 func resetComputedStyles(st *walkState, p *Page, colorPushed *bool, stylePushed *bool, alignedPushed *bool) {
@@ -1735,149 +1821,194 @@ func condenseSpaces(s string) string {
 // parseBackgroundPosition parses simple background-position values like "-24px 0" or "0 0".
 // Returns x, y pixel offsets; boolean indicates if any value was parsed.
 func parseBackgroundPosition(val string) (int, int, bool) {
-    v := strings.TrimSpace(val)
-    if v == "" {
-        return 0, 0, false
-    }
-    lower := strings.ToLower(v)
-    lower = condenseSpaces(strings.ReplaceAll(lower, ",", " "))
-    parts := strings.Fields(lower)
-    if len(parts) == 0 {
-        return 0, 0, false
-    }
-    parse := func(s string) (int, bool) {
-        s = strings.TrimSpace(s)
-        switch s {
-        case "left", "top", "center":
-            return 0, true
-        case "right", "bottom":
-            return 0, true
-        }
-        if strings.HasSuffix(s, "px") {
-            s = strings.TrimSpace(s[:len(s)-2])
-        }
-        if f, err := strconv.ParseFloat(s, 64); err == nil {
-            if f >= 0 {
-                return int(f + 0.5), true
-            }
-            return int(f - 0.5), true
-        }
-        return 0, false
-    }
-    if len(parts) == 1 {
-        if x, ok := parse(parts[0]); ok {
-            return x, 0, true
-        }
-        return 0, 0, false
-    }
-    x, okx := parse(parts[0])
-    y, oky := parse(parts[1])
-    if okx || oky {
-        return x, y, true
-    }
-    return 0, 0, false
+	v := strings.TrimSpace(val)
+	if v == "" {
+		return 0, 0, false
+	}
+	lower := strings.ToLower(v)
+	lower = condenseSpaces(strings.ReplaceAll(lower, ",", " "))
+	parts := strings.Fields(lower)
+	if len(parts) == 0 {
+		return 0, 0, false
+	}
+	parse := func(s string) (int, bool) {
+		s = strings.TrimSpace(s)
+		switch s {
+		case "left", "top", "center":
+			return 0, true
+		case "right", "bottom":
+			return 0, true
+		}
+		if strings.HasSuffix(s, "px") {
+			s = strings.TrimSpace(s[:len(s)-2])
+		}
+		if f, err := strconv.ParseFloat(s, 64); err == nil {
+			if f >= 0 {
+				return int(f + 0.5), true
+			}
+			return int(f - 0.5), true
+		}
+		return 0, false
+	}
+	if len(parts) == 1 {
+		if x, ok := parse(parts[0]); ok {
+			return x, 0, true
+		}
+		return 0, 0, false
+	}
+	x, okx := parse(parts[0])
+	y, oky := parse(parts[1])
+	if okx || oky {
+		return x, y, true
+	}
+	return 0, 0, false
 }
 
 // fetchAndEncodeImageRegion fetches an image, crops the (x,y,w,h) rectangle and encodes it.
 // Uses existing caches with a region-specific key.
 func fetchAndEncodeImageRegion(absURL string, prefs RenderOptions, x, y, w, h int) ([]byte, bool) {
-    if w <= 0 || h <= 0 {
-        return nil, false
-    }
-    // Region cache key
-    regionKey := absURL + "#rect=" + strconv.Itoa(x) + "," + strconv.Itoa(y) + "," + strconv.Itoa(w) + "," + strconv.Itoa(h)
-    candidates := cacheCandidatesFor(prefs)
-    for _, cand := range candidates {
-        if data, _, _, ok := imgCacheGet(cand.format, cand.quality, regionKey); ok {
-            return data, true
-        }
-        if data, _, _, ok := diskCacheGet(cand.format, cand.quality, regionKey); ok {
-            imgCachePut(cand.format, cand.quality, regionKey, data, w, h)
-            return data, true
-        }
-    }
+	if w <= 0 || h <= 0 {
+		return nil, false
+	}
+	// Region cache key
+	regionKey := absURL + "#rect=" + strconv.Itoa(x) + "," + strconv.Itoa(y) + "," + strconv.Itoa(w) + "," + strconv.Itoa(h)
+	candidates := cacheCandidatesFor(prefs)
+	for _, cand := range candidates {
+		if data, _, _, ok := imgCacheGet(cand.format, cand.quality, regionKey); ok {
+			return data, true
+		}
+		if data, _, _, ok := diskCacheGet(cand.format, cand.quality, regionKey); ok {
+			imgCachePut(cand.format, cand.quality, regionKey, data, w, h)
+			return data, true
+		}
+	}
 
-    // Attempt to reuse cached full image first
-    var srcBytes []byte
-    var have bool
-    for _, cand := range candidates {
-        if data, _, _, ok := imgCacheGet(cand.format, cand.quality, absURL); ok {
-            srcBytes = data
-            have = true
-            break
-        }
-        if data, _, _, ok := diskCacheGet(cand.format, cand.quality, absURL); ok {
-            srcBytes = data
-            have = true
-            break
-        }
-    }
-    if !have {
-        // Fallback to fetching from network
-        req, err := http.NewRequest(http.MethodGet, absURL, nil)
-        if err != nil {
-            return nil, false
-        }
-        req.Header.Set("Accept", "image/*")
-        if prefs.ReqHeaders != nil {
-            if ua := prefs.ReqHeaders.Get("User-Agent"); ua != "" { req.Header.Set("User-Agent", ua) }
-            if al := prefs.ReqHeaders.Get("Accept-Language"); al != "" { req.Header.Set("Accept-Language", al) }
-            var cookieParts []string
-            if ck := prefs.ReqHeaders.Get("Cookie"); ck != "" { cookieParts = append(cookieParts, ck) }
-            if oc := prefs.OriginCookies; oc != "" { cookieParts = append(cookieParts, oc) }
-            if len(cookieParts) > 0 { req.Header.Set("Cookie", strings.Join(cookieParts, "; ")) }
-        }
-        if req.Header.Get("User-Agent") == "" { req.Header.Set("User-Agent", "OMS-ImageFetcher/1.0") }
-        if prefs.Referrer != "" { req.Header.Set("Referer", prefs.Referrer) }
-        client := &http.Client{Timeout: 8 * time.Second}
-        if prefs.Jar != nil { client.Jar = prefs.Jar }
-        resp, err := client.Do(req)
-        if err != nil { return nil, false }
-        defer resp.Body.Close()
-        var rc io.ReadCloser = resp.Body
-        switch strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Encoding"))) {
-        case "gzip":
-            if gr, e := gzip.NewReader(resp.Body); e == nil { rc = gr; defer gr.Close() }
-        case "deflate":
-            if zr, e := zlib.NewReader(resp.Body); e == nil { rc = zr; defer zr.Close() } else if fr := flate.NewReader(resp.Body); fr != nil { rc = io.NopCloser(fr); defer fr.Close() }
-        }
-        b, err := io.ReadAll(rc)
-        if err != nil || len(b) == 0 { return nil, false }
-        srcBytes = b
-    }
+	// Attempt to reuse cached full image first
+	var srcBytes []byte
+	var have bool
+	for _, cand := range candidates {
+		if data, _, _, ok := imgCacheGet(cand.format, cand.quality, absURL); ok {
+			srcBytes = data
+			have = true
+			break
+		}
+		if data, _, _, ok := diskCacheGet(cand.format, cand.quality, absURL); ok {
+			srcBytes = data
+			have = true
+			break
+		}
+	}
+	if !have {
+		// Fallback to fetching from network
+		req, err := http.NewRequest(http.MethodGet, absURL, nil)
+		if err != nil {
+			return nil, false
+		}
+		req.Header.Set("Accept", "image/*")
+		if prefs.ReqHeaders != nil {
+			if ua := prefs.ReqHeaders.Get("User-Agent"); ua != "" {
+				req.Header.Set("User-Agent", ua)
+			}
+			if al := prefs.ReqHeaders.Get("Accept-Language"); al != "" {
+				req.Header.Set("Accept-Language", al)
+			}
+			var cookieParts []string
+			if ck := prefs.ReqHeaders.Get("Cookie"); ck != "" {
+				cookieParts = append(cookieParts, ck)
+			}
+			if oc := prefs.OriginCookies; oc != "" {
+				cookieParts = append(cookieParts, oc)
+			}
+			if len(cookieParts) > 0 {
+				req.Header.Set("Cookie", strings.Join(cookieParts, "; "))
+			}
+		}
+		if req.Header.Get("User-Agent") == "" {
+			req.Header.Set("User-Agent", "OMS-ImageFetcher/1.0")
+		}
+		if prefs.Referrer != "" {
+			req.Header.Set("Referer", prefs.Referrer)
+		}
+		client := &http.Client{Timeout: 8 * time.Second}
+		if prefs.Jar != nil {
+			client.Jar = prefs.Jar
+		}
+		resp, err := client.Do(req)
+		if err != nil {
+			return nil, false
+		}
+		defer resp.Body.Close()
+		var rc io.ReadCloser = resp.Body
+		switch strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Encoding"))) {
+		case "gzip":
+			if gr, e := gzip.NewReader(resp.Body); e == nil {
+				rc = gr
+				defer gr.Close()
+			}
+		case "deflate":
+			if zr, e := zlib.NewReader(resp.Body); e == nil {
+				rc = zr
+				defer zr.Close()
+			} else if fr := flate.NewReader(resp.Body); fr != nil {
+				rc = io.NopCloser(fr)
+				defer fr.Close()
+			}
+		}
+		b, err := io.ReadAll(rc)
+		if err != nil || len(b) == 0 {
+			return nil, false
+		}
+		srcBytes = b
+	}
 
-    // Decode and crop
-    img, _, err := image.Decode(bytes.NewReader(srcBytes))
-    if err != nil {
-        return nil, false
-    }
-    b := img.Bounds()
-    if x < 0 { x = 0 }
-    if y < 0 { y = 0 }
-    if x > b.Dx()-1 { x = b.Dx() - 1 }
-    if y > b.Dy()-1 { y = b.Dy() - 1 }
-    if x+w > b.Dx() { w = b.Dx() - x }
-    if y+h > b.Dy() { h = b.Dy() - y }
-    if w <= 0 || h <= 0 { return nil, false }
-    rect := image.Rect(b.Min.X+x, b.Min.Y+y, b.Min.X+x+w, b.Min.Y+y+h)
+	// Decode and crop
+	img, _, err := image.Decode(bytes.NewReader(srcBytes))
+	if err != nil {
+		return nil, false
+	}
+	b := img.Bounds()
+	if x < 0 {
+		x = 0
+	}
+	if y < 0 {
+		y = 0
+	}
+	if x > b.Dx()-1 {
+		x = b.Dx() - 1
+	}
+	if y > b.Dy()-1 {
+		y = b.Dy() - 1
+	}
+	if x+w > b.Dx() {
+		w = b.Dx() - x
+	}
+	if y+h > b.Dy() {
+		h = b.Dy() - y
+	}
+	if w <= 0 || h <= 0 {
+		return nil, false
+	}
+	rect := image.Rect(b.Min.X+x, b.Min.Y+y, b.Min.X+x+w, b.Min.Y+y+h)
 
-    type subImager interface{ SubImage(r image.Rectangle) image.Image }
-    var region image.Image
-    if si, ok := img.(subImager); ok {
-        region = si.SubImage(rect)
-    } else {
-        dst := image.NewRGBA(image.Rect(0, 0, w, h))
-        draw.Draw(dst, dst.Bounds(), img, rect.Min, draw.Src)
-        region = dst
-    }
+	type subImager interface {
+		SubImage(r image.Rectangle) image.Image
+	}
+	var region image.Image
+	if si, ok := img.(subImager); ok {
+		region = si.SubImage(rect)
+	} else {
+		dst := image.NewRGBA(image.Rect(0, 0, w, h))
+		draw.Draw(dst, dst.Bounds(), img, rect.Min, draw.Src)
+		region = dst
+	}
 
-    data, _, _, format, quality, err := encodeImage(region, prefs)
-    if err != nil {
-        return nil, false
-    }
-    imgCachePut(format, quality, regionKey, data, w, h)
-    diskCachePut(format, quality, regionKey, data, w, h)
-    return data, true
+	data, _, _, format, quality, err := encodeImage(region, prefs)
+	if err != nil {
+		return nil, false
+	}
+	imgCachePut(format, quality, regionKey, data, w, h)
+	diskCachePut(format, quality, regionKey, data, w, h)
+	return data, true
 }
 
 func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool, st *walkState, prefs RenderOptions) {
@@ -1904,19 +2035,19 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 					continue
 				}
 			}
-            bgRendered = renderBackgroundImage(c, props, base, p, prefs)
-            if props != nil {
-                // Block background color support: only for container/structural elements
-                // and only when subtree does not contain form controls to avoid flooding
-                // input areas with container backgrounds.
-                if isBgPaintableTag(strings.ToLower(c.Data)) && !containsFormControl(c) {
-                    if bgc := strings.TrimSpace(props["background-color"]); bgc != "" {
-                        if hx := cssToHex(bgc); hx != "" {
-                            st.pushBgcolor(p, hx)
-                            bgColorPushed = true
-                        }
-                    }
-                }
+			bgRendered = renderBackgroundImage(c, props, base, p, prefs)
+			if props != nil {
+				// Block background color support: only for container/structural elements
+				// and only when subtree does not contain form controls to avoid flooding
+				// input areas with container backgrounds.
+				if isBgPaintableTag(strings.ToLower(c.Data)) && !containsFormControl(c) {
+					if bgc := strings.TrimSpace(props["background-color"]); bgc != "" {
+						if hx := cssToHex(bgc); hx != "" {
+							st.pushBgcolor(p, hx)
+							bgColorPushed = true
+						}
+					}
+				}
 				align := strings.ToLower(strings.TrimSpace(cssEffectiveProp(c, st.css, props, "text-align")))
 				switch align {
 				case "center":
@@ -2049,7 +2180,7 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 			}
 			// Do not recurse into heading children to avoid duplicate text
 			recurse = false
-	case "div", "section", "article", "header", "footer", "main", "nav", "aside":
+		case "div", "section", "article", "header", "footer", "main", "nav", "aside":
 			if hasClass(c, "p") {
 				resetComputedStyles(st, p, &colorPushed, &stylePushed, &alignedPushed)
 				st.pushColor(p, "#007700")
@@ -2221,7 +2352,7 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 			}
 			p.AddText("_")
 			recurse = false
-	case "span":
+		case "span":
 			// Avoid textual placeholders for decorative sprite spans; rely on background renderer.
 			if bgRendered {
 				resetComputedStyles(st, p, &colorPushed, &stylePushed, &alignedPushed)
@@ -3626,12 +3757,12 @@ func LoadPageWithHeadersAndOptions(oURL string, hdr http.Header, opts *RenderOpt
 	if pageIdx > len(parts) {
 		pageIdx = len(parts)
 	}
-    sel := parts[pageIdx-1]
-    // Rewrite only for pages >1 so OM2 history treats them as distinct.
-    // Do NOT rewrite page 1 to avoid style regressions on return.
-    if pageIdx > 1 {
-        sel = rewriteInitialURLRaw(sel, pageIdx)
-    }
+	sel := parts[pageIdx-1]
+	// Rewrite only for pages >1 so OM2 history treats them as distinct.
+	// Do NOT rewrite page 1 to avoid style regressions on return.
+	if pageIdx > 1 {
+		sel = rewriteInitialURLRaw(sel, pageIdx)
+	}
 	serverBase := ""
 	if opts != nil {
 		serverBase = opts.ServerBase
@@ -3691,39 +3822,41 @@ func LoadPageWithHeadersAndOptions(oURL string, hdr http.Header, opts *RenderOpt
 			lastShown = n
 		}
 		nav.AddBreak()
-		nav.AddText(fmt.Sprintf("Выбор страницы (1…%d)", len(parts)))
-		nav.AddBreak()
-		formAction := "0/" + serverBase + "/fetch"
-		nav.AddForm(formAction)
-		nav.AddHidden("url", effectiveURL)
-		if maxTags > 0 {
-			nav.AddHidden("pp", strconv.Itoa(maxTags))
+		/*
+			////nav.AddText(fmt.Sprintf("Выбор страницы (1…%d)", len(parts)))
+			////nav.AddBreak()
+			////formAction := "0/" + serverBase + "/fetch"
+			////nav.AddForm(formAction)
+			////nav.AddHidden("url", effectiveURL)
+			////if maxTags > 0 {
+			////	nav.AddHidden("pp", strconv.Itoa(maxTags))
+			////}
+			////if rp.ImagesOn {
+			////	nav.AddHidden("img", "1")
+			////}
+			////if rp.HighQuality {
+			////	nav.AddHidden("hq", "1")
+			////}
+			////if rp.ImageMIME != "" {
+			////	nav.AddHidden("mime", rp.ImageMIME)
+			////}
+			////if rp.MaxInlineKB > 0 {
+			////	nav.AddHidden("maxkb", strconv.Itoa(rp.MaxInlineKB))
+			////}
+			////nav.AddTextInput("page", "")
+			////nav.AddText(" ")
+			////nav.AddSubmit("go", "OK")
+			////nav.AddHr("")
+		*/
+		// Ensure final raw page (content + nav) does not exceed per-part byte budget.
+		// Shrink the selected chunk before appending nav.
+		budget := maxBytesBudget()
+		allowed := budget - len(nav.Data)
+		if allowed < 1024 { // keep a sane minimal room for content
+			allowed = 1024
 		}
-		if rp.ImagesOn {
-			nav.AddHidden("img", "1")
-		}
-		if rp.HighQuality {
-			nav.AddHidden("hq", "1")
-		}
-		if rp.ImageMIME != "" {
-			nav.AddHidden("mime", rp.ImageMIME)
-		}
-		if rp.MaxInlineKB > 0 {
-			nav.AddHidden("maxkb", strconv.Itoa(rp.MaxInlineKB))
-		}
-        nav.AddTextInput("page", "")
-        nav.AddText(" ")
-        nav.AddSubmit("go", "OK")
-        nav.AddHr("")
-        // Ensure final raw page (content + nav) does not exceed per-part byte budget.
-        // Shrink the selected chunk before appending nav.
-        budget := maxBytesBudget()
-        allowed := budget - len(nav.Data)
-        if allowed < 1024 { // keep a sane minimal room for content
-            allowed = 1024
-        }
-        sel = shrinkPartToMaxBytes(sel, allowed)
-        sel = append(sel, nav.Data...)
+		sel = shrinkPartToMaxBytes(sel, allowed)
+		sel = append(sel, nav.Data...)
 	}
 	p.Data = sel
 	p.partCur = pageIdx
