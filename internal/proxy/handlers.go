@@ -3,12 +3,17 @@ package proxy
 import (
 	"bytes"
 	"encoding/json"
+	"fmt"
 	"io"
+	"mime"
 	"net/http"
+	"net/url"
 	"os"
+	"path"
 	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"operetta/oms"
 )
@@ -269,6 +274,91 @@ func (s *Server) handleFetch(w http.ResponseWriter, r *http.Request) {
 	s.writeOMS(w, page.Data, page.SetCookies)
 }
 
+func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
+	target := strings.TrimSpace(r.URL.Query().Get("url"))
+	if target == "" {
+		http.Error(w, "missing url", http.StatusBadRequest)
+		return
+	}
+	parsed, err := url.Parse(target)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") {
+		http.Error(w, "invalid url", http.StatusBadRequest)
+		return
+	}
+
+	clientKey := s.clientJarKey(r, nil)
+	jar := s.cookieJars.Get(clientKey)
+	httpClient := &http.Client{
+		Timeout: 5 * time.Minute,
+	}
+	if jar != nil {
+		httpClient.Jar = jar
+	}
+
+	req, err := http.NewRequestWithContext(r.Context(), http.MethodGet, target, nil)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	req.Header.Set("User-Agent", oms.DefaultUpstreamUA)
+	if ref := strings.TrimSpace(r.URL.Query().Get("ref")); ref != "" {
+		req.Header.Set("Referer", ref)
+	}
+
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= http.StatusBadRequest {
+		w.WriteHeader(resp.StatusCode)
+		_, _ = io.Copy(w, resp.Body)
+		return
+	}
+
+	ct := strings.TrimSpace(r.URL.Query().Get("ct"))
+	if ct == "" {
+		ct = strings.TrimSpace(resp.Header.Get("Content-Type"))
+	}
+	if ct != "" {
+		w.Header().Set("Content-Type", ct)
+	}
+
+	filename := strings.TrimSpace(r.URL.Query().Get("name"))
+	if filename == "" {
+		filename = deriveDownloadFilename(resp.Header.Get("Content-Disposition"), parsed.Path)
+	}
+
+	mode := strings.TrimSpace(r.URL.Query().Get("mode"))
+	if strings.EqualFold(mode, "stream") {
+		if filename != "" {
+			w.Header().Set("Content-Disposition", fmt.Sprintf("inline; filename=\"%s\"", encodeDispositionFilename(filename)))
+		} else if disp := resp.Header.Get("Content-Disposition"); disp != "" {
+			w.Header().Set("Content-Disposition", disp)
+		}
+	} else {
+		if filename != "" {
+			w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", encodeDispositionFilename(filename)))
+		} else if disp := resp.Header.Get("Content-Disposition"); disp != "" {
+			w.Header().Set("Content-Disposition", disp)
+		}
+	}
+
+	if cl := resp.Header.Get("Content-Length"); cl != "" {
+		w.Header().Set("Content-Length", cl)
+	}
+	if ar := resp.Header.Get("Accept-Ranges"); ar != "" {
+		w.Header().Set("Accept-Ranges", ar)
+	}
+	w.Header().Set("Connection", "close")
+	w.WriteHeader(resp.StatusCode)
+	if _, err := io.Copy(w, resp.Body); err != nil {
+		s.logger.Printf("download stream error for %s: %v", target, err)
+	}
+}
+
 func (s *Server) handleValidate(w http.ResponseWriter, r *http.Request) {
 	u := r.URL.Query().Get("url")
 	if u == "" {
@@ -306,6 +396,31 @@ func (s *Server) handlePing(w http.ResponseWriter, _ *http.Request) {
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 	w.Header().Set("Connection", "close")
 	io.WriteString(w, "pong\n")
+}
+
+func deriveDownloadFilename(disposition, pathPart string) string {
+	if disp := strings.TrimSpace(disposition); disp != "" {
+		if _, params, err := mime.ParseMediaType(disp); err == nil {
+			if name := params["filename"]; name != "" {
+				if decoded, err := url.QueryUnescape(name); err == nil {
+					return decoded
+				}
+				return name
+			}
+		}
+	}
+	if base := path.Base(pathPart); base != "" && base != "." && base != "/" {
+		if decoded, err := url.PathUnescape(base); err == nil {
+			return decoded
+		}
+		return base
+	}
+	return ""
+}
+
+func encodeDispositionFilename(name string) string {
+	replacer := strings.NewReplacer("\\", "\\\\", "\"", "\\\"")
+	return replacer.Replace(name)
 }
 
 func (s *Server) headersFromParams(r *http.Request, params map[string]string) http.Header {

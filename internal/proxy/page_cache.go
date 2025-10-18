@@ -52,6 +52,9 @@ func (c *pageCache) Store(target string, opt *oms.RenderOptions, _ http.Header, 
 	if opt == nil || page == nil || len(page.Data) == 0 || opt.Page > 1 {
 		return
 	}
+	if page.NoCache {
+		return
+	}
 	data := page.Data
 	if len(page.CachePacked) > 0 {
 		data = page.CachePacked

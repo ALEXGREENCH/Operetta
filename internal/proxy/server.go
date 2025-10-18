@@ -163,4 +163,5 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/fetch", s.handleFetch)
 	s.mux.HandleFunc("/validate", s.handleValidate)
 	s.mux.HandleFunc("/ping", s.handlePing)
+	s.mux.HandleFunc("/download", s.handleDownload)
 }

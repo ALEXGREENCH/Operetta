@@ -12,8 +12,10 @@ import (
 	"image/jpeg"
 	"image/png"
 	"io"
+	"mime"
 	"net/http"
 	"net/url"
+	"path"
 	"sort"
 	"strings"
 
@@ -38,6 +40,10 @@ var ProxyCookieJarStore interface {
 var ProxyDeriveClientKey func(r *http.Request) string = nil
 
 const defaultUpstreamUA = "Mozilla/5.0 (Linux; Android 9; OMS Test) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
+
+// DefaultUpstreamUA exposes the UA string used for origin requests so other packages
+// (e.g., proxy download handlers) can mimic the renderer's behaviour.
+const DefaultUpstreamUA = defaultUpstreamUA
 
 const defaultPaginationBytes = 32000
 const maxInlineBackgroundSize = 128
@@ -3741,6 +3747,10 @@ func LoadPageWithHeadersAndOptions(oURL string, hdr http.Header, opts *RenderOpt
 		return errorPage(effectiveURL, "Timeout loading page"), nil
 	}
 	defer resp.Body.Close()
+	if shouldOfferDownload(resp) {
+		page := renderDownloadPage(effectiveURL, resp, opts)
+		return page, nil
+	}
 	var reader io.ReadCloser = resp.Body
 	switch strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Encoding"))) {
 	case "gzip":
@@ -4198,6 +4208,155 @@ func looksLikeActionKey(key string) bool {
 		return true
 	}
 	return strings.HasPrefix(key, "/")
+}
+
+func shouldOfferDownload(resp *http.Response) bool {
+	if resp == nil {
+		return false
+	}
+	if cd := strings.ToLower(resp.Header.Get("Content-Disposition")); cd != "" && strings.Contains(cd, "attachment") {
+		return true
+	}
+	ct := strings.TrimSpace(resp.Header.Get("Content-Type"))
+	if ct == "" {
+		return false
+	}
+	mediaType := strings.ToLower(ct)
+	if mt, _, err := mime.ParseMediaType(ct); err == nil {
+		mediaType = strings.ToLower(mt)
+	}
+	if mediaType == "" {
+		return false
+	}
+	if strings.Contains(mediaType, "html") || strings.Contains(mediaType, "xml") {
+		return false
+	}
+	if strings.HasPrefix(mediaType, "text/") {
+		return false
+	}
+	switch mediaType {
+	case "application/json", "application/javascript":
+		return false
+	case "application/octet-stream":
+		// Normal OMS responses use application/octet-stream; only treat as download
+		// when server explicitly marks it as an attachment.
+		if cd := resp.Header.Get("Content-Disposition"); cd == "" {
+			return false
+		}
+	}
+	return true
+}
+
+func renderDownloadPage(effectiveURL string, resp *http.Response, opts *RenderOptions) *Page {
+	page := NewPage()
+	page.AddString("1/" + effectiveURL)
+	page.AddStyle(styleDefault)
+
+	ct := strings.TrimSpace(resp.Header.Get("Content-Type"))
+	if mt, _, err := mime.ParseMediaType(ct); err == nil {
+		ct = mt
+	}
+	filename := fileNameFromResponse(resp, effectiveURL)
+	sizeText := humanReadableSize(resp.ContentLength)
+
+	page.AddText("Download file")
+	page.AddBreak()
+	page.AddBreak()
+	if filename != "" {
+		page.AddText("Name: " + filename)
+		page.AddBreak()
+	}
+	if sizeText != "" {
+		page.AddText("Size: " + sizeText)
+		page.AddBreak()
+	}
+	if ct != "" {
+		page.AddText("Type: " + ct)
+		page.AddBreak()
+	}
+	page.AddBreak()
+
+	downloadLink := buildDownloadLink(opts, effectiveURL, resp, filename, false)
+	page.AddLink("0/"+downloadLink, "[Download]")
+
+	if strings.HasPrefix(strings.ToLower(ct), "video/3gpp") {
+		page.AddBreak()
+		streamLink := buildDownloadLink(opts, effectiveURL, resp, filename, true)
+		page.AddLink("0/"+streamLink, "[Play]")
+		page.AddText(" Opens external player")
+	}
+
+	page.AddBreak()
+	page.AddLink("0/"+effectiveURL, "[Open original]")
+
+	if resp != nil {
+		page.SetCookies = append([]string(nil), resp.Header["Set-Cookie"]...)
+	}
+	page.NoCache = true
+	page.finalize()
+	return page
+}
+
+func buildDownloadLink(opts *RenderOptions, effectiveURL string, resp *http.Response, filename string, stream bool) string {
+	values := url.Values{}
+	values.Set("url", effectiveURL)
+	if ct := strings.TrimSpace(resp.Header.Get("Content-Type")); ct != "" {
+		values.Set("ct", ct)
+	}
+	if filename != "" {
+		values.Set("name", filename)
+	}
+	values.Set("ref", effectiveURL)
+	if stream {
+		values.Set("mode", "stream")
+	}
+	path := "/download?" + values.Encode()
+	if opts != nil && strings.TrimSpace(opts.ServerBase) != "" {
+		base := strings.TrimRight(opts.ServerBase, "/")
+		return base + path
+	}
+	return path
+}
+
+func fileNameFromResponse(resp *http.Response, rawURL string) string {
+	if resp != nil {
+		if cd := resp.Header.Get("Content-Disposition"); cd != "" {
+			if _, params, err := mime.ParseMediaType(cd); err == nil {
+				if name := params["filename"]; name != "" {
+					if decoded, err := url.QueryUnescape(name); err == nil {
+						return decoded
+					}
+					return name
+				}
+			}
+		}
+	}
+	if u, err := url.Parse(rawURL); err == nil {
+		if base := path.Base(u.Path); base != "" && base != "/" {
+			if decoded, err := url.PathUnescape(base); err == nil {
+				return decoded
+			}
+			return base
+		}
+	}
+	return ""
+}
+
+func humanReadableSize(n int64) string {
+	if n <= 0 {
+		return ""
+	}
+	units := []string{"B", "KB", "MB", "GB", "TB"}
+	size := float64(n)
+	idx := 0
+	for size >= 1024 && idx < len(units)-1 {
+		size /= 1024
+		idx++
+	}
+	if idx == 0 {
+		return fmt.Sprintf("%d %s", n, units[idx])
+	}
+	return fmt.Sprintf("%.1f %s", size, units[idx])
 }
 
 func nextSignificantSibling(n *html.Node) *html.Node {

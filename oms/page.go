@@ -37,6 +37,8 @@ type Page struct {
 	compression   CompressionMethod
 	// FormHidden records hidden input fields discovered on the page keyed by form action URL.
 	FormHidden map[string]map[string]string
+	// NoCache indicates that the page should not be persisted in the render cache.
+	NoCache bool
 }
 
 // NewPage allocates an empty page.
