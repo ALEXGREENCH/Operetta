@@ -92,14 +92,18 @@ func TestSelectOMSPartFromPacked(t *testing.T) {
 		t.Fatalf("unexpected total parts: got %d want %d", total, len(partsAfter))
 	}
 
+	selected := append([]byte(nil), partsAfter[1]...)
+	selected = rewriteInitialURLRaw(selected, 2)
 	expected := NewPage()
-	expected.Data = append([]byte(nil), partsAfter[1]...)
+	expected.Data = selected
 	expected.partCur = 2
 	expected.partCnt = len(partsAfter)
 	expected.SetTransport(ClientVersion2, CompressionDeflate)
 	expected.finalize()
+	expected.Normalize()
 
 	if !bytes.Equal(partData, expected.Data) {
-		t.Fatalf("part data mismatch")
+		t.Fatalf("part data mismatch len(part)=%d len(expected)=%d",
+			len(partData), len(expected.Data))
 	}
 }

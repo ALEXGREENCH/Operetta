@@ -9,11 +9,15 @@ import (
     "time"
 
     "operetta/internal/proxy"
+    "operetta/oms"
 )
 
 func main() {
 	addrFlag := flag.String("addr", ":8081", "listen address, e.g. :81 or 0.0.0.0:8081")
 	flag.Parse()
+	
+	oms.ProxyCookieJarStore = proxy.CookieJarStoreInstance
+    oms.ProxyDeriveClientKey = proxy.DeriveUpstreamClientKey
 
 	addr := *addrFlag
 	if env := os.Getenv("PORT"); env != "" {

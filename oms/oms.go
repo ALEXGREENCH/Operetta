@@ -31,6 +31,12 @@ import (
 	"golang.org/x/net/html"
 )
 
+var ProxyCookieJarStore interface {
+	Get(key string) http.CookieJar
+} = nil
+
+var ProxyDeriveClientKey func(r *http.Request) string = nil
+
 const defaultUpstreamUA = "Mozilla/5.0 (Linux; Android 9; OMS Test) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120 Safari/537.36"
 
 const defaultPaginationBytes = 32000
@@ -1013,7 +1019,16 @@ func LoadPageWithHeaders(oURL string, hdr http.Header) (*Page, error) {
 		}
 	}
 
-	client := &http.Client{Timeout: 15 * time.Second}
+	jar := http.CookieJar(nil)
+	if ProxyCookieJarStore != nil && ProxyDeriveClientKey != nil {
+		jar = ProxyCookieJarStore.Get(ProxyDeriveClientKey(req))
+	}
+
+	client := &http.Client{
+		Timeout: 15 * time.Second,
+		Jar:     jar,
+	}
+
 	resp, err := client.Do(req)
 	if err != nil {
 		return errorPage(oURL, "Timeout loading page"), nil
@@ -1174,6 +1189,48 @@ type walkState struct {
 	curColor   string
 	bgStack    []string
 	curBg      string
+	formStack  []string
+}
+
+// resolveFormActionURL resolves a form action reference against the base page URL and
+// normalises it for use as a cache key when storing hidden form fields.
+func resolveFormActionURL(base, action string) string {
+	base = strings.TrimSpace(base)
+	action = strings.TrimSpace(action)
+	var baseURL *url.URL
+	if base != "" {
+		if bu, err := url.Parse(base); err == nil {
+			baseURL = bu
+		}
+	}
+	if action == "" {
+		if baseURL != nil {
+			clone := *baseURL
+			clone.Fragment = ""
+			return clone.String()
+		}
+		return ""
+	}
+	if action == "1" { // OMS placeholder for same-page action
+		if baseURL != nil {
+			clone := *baseURL
+			clone.Fragment = ""
+			return clone.String()
+		}
+		return ""
+	}
+	if baseURL == nil {
+		return action
+	}
+	if au, err := url.Parse(action); err == nil {
+		if au.IsAbs() {
+			return au.String()
+		}
+		resolved := baseURL.ResolveReference(au)
+		resolved.Fragment = ""
+		return resolved.String()
+	}
+	return action
 }
 
 // RenderOptions define client rendering preferences relevant to OBML generation.
@@ -2792,6 +2849,8 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 		case "form":
 			action := getAttr(c, "action")
 			p.AddForm(action)
+			absAction := resolveFormActionURL(base, action)
+			st.formStack = append(st.formStack, absAction)
 		case "button":
 			typ := strings.ToLower(getAttr(c, "type"))
 			if typ == "" {
@@ -2857,6 +2916,21 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 				p.AddRadio(name, value, checked)
 			case "hidden":
 				p.AddHidden(name, value)
+				if len(st.formStack) > 0 {
+					actionKey := st.formStack[len(st.formStack)-1]
+					actionKey = strings.TrimSpace(actionKey)
+					if actionKey == "" {
+						actionKey = resolveFormActionURL(base, "")
+					}
+					if actionKey != "" {
+						if p.FormHidden[actionKey] == nil {
+							p.FormHidden[actionKey] = make(map[string]string)
+						}
+						if _, exists := p.FormHidden[actionKey][name]; !exists {
+							p.FormHidden[actionKey][name] = value
+						}
+					}
+				}
 			case "button":
 				p.AddButton(name, value)
 			case "reset":
@@ -2939,6 +3013,11 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 		}
 		if recurse && c.FirstChild != nil {
 			walkRich(c.FirstChild, base, p, visited, st, prefs)
+		}
+		if c.Type == html.ElementNode && strings.EqualFold(c.Data, "form") {
+			if len(st.formStack) > 0 {
+				st.formStack = st.formStack[:len(st.formStack)-1]
+			}
 		}
 		if c.Type == html.ElementNode {
 			switch strings.ToLower(c.Data) {
@@ -3531,13 +3610,40 @@ func LoadPageWithHeadersAndOptions(oURL string, hdr http.Header, opts *RenderOpt
 	method := http.MethodGet
 	var bodyReader io.Reader
 	var contentTypeOverride string
+	debugHTTP := os.Getenv("OMS_HTTP_DEBUG") == "1"
 
 	if hdr == nil {
 		hdr = http.Header{}
 	}
 
 	if opts != nil {
+		debugForms := debugHTTP
+		if fb := strings.TrimSpace(opts.FormBody); fb != "" && fb != "0" {
+			if debugForms {
+				if vals, err := url.ParseQuery(fb); err == nil {
+					var parts []string
+					for k, vs := range vals {
+						v := ""
+						if len(vs) > 0 {
+							v = vs[0]
+						}
+						masked := v
+						lk := strings.ToLower(k)
+						if strings.Contains(lk, "pass") || strings.Contains(lk, "pwd") || strings.Contains(lk, "token") {
+							masked = "***"
+						}
+						parts = append(parts, fmt.Sprintf("%s(len=%d)=%s", k, len(v), masked))
+					}
+					log.Printf("FORM payload keys: %s", strings.Join(parts, ", "))
+				} else {
+					log.Printf("FORM payload raw len=%d", len(fb))
+				}
+			}
+		}
 		if submission := prepareOperaMiniSubmission(oURL, opts.FormBody); submission != nil {
+			if debugForms {
+				log.Printf("SUBMISSION plan method=%s url=%s body_len=%d ct=%s", submission.Method, submission.URL, len(submission.Body), submission.ContentType)
+			}
 			if submission.URL != "" {
 				effectiveURL = submission.URL
 			}
@@ -3577,9 +3683,58 @@ func LoadPageWithHeadersAndOptions(oURL string, hdr http.Header, opts *RenderOpt
 			req.Header.Add(k, v)
 		}
 	}
+	// For POST submissions, ensure Referer/Origin are present to mimic browser behavior
+	if req.Method == http.MethodPost {
+		if req.Header.Get("Referer") == "" {
+			if u, err := url.Parse(effectiveURL); err == nil {
+				ref := *u
+				ref.RawQuery = ""
+				req.Header.Set("Referer", ref.String())
+				if debugHTTP {
+					log.Printf("UPSTREAM add Referer=%s", ref.String())
+				}
+			}
+		}
+		if req.Header.Get("Origin") == "" {
+			if u, err := url.Parse(effectiveURL); err == nil {
+				origin := u.Scheme + "://" + u.Host
+				req.Header.Set("Origin", origin)
+				if debugHTTP {
+					log.Printf("UPSTREAM add Origin=%s", origin)
+				}
+			}
+		}
+	}
 	hc := &http.Client{Timeout: 15 * time.Second}
 	if opts != nil && opts.Jar != nil {
 		hc.Jar = opts.Jar
+	}
+	// Debug logging for upstream request and cookie jar behavior
+	if debugHTTP {
+		var ck string
+		if c := req.Header.Get("Cookie"); c != "" {
+			ck = c
+		}
+		xk := req.Header.Get("X-Operetta-Client-Key")
+		var jarInfo string
+		if hc.Jar != nil {
+			u := req.URL
+			if u != nil {
+				if cookies := hc.Jar.Cookies(u); len(cookies) > 0 {
+					names := make([]string, 0, len(cookies))
+					for _, c := range cookies {
+						names = append(names, c.Name)
+					}
+					jarInfo = "cookies=" + strings.Join(names, ",")
+				} else {
+					jarInfo = "cookies=0"
+				}
+			}
+		} else {
+			jarInfo = "jar=nil"
+		}
+		ct := req.Header.Get("Content-Type")
+		log.Printf("UPSTREAM req url=%s method=%s xkey=%q cookie_hdr_len=%d jar=%s ct=%q body=%t", effectiveURL, req.Method, xk, len(ck), jarInfo, ct, bodyReader != nil)
 	}
 	resp, err := hc.Do(req)
 	if err != nil {
@@ -3605,6 +3760,27 @@ func LoadPageWithHeadersAndOptions(oURL string, hdr http.Header, opts *RenderOpt
 	body, err := io.ReadAll(reader)
 	if err != nil {
 		return errorPage(effectiveURL, "Internal server error"), nil
+	}
+	// Log response status and set-cookies (after potential redirects)
+	if debugHTTP {
+		sc := resp.Header["Set-Cookie"]
+		nsc := 0
+		if sc != nil {
+			nsc = len(sc)
+		}
+		finalURL := effectiveURL
+		if resp.Request != nil && resp.Request.URL != nil {
+			finalURL = resp.Request.URL.String()
+		}
+		log.Printf("UPSTREAM resp status=%d final=%s set-cookie=%d", resp.StatusCode, finalURL, nsc)
+		if nsc > 0 {
+			for i, v := range sc {
+				if i >= 3 {
+					break
+				}
+				log.Printf("UPSTREAM set-cookie[%d]=%s", i, v)
+			}
+		}
 	}
 	if looksLikeOMS(body) {
 		return &Page{Data: body, SetCookies: resp.Header["Set-Cookie"]}, nil
@@ -3884,6 +4060,9 @@ func prepareOperaMiniSubmission(baseURL, payload string) *formSubmission {
 	values := url.Values{}
 	actionOverride := ""
 	method := http.MethodGet
+	seenOPF := false
+	hasSensitive := false
+	// Heuristics: sensitive fields indicate login; absence of opf -> prefer POST
 	parts := strings.Split(payload, "&")
 	for _, part := range parts {
 		if part == "" {
@@ -3910,6 +4089,7 @@ func prepareOperaMiniSubmission(baseURL, payload string) *formSubmission {
 		}
 		switch strings.ToLower(key) {
 		case "opf":
+			seenOPF = true
 			if val == "" || val == "0" || val == "1" {
 				method = http.MethodGet
 			} else {
@@ -3925,6 +4105,10 @@ func prepareOperaMiniSubmission(baseURL, payload string) *formSubmission {
 		if actionOverride == "" && looksLikeActionKey(key) {
 			actionOverride = key
 		}
+		lk := strings.ToLower(key)
+		if strings.Contains(lk, "pass") || strings.Contains(lk, "pwd") || strings.Contains(lk, "token") {
+			hasSensitive = hasSensitive || (val != "")
+		}
 		normalizedKey := key
 		if looksLikeActionKey(key) {
 			if strings.HasPrefix(key, "/") && len(key) > 1 {
@@ -3937,6 +4121,12 @@ func prepareOperaMiniSubmission(baseURL, payload string) *formSubmission {
 			continue
 		}
 		values.Add(normalizedKey, val)
+	}
+	if method == http.MethodGet && !seenOPF && hasSensitive {
+		if os.Getenv("OMS_HTTP_DEBUG") == "1" {
+			log.Printf("SUBMISSION heuristic: forcing POST (has sensitive fields, no opf)")
+		}
+		method = http.MethodPost
 	}
 	base, err := url.Parse(baseURL)
 	if err != nil {

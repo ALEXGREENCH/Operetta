@@ -35,11 +35,13 @@ type Page struct {
 	partCnt       int
 	clientVersion ClientVersion
 	compression   CompressionMethod
+	// FormHidden records hidden input fields discovered on the page keyed by form action URL.
+	FormHidden map[string]map[string]string
 }
 
 // NewPage allocates an empty page.
 func NewPage() *Page {
-	p := &Page{}
+	p := &Page{FormHidden: make(map[string]map[string]string)}
 	p.SetTransport(ClientVersion2, CompressionDeflate)
 	return p
 }
@@ -434,11 +436,11 @@ func (p *Page) finalize() {
 	binary.LittleEndian.PutUint16(header[:2], headerWord)
 	binary.BigEndian.PutUint32(header[2:], uint32(size))
 	p.Data = append(header, payload...)
-    // Preserve pre-set packed full-page if caller prepared it earlier.
-    // Otherwise, default to caching the finalized data.
-    if len(p.CachePacked) == 0 {
-        p.CachePacked = append([]byte(nil), p.Data...)
-    }
+	// Preserve pre-set packed full-page if caller prepared it earlier.
+	// Otherwise, default to caching the finalized data.
+	if len(p.CachePacked) == 0 {
+		p.CachePacked = append([]byte(nil), p.Data...)
+	}
 }
 
 // Normalize ensures the final OMS payload strictly follows conservative

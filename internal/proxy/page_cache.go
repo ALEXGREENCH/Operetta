@@ -1,12 +1,12 @@
 package proxy
 
 import (
-    "net/http"
-    "strconv"
-    "sync"
-    "time"
+	"net/http"
+	"strconv"
+	"sync"
+	"time"
 
-    "operetta/oms"
+	"operetta/oms"
 )
 
 type cacheEntry struct {
@@ -78,14 +78,14 @@ func (c *pageCache) Select(target string, opt *oms.RenderOptions) ([]byte, []str
 	if !ok {
 		return nil, nil, 0, 0, false
 	}
-    var raw []byte
-    var cur, cnt int
-    var err error
-    if opt.ServerBase != "" {
-        raw, cur, cnt, err = oms.SelectOMSPartFromPackedWithNav(entry.data, opt.Page, opt.MaxTagsPerPage, opt.ServerBase, target, opt)
-    } else {
-        raw, cur, cnt, err = oms.SelectOMSPartFromPacked(entry.data, opt.Page, opt.MaxTagsPerPage)
-    }
+	var raw []byte
+	var cur, cnt int
+	var err error
+	if opt.ServerBase != "" {
+		raw, cur, cnt, err = oms.SelectOMSPartFromPackedWithNav(entry.data, opt.Page, opt.MaxTagsPerPage, opt.ServerBase, target, opt)
+	} else {
+		raw, cur, cnt, err = oms.SelectOMSPartFromPacked(entry.data, opt.Page, opt.MaxTagsPerPage)
+	}
 	if err != nil {
 		return nil, nil, 0, 0, false
 	}

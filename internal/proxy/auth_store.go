@@ -77,7 +77,7 @@ func clientAuthKeyFromRequest(r *http.Request) string {
     if c, err := r.Cookie(authCookieName); err == nil && c != nil && strings.TrimSpace(c.Value) != "" {
         return c.Value
     }
-    return deriveClientKey(r)
+    return DeriveClientKey(r)
 }
 
 func generateAuthTokens() authTokens {
@@ -89,3 +89,33 @@ func generateAuthTokens() authTokens {
     return authTokens{Code: code, Prefix: prefix}
 }
 
+func (s *authStore) ensureByCode(prefix, code string) (authTokens, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if strings.Contains(prefix, ".") && code == "" {
+		parts := strings.SplitN(prefix, ".", 2)
+		prefix = parts[0]
+		if len(parts) > 1 {
+			code = parts[1]
+		}
+	}
+
+	for key, tok := range s.sessions {
+		if tok.Prefix == prefix && tok.Code == code {
+			tok.ExpiresAt = s.clock().Add(s.ttl)
+			s.sessions[key] = tok
+			return tok, true
+		}
+	}
+
+	tok := authTokens{Prefix: prefix, Code: code, ExpiresAt: s.clock().Add(s.ttl)}
+	return tok, false
+}
+
+func (s *authStore) updateToken(key string, tok authTokens) {
+    s.mu.Lock()
+    defer s.mu.Unlock()
+    tok.ExpiresAt = s.clock().Add(s.ttl)
+    s.sessions[key] = tok
+}
