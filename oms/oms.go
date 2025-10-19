@@ -3958,7 +3958,12 @@ func LoadPageWithHeadersAndOptions(oURL string, hdr http.Header, opts *RenderOpt
 		nav := NewPage()
 		nav.AddHr("")
 		if pageIdx > 1 {
-			prevURL := serverBase + "/fetch?" + BuildPaginationQuery(effectiveURL, &rp, pageIdx-1, maxTags)
+			var prevURL string
+			if pageIdx-1 <= 1 {
+				prevURL = effectiveURL
+			} else {
+				prevURL = serverBase + "/fetch?" + BuildPaginationQuery(effectiveURL, &rp, pageIdx-1, maxTags)
+			}
 			nav.AddLink("0/"+prevURL, "[<<]")
 		} else {
 			nav.AddText("[<<]")
@@ -4003,7 +4008,10 @@ func LoadPageWithHeadersAndOptions(oURL string, hdr http.Header, opts *RenderOpt
 			if n == pageIdx {
 				nav.AddText("•" + label)
 			} else {
-				pageURL := serverBase + "/fetch?" + BuildPaginationQuery(effectiveURL, &rp, n, maxTags)
+				pageURL := effectiveURL
+				if n > 1 {
+					pageURL = serverBase + "/fetch?" + BuildPaginationQuery(effectiveURL, &rp, n, maxTags)
+				}
 				nav.AddLink("0/"+pageURL, label)
 			}
 			lastShown = n

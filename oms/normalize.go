@@ -299,8 +299,13 @@ func SelectOMSPartFromPackedWithNav(data []byte, page, maxTags int, serverBase, 
 		nav.AddHr("")
 		// Prev block
 		if cur > 1 {
-			prevURL := serverBase + "/fetch?" + BuildPaginationQuery(target, &rp, cur-1, maxTags)
-			firstURL := serverBase + "/fetch?" + BuildPaginationQuery(target, &rp, 1, maxTags)
+			firstURL := target
+			var prevURL string
+			if cur-1 <= 1 {
+				prevURL = target
+			} else {
+				prevURL = serverBase + "/fetch?" + BuildPaginationQuery(target, &rp, cur-1, maxTags)
+			}
 			nav.AddLink("0/"+firstURL, "[<<]")
 			nav.AddText(" ")
 			nav.AddLink("0/"+prevURL, "[<]")
