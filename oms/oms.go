@@ -2979,18 +2979,7 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 			p.EndSelect()
 		}
 
-		if stylePushed {
-			st.popStyle(p)
-		}
-		if colorPushed {
-			st.popColor(p)
-		}
-		if alignedPushed {
-			st.popStyle(p)
-		}
-		if bgColorPushed {
-			st.popBgcolor(p)
-		} else if c.Type == html.TextNode {
+		if c.Type == html.TextNode {
 			if !visited[c] {
 				// Skip any stray text nodes under head/style/script/meta/link/noscript
 				skip := false
@@ -3019,6 +3008,18 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 		}
 		if recurse && c.FirstChild != nil {
 			walkRich(c.FirstChild, base, p, visited, st, prefs)
+		}
+		if stylePushed {
+			st.popStyle(p)
+		}
+		if colorPushed {
+			st.popColor(p)
+		}
+		if alignedPushed {
+			st.popStyle(p)
+		}
+		if bgColorPushed {
+			st.popBgcolor(p)
 		}
 		if c.Type == html.ElementNode && strings.EqualFold(c.Data, "form") {
 			if len(st.formStack) > 0 {
