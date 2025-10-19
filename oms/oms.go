@@ -2530,6 +2530,7 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 			}
 			buttonWrap := hasAnyClass(c, "but", "hud", "tut", "ba", "bmx", "ib-search", "butt")
 			blockWrap := hasAnyClass(c, "opis", "str-up", "str-dw")
+			iconOnly := isIconOnlyLink(c)
 			if blockWrap {
 				p.AddPlus()
 			}
@@ -2569,13 +2570,25 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 				p.AddText(" ")
 			}
 			resetComputedStyles(st, p, &colorPushed, &stylePushed, &alignedPushed)
+			shouldBreak := true
 			if buttonWrap || blockWrap {
-				p.AddBreak()
-			} else {
-				if ns := nextSignificantSibling(c); !(ns != nil && ns.Type == html.TextNode &&
-					hasPrefixAny(strings.TrimLeft(ns.Data, " \t\n"), "]", "|", ")")) {
-					p.AddBreak()
+				shouldBreak = true
+			} else if iconOnly {
+				if ns := nextSignificantSibling(c); ns != nil && ns.Type == html.ElementNode &&
+					strings.EqualFold(ns.Data, "a") && isIconOnlyLink(ns) {
+					shouldBreak = false
 				}
+			} else {
+				if ns := nextSignificantSibling(c); ns != nil && ns.Type == html.TextNode &&
+					hasPrefixAny(strings.TrimLeft(ns.Data, " \t\n"), "]", "|", ")") {
+					shouldBreak = false
+				}
+			}
+			if !shouldBreak && iconOnly {
+				p.AddText(" ")
+			}
+			if shouldBreak {
+				p.AddBreak()
 			}
 			recurse = false
 		case "img":
@@ -3142,6 +3155,56 @@ func findFirstImgAlt(n *html.Node) string {
 		return ""
 	}
 	return rec(n)
+}
+
+// isIconOnlyLink reports whether the subtree under n contains at least one image-like
+// element and no visible text content. It is used to keep consecutive toolbar icons inline.
+func isIconOnlyLink(n *html.Node) bool {
+	if n == nil {
+		return false
+	}
+	hasIcon := false
+	var walk func(*html.Node) bool
+	walk = func(node *html.Node) bool {
+		for c := node.FirstChild; c != nil; c = c.NextSibling {
+			switch c.Type {
+			case html.TextNode:
+				text := strings.TrimSpace(c.Data)
+				if text == "" {
+					continue
+				}
+				if c.Parent != nil {
+					parent := strings.ToLower(c.Parent.Data)
+					if parent == "title" || parent == "desc" {
+						if c.Parent.Parent != nil && strings.EqualFold(c.Parent.Parent.Data, "svg") {
+							// Skip accessibility metadata commonly embedded inside <svg>.
+							continue
+						}
+					}
+				}
+				return false
+			case html.ElementNode:
+				tag := strings.ToLower(c.Data)
+				switch tag {
+				case "img", "svg":
+					hasIcon = true
+				case "picture":
+					// picture wraps <img> / <source>; recurse to find the actual image.
+				case "title", "desc":
+					// Skip SVG metadata; descendants already handled in text case.
+					continue
+				}
+				if !walk(c) {
+					return false
+				}
+			}
+		}
+		return true
+	}
+	if !walk(n) {
+		return false
+	}
+	return hasIcon
 }
 
 // findBaseURL scans <head> for <base href> and returns absolute base
