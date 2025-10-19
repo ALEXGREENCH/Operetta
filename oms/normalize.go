@@ -83,7 +83,7 @@ func NormalizeOMS(b []byte) ([]byte, error) {
 		dec = append(dec, 'Q')
 	}
 
-	parsed := parseTagCountFromDec(dec, headerLen)
+	parsed := parseTagCountFromDec(dec, headerLen, version)
 	if parsed < 1 {
 		parsed = 1
 	}
@@ -127,7 +127,7 @@ func NormalizeOMSWithStag(b []byte, stag int) ([]byte, error) {
 	if dec[len(dec)-1] != 'Q' {
 		dec = append(dec, 'Q')
 	}
-	parsed := parseTagCountFromDec(dec, headerLen)
+	parsed := parseTagCountFromDec(dec, headerLen, version)
 	if parsed < 1 {
 		parsed = 1
 	}
@@ -176,7 +176,7 @@ func SelectOMSPartFromPacked(data []byte, page, maxTags int) ([]byte, int, int, 
 		return data, 1, 1, io.ErrUnexpectedEOF
 	}
 	raw := decoded[headerLen:]
-	parts := splitByTags(raw, maxTags)
+	parts := splitByTags(raw, maxTags, version)
 	if len(parts) == 0 {
 		return data, 1, 1, nil
 	}
@@ -252,6 +252,10 @@ func SelectOMSPartFromPackedWithNav(data []byte, page, maxTags int, serverBase, 
 	headerWord := binary.LittleEndian.Uint16(data[:2])
 	version := clientVersionFromHeaderByte(byte(headerWord & 0xFF))
 	compression := compressionFromHeaderByte(byte(headerWord >> 8))
+	styleDataLen := 4
+	if version == ClientVersion3 {
+		styleDataLen = 6
+	}
 	decoded, err := decompressPayload(compression, data[6:])
 	if err != nil {
 		return data, 1, 1, err
@@ -264,7 +268,7 @@ func SelectOMSPartFromPackedWithNav(data []byte, page, maxTags int, serverBase, 
 		return data, 1, 1, io.ErrUnexpectedEOF
 	}
 	raw := decoded[headerLen:]
-	parts := splitByTags(raw, maxTags)
+	parts := splitByTags(raw, maxTags, version)
 	if len(parts) == 0 {
 		return data, 1, 1, nil
 	}
@@ -423,7 +427,7 @@ func SelectOMSPartFromPackedWithNav(data []byte, page, maxTags int, serverBase, 
 	if allowed < 1024 {
 		allowed = 1024
 	}
-	selected = shrinkPartToMaxBytes(selected, allowed)
+	selected = shrinkPartToMaxBytes(selected, allowed, styleDataLen)
 
 	// Insert top nav after initial string and prelude tags ('S','D','k')
 	// Compute splice position
@@ -436,11 +440,11 @@ func SelectOMSPartFromPackedWithNav(data []byte, page, maxTags int, serverBase, 
 			pos++
 			switch tag {
 			case 'S':
-				if pos+4 > len(selected) {
+				if pos+styleDataLen > len(selected) {
 					pos = len(selected)
 					break
 				}
-				pos += 4
+				pos += styleDataLen
 			case 'D':
 				if pos+2 > len(selected) {
 					pos = len(selected)
@@ -484,7 +488,7 @@ Splice:
 }
 
 // parseTagCountFromDec walks the inflated stream (starting with V2 header) and returns number of tags.
-func parseTagCountFromDec(dec []byte, headerLen int) int {
+func parseTagCountFromDec(dec []byte, headerLen int, clientVersion ClientVersion) int {
 	if len(dec) < headerLen {
 		return 0
 	}
@@ -495,6 +499,10 @@ func parseTagCountFromDec(dec []byte, headerLen int) int {
 	}
 	n := 0
 	limit := len(dec)
+	styleDataLen := 4
+	if clientVersion == ClientVersion3 {
+		styleDataLen = 6
+	}
 	for p < limit {
 		tag := dec[p]
 		n++
@@ -510,7 +518,7 @@ func parseTagCountFromDec(dec []byte, headerLen int) int {
 		case 'D', 'R':
 			p += 2
 		case 'S':
-			p += 4
+			p += styleDataLen
 		case 'J':
 			p += 4
 		case 'I':

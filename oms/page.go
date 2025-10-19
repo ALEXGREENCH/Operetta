@@ -98,6 +98,16 @@ func calcColor(color string) uint16 {
 	return uint16(r) | uint16(g)<<5 | uint16(b)<<11
 }
 
+func rgb565ToRGB24(c uint16) uint32 {
+	r5 := (c >> 11) & 0x1F
+	g6 := (c >> 5) & 0x3F
+	b5 := c & 0x1F
+	r8 := (r5 << 3) | (r5 >> 2)
+	g8 := (g6 << 2) | (g6 >> 4)
+	b8 := (b5 << 3) | (b5 >> 2)
+	return uint32(r8)<<16 | uint32(g8)<<8 | uint32(b8)
+}
+
 // Deprecated: do not use directly; use AddStyle(curStyle | (color<<8)) instead.
 func (p *Page) AddTextcolor(color string) {
 	p.AddStyle(uint32(calcColor(color)) << 8)
@@ -106,8 +116,24 @@ func (p *Page) AddTextcolor(color string) {
 // AddStyle appends style information.
 func (p *Page) AddStyle(style uint32) {
 	p.addTag('S')
+	styleByte := byte(style & 0xFF)
+	color565 := uint16((style >> 8) & 0xFFFF)
+	pad := byte((style >> 24) & 0xFF)
+
+	if p.clientVersion == ClientVersion3 {
+		var buf [6]byte
+		buf[0] = styleByte
+		color24 := rgb565ToRGB24(color565)
+		binary.BigEndian.PutUint32(buf[1:5], color24)
+		buf[5] = pad
+		p.addData(buf[:])
+		return
+	}
+
 	var buf [4]byte
-	binary.BigEndian.PutUint32(buf[:], style)
+	buf[0] = styleByte
+	binary.BigEndian.PutUint16(buf[1:3], color565)
+	buf[3] = pad
 	p.addData(buf[:])
 }
 
@@ -301,7 +327,7 @@ func (p *Page) EndSelect() { p.addTag('l') }
 
 // AddButton adds a push button control.
 func (p *Page) AddButton(name, value string) {
-	p.addTag('b')
+	p.addTag('u')
 	p.AddString(name)
 	p.AddString(value)
 }
@@ -344,7 +370,7 @@ func (p *Page) finalize() {
 		p.addTag('Q')
 	}
 	// Derive TagCount by scanning payload to avoid mismatches
-	baseTags, baseStrings := analyzePayloadCounts(p.Data)
+	baseTags, baseStrings := analyzePayloadCounts(p.Data, p.clientVersion)
 	cnt := adjustTagCount(baseTags)
 	// If no override set, bump by +1 to avoid OM2 AIOOBE on some pages
 	if os.Getenv("OMS_TAGCOUNT_MODE") == "" && os.Getenv("OMS_TAGCOUNT_DELTA") == "" {
@@ -481,7 +507,7 @@ func adjustTagCount(base int) int {
 	return base
 }
 
-func analyzePayloadCounts(b []byte) (int, int) {
+func analyzePayloadCounts(b []byte, clientVersion ClientVersion) (int, int) {
 	if len(b) < 2 {
 		return 0, 0
 	}
@@ -492,6 +518,10 @@ func analyzePayloadCounts(b []byte) (int, int) {
 	n := 0
 	strings := 1 // initial URL string
 	limit := len(b)
+	styleDataLen := 4
+	if normalizeClientVersion(clientVersion) == ClientVersion3 {
+		styleDataLen = 6
+	}
 	for p < limit {
 		tag := b[p]
 		n++
@@ -508,7 +538,7 @@ func analyzePayloadCounts(b []byte) (int, int) {
 		case 'D', 'R':
 			p += 2
 		case 'S':
-			p += 4
+			p += styleDataLen
 		case 'J':
 			p += 4
 		case 'I':
@@ -598,12 +628,12 @@ func analyzePayloadCounts(b []byte) (int, int) {
 // computeTagCount scans the payload (p.Data) and counts tags conservatively.
 // It skips the initial OMS_STRING with page URL and then walks tagged payload.
 func computeTagCount(b []byte) int {
-	tags, _ := analyzePayloadCounts(b)
+	tags, _ := analyzePayloadCounts(b, ClientVersion2)
 	return tags
 }
 
 func countStrings(b []byte) int {
-	_, strings := analyzePayloadCounts(b)
+	_, strings := analyzePayloadCounts(b, ClientVersion2)
 	return strings
 }
 

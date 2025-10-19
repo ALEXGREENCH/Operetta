@@ -62,7 +62,7 @@ func TestSelectOMSPartFromPacked(t *testing.T) {
 	}
 	raw := append([]byte(nil), basePage.Data...)
 	maxTags := 3
-	parts := splitByTags(raw, maxTags)
+	parts := splitByTags(raw, maxTags, ClientVersion2)
 	if len(parts) < 2 {
 		t.Fatalf("expected multiple parts, got %d", len(parts))
 	}
@@ -87,7 +87,7 @@ func TestSelectOMSPartFromPacked(t *testing.T) {
 		t.Fatalf("decompress first: %v", err)
 	}
 	rawAfter := decodedFirst[35:]
-	partsAfter := splitByTags(rawAfter, maxTags)
+	partsAfter := splitByTags(rawAfter, maxTags, ClientVersion2)
 	if total != len(partsAfter) {
 		t.Fatalf("unexpected total parts: got %d want %d", total, len(partsAfter))
 	}

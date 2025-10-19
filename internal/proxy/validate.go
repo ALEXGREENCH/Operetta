@@ -5,7 +5,20 @@ import (
 	"compress/flate"
 	"encoding/binary"
 	"io"
+
+	"operetta/oms"
 )
+
+func headerByteToClientVersion(b byte) oms.ClientVersion {
+	switch b {
+	case 0x0d:
+		return oms.ClientVersion1
+	case 0x1a:
+		return oms.ClientVersion3
+	default:
+		return oms.ClientVersion2
+	}
+}
 
 type omsAnalysis struct {
 	Magic      uint16            `json:"magic"`
@@ -32,6 +45,7 @@ func analyzeOMS(b []byte) omsAnalysis {
 	}
 	out.Magic = binary.LittleEndian.Uint16(b[:2])
 	out.Size = binary.BigEndian.Uint32(b[2:6])
+	version := headerByteToClientVersion(byte(out.Magic & 0xFF))
 	fr := flate.NewReader(bytes.NewReader(b[6:]))
 	dec, err := io.ReadAll(fr)
 	fr.Close()
@@ -61,7 +75,7 @@ func analyzeOMS(b []byte) omsAnalysis {
 		out.V2BE["res5"] = uint32(beU16(33))
 		tcSw := binary.LittleEndian.Uint16(dec[18:20])
 		out.TagCountSw = "0x" + hexU16(tcSw)
-		parsed, tags, counts := parseTags(dec)
+		parsed, tags, counts := parseTags(dec, version)
 		out.ParsedTags = parsed
 		maxShow := 64
 		if len(tags) < maxShow {
@@ -92,7 +106,7 @@ func hexU16(v uint16) string {
 	return string([]byte{hexd[v>>12&0xF], hexd[v>>8&0xF], hexd[v>>4&0xF], hexd[v&0xF]})
 }
 
-func parseTags(dec []byte) (int, []byte, map[byte]int) {
+func parseTags(dec []byte, version oms.ClientVersion) (int, []byte, map[byte]int) {
 	if len(dec) < 35 {
 		return 0, nil, map[byte]int{}
 	}
@@ -104,6 +118,10 @@ func parseTags(dec []byte) (int, []byte, map[byte]int) {
 	tags := make([]byte, 0, 256)
 	counts := map[byte]int{}
 	limit := len(dec)
+	styleDataLen := 4
+	if version == oms.ClientVersion3 {
+		styleDataLen = 6
+	}
 	for p < limit {
 		tag := dec[p]
 		tags = append(tags, tag)
@@ -120,7 +138,7 @@ func parseTags(dec []byte) (int, []byte, map[byte]int) {
 		case 'D', 'R':
 			p += 2
 		case 'S':
-			p += 4
+			p += styleDataLen
 		case 'J':
 			p += 4
 		case 'I':

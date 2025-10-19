@@ -116,10 +116,20 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 			tok = s.auth.ensure(clientKey)
 			s.logger.Printf("AuthStore: created new session for %q", clientKey)
 
-			tok.Prefix = params["h"]
-			tok.Code = params["c"]
-			s.auth.updateToken(clientKey, tok)
-			s.logger.Printf("AuthStore: updated token for %q with prefix=%q code=%q", clientKey, tok.Prefix, tok.Code)
+			h := strings.TrimSpace(params["h"])
+			c := strings.TrimSpace(params["c"])
+			if h != "" || c != "" {
+				if h != "" {
+					tok.Prefix = h
+				}
+				if c != "" {
+					tok.Code = c
+				}
+				s.auth.updateToken(clientKey, tok)
+				s.logger.Printf("AuthStore: updated token for %q with prefix=%q code=%q", clientKey, tok.Prefix, tok.Code)
+			} else {
+				s.logger.Printf("AuthStore: kept generated token for %q (no prefix/code provided)", clientKey)
+			}
 		}
 
 		if debugHTTP {
@@ -530,6 +540,9 @@ func (s *Server) renderOptionsFromParams(r *http.Request, params map[string]stri
 			}
 		}
 	}
+	if strings.TrimSpace(params["version"]) == "" && opt.ClientVersion == oms.ClientVersion3 {
+		opt.ClientVersion = oms.ClientVersion2
+	}
 	if wv := strings.TrimSpace(params["w"]); wv != "" {
 		seg := strings.SplitN(wv, ";", 2)
 		if len(seg) >= 1 {
@@ -617,6 +630,9 @@ func (s *Server) renderOptionsFromQuery(r *http.Request, hdr http.Header) *oms.R
 				opt.ClientVersion = oms.ClientVersion2
 			}
 		}
+	}
+	if strings.TrimSpace(q.Get("version")) == "" && opt.ClientVersion == oms.ClientVersion3 {
+		opt.ClientVersion = oms.ClientVersion2
 	}
 	if v := strings.TrimSpace(q.Get("c")); v != "" {
 		opt.AuthCode = v

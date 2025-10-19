@@ -330,7 +330,7 @@ func maxBytesBudget() int {
 
 // shrinkPartToMaxBytes trims a single part (prefix + tagged body) so that its
 // total raw size does not exceed limit. Trimming respects tag boundaries.
-func shrinkPartToMaxBytes(part []byte, limit int) []byte {
+func shrinkPartToMaxBytes(part []byte, limit int, styleDataLen int) []byte {
 	if limit <= 0 || len(part) <= limit || len(part) < 2 {
 		return part
 	}
@@ -364,7 +364,13 @@ func shrinkPartToMaxBytes(part []byte, limit int) []byte {
 			// no payload
 		case 'D', 'R':
 			np += 2
-		case 'S', 'J':
+		case 'S':
+			if np+styleDataLen > limitAll {
+				np = limitAll
+				break
+			}
+			np += styleDataLen
+		case 'J':
 			np += 4
 		case 'I':
 			if np+8 > limitAll {
@@ -467,11 +473,15 @@ func shrinkPartToMaxBytes(part []byte, limit int) []byte {
 	return append([]byte{}, part[:p]...)
 }
 
-func splitByTags(b []byte, maxTags int) [][]byte {
+func splitByTags(b []byte, maxTags int, clientVersion ClientVersion) [][]byte {
 	if maxTags <= 0 || len(b) < 2 {
 		return [][]byte{b}
 	}
 	maxBytes := maxBytesBudget()
+	styleDataLen := 4
+	if clientVersion == ClientVersion3 {
+		styleDataLen = 6
+	}
 	// Prefix is initial page URL string (len + bytes)
 	if len(b) < 2 {
 		return [][]byte{b}
@@ -492,11 +502,11 @@ func splitByTags(b []byte, maxTags int) [][]byte {
 		pp++
 		switch tag {
 		case 'S':
-			if pp+4 > len(b) {
+			if pp+styleDataLen > len(b) {
 				pp = len(b)
 				break
 			}
-			pp += 4
+			pp += styleDataLen
 		case 'D':
 			if pp+2 > len(b) {
 				pp = len(b)
@@ -541,18 +551,25 @@ PreludeDone:
 			pz++
 			switch tag {
 			case 'S':
-				if pz+4 > len(src) {
+				if pz+styleDataLen > len(src) {
 					pz = len(src)
 					break
 				}
-				val := src[pz : pz+4]
-				pz += 4
-				// style color lives in bits 8..23 (uint32 big-endian)
-				sv := binary.BigEndian.Uint32(val)
-				if (sv & 0x00FFFF00) != 0 { // has color component
-					buf := make([]byte, 1+4)
+				data := src[pz : pz+styleDataLen]
+				pz += styleDataLen
+				hasColor := false
+				if styleDataLen == 6 {
+					// 24-bit RGB color encoded in big-endian
+					if binary.BigEndian.Uint32(data[1:5])&0x00FFFFFF != 0 {
+						hasColor = true
+					}
+				} else if binary.BigEndian.Uint16(data[1:3]) != 0 {
+					hasColor = true
+				}
+				if hasColor {
+					buf := make([]byte, 1+styleDataLen)
 					buf[0] = 'S'
-					copy(buf[1:], val)
+					copy(buf[1:], data)
 					sColor = buf
 				}
 			case 'D':
@@ -615,7 +632,17 @@ PreludeDone:
 			// no payload
 		case 'D', 'R':
 			p += 2
-		case 'S', 'J':
+		case 'S':
+			if p+styleDataLen > limit {
+				p = limit
+				break
+			}
+			p += styleDataLen
+		case 'J':
+			if p+4 > limit {
+				p = limit
+				break
+			}
 			p += 4
 		case 'I':
 			if p+8 > limit {
@@ -3999,7 +4026,7 @@ func LoadPageWithHeadersAndOptions(oURL string, hdr http.Header, opts *RenderOpt
 		packed.finalize()
 		p.CachePacked = append([]byte(nil), packed.Data...)
 	}
-	parts := splitByTags(p.Data, maxTags)
+	parts := splitByTags(p.Data, maxTags, rp.ClientVersion)
 	if len(parts) == 0 {
 		p.finalize()
 		return p, nil
@@ -4008,6 +4035,10 @@ func LoadPageWithHeadersAndOptions(oURL string, hdr http.Header, opts *RenderOpt
 		pageIdx = len(parts)
 	}
 	sel := parts[pageIdx-1]
+	styleDataLen := 4
+	if rp.ClientVersion == ClientVersion3 {
+		styleDataLen = 6
+	}
 	// Rewrite only for pages >1 so OM2 history treats them as distinct.
 	// Do NOT rewrite page 1 to avoid style regressions on return.
 	if pageIdx > 1 {
@@ -4113,7 +4144,7 @@ func LoadPageWithHeadersAndOptions(oURL string, hdr http.Header, opts *RenderOpt
 		if allowed < 1024 { // keep a sane minimal room for content
 			allowed = 1024
 		}
-		sel = shrinkPartToMaxBytes(sel, allowed)
+		sel = shrinkPartToMaxBytes(sel, allowed, styleDataLen)
 		sel = append(sel, nav.Data...)
 	}
 	p.Data = sel
