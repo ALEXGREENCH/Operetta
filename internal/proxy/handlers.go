@@ -5,12 +5,14 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"mime"
 	"net/http"
 	"net/url"
 	"os"
 	"path"
 	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -159,34 +161,44 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 		}
 		if raw := params["u"]; raw != "" {
 			target := normalizeObmlURL(raw)
+			effectiveTarget := target
 			jarKey := s.clientJarKey(r, params)
 			hdr := s.headersFromParams(r, params)
 			if form := strings.TrimSpace(params["j"]); form != "" {
-				if augmented, changed := s.forms.Augment(jarKey, target, form); changed {
-					params["j"] = augmented
-					if debugHTTP {
-						s.logger.Printf("Form augment: applied stored hidden fields for %q", target)
+				logOperaMiniForm(s.logger, "Inbound", form)
+				if derived := deriveOperaMiniFormTarget(target, form); derived != "" {
+					if derived != effectiveTarget {
+						s.logger.Printf("Form target override: %q -> %q", effectiveTarget, derived)
 					}
-				} else if s.prefetchFormHidden(r, params, target, hdr, jarKey, debugHTTP) {
-					if augmented, changed := s.forms.Augment(jarKey, target, form); changed {
+					effectiveTarget = derived
+				}
+				if augmented, changed := s.forms.Augment(jarKey, effectiveTarget, form); changed {
+					params["j"] = augmented
+					logOperaMiniForm(s.logger, "Augmented", augmented)
+					if debugHTTP {
+						s.logger.Printf("Form augment: applied stored hidden fields for %q", effectiveTarget)
+					}
+				} else if s.prefetchFormHidden(r, params, effectiveTarget, hdr, jarKey, debugHTTP) {
+					if augmented, changed := s.forms.Augment(jarKey, effectiveTarget, form); changed {
 						params["j"] = augmented
+						logOperaMiniForm(s.logger, "Augmented", augmented)
 						if debugHTTP {
-							s.logger.Printf("Form augment: applied prefetched hidden fields for %q", target)
+							s.logger.Printf("Form augment: applied prefetched hidden fields for %q", effectiveTarget)
 						}
 					}
 				}
 			}
 			opt := s.renderOptionsFromParams(r, params, hdr, jarKey)
 			if debugHTTP {
-				s.logger.Printf("FETCH target(raw=%q norm=%q) jarKey=%q formLen=%d hdrCookieLen=%d",
-					raw, target, jarKey, len(opt.FormBody), len(hdr.Get("Cookie")))
+				s.logger.Printf("FETCH target(raw=%q norm=%q effective=%q) jarKey=%q formLen=%d hdrCookieLen=%d",
+					raw, target, effectiveTarget, jarKey, len(opt.FormBody), len(hdr.Get("Cookie")))
 			}
-			if s.isInternalAboutRequest(raw, target) {
+			if s.isInternalAboutRequest(raw, effectiveTarget) {
 				page := s.renderAboutPage(params)
 				s.writeOMS(w, page.Data, page.SetCookies)
 				return
 			}
-			if s.shouldServeLocalBookmarks() && looksLikeBookmarksPortal(target) {
+			if s.shouldServeLocalBookmarks() && looksLikeBookmarksPortal(effectiveTarget) {
 				if page := s.renderLocalBookmarks(params["c"], params["h"], opt); page != nil {
 					page.Normalize()
 					if !hadCookie {
@@ -201,11 +213,11 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			s.renderPrefs.Remember(s.renderPrefKeyWithOptions(r, params["u"], opt), opt)
-			cacheHit := s.serveFromCache(w, target, opt)
+			cacheHit := s.serveFromCache(w, effectiveTarget, opt)
 			if cacheHit {
 				return
 			}
-			page, err := s.loadPage(target, hdr, opt)
+			page, err := s.loadPage(effectiveTarget, hdr, opt)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusBadGateway)
 				return
@@ -721,6 +733,115 @@ func (s *Server) prefetchFormHidden(r *http.Request, params map[string]string, t
 		s.logger.Printf("Form prefetch: cached %d hidden fields for %q", len(page.FormHidden), target)
 	}
 	return true
+}
+
+func deriveOperaMiniFormTarget(baseTarget, formBody string) string {
+	baseTarget = strings.TrimSpace(baseTarget)
+	formBody = strings.TrimSpace(formBody)
+	if formBody == "" || formBody == "0" {
+		return ""
+	}
+	parts := strings.Split(formBody, "&")
+	actionOverride := ""
+	for _, part := range parts {
+		if part == "" {
+			continue
+		}
+		kv := strings.SplitN(part, "=", 2)
+		rawKey := kv[0]
+		rawVal := ""
+		if len(kv) == 2 {
+			rawVal = kv[1]
+		}
+		key, err := url.QueryUnescape(rawKey)
+		if err != nil {
+			key = rawKey
+		}
+		val, err := url.QueryUnescape(rawVal)
+		if err != nil {
+			val = rawVal
+		}
+		key = strings.TrimSpace(key)
+		val = strings.TrimSpace(val)
+		if key == "" {
+			continue
+		}
+		switch strings.ToLower(key) {
+		case "opf":
+			continue
+		case "opa", "action":
+			if val != "" {
+				actionOverride = val
+			}
+			continue
+		}
+		if actionOverride == "" && isOperaMiniActionKey(key) {
+			actionOverride = key
+		}
+	}
+	if actionOverride == "" {
+		return ""
+	}
+	var baseURL *url.URL
+	if baseTarget != "" {
+		if bu, err := url.Parse(baseTarget); err == nil {
+			baseURL = bu
+		}
+	}
+	override := actionOverride
+	if strings.HasPrefix(override, "//") && baseURL != nil && baseURL.Scheme != "" {
+		override = baseURL.Scheme + ":" + override
+	}
+	if parsed, err := url.Parse(override); err == nil {
+		if baseURL != nil && !parsed.IsAbs() {
+			parsed = baseURL.ResolveReference(parsed)
+		}
+		parsed.Fragment = ""
+		return parsed.String()
+	}
+	return override
+}
+
+func isOperaMiniActionKey(key string) bool {
+	if key == "" {
+		return false
+	}
+	if strings.HasPrefix(key, "http://") || strings.HasPrefix(key, "https://") {
+		return true
+	}
+	if strings.HasPrefix(key, "//") {
+		return true
+	}
+	return strings.HasPrefix(key, "/")
+}
+
+func logOperaMiniForm(logger *log.Logger, prefix, body string) {
+	if logger == nil {
+		return
+	}
+	body = strings.TrimSpace(body)
+	if body == "" || body == "0" {
+		return
+	}
+	if vals, err := url.ParseQuery(body); err == nil {
+		items := make([]string, 0, len(vals))
+		for k, vs := range vals {
+			val := ""
+			if len(vs) > 0 {
+				val = vs[0]
+			}
+			display := val
+			lk := strings.ToLower(k)
+			if strings.Contains(lk, "pass") || strings.Contains(lk, "pwd") || strings.Contains(lk, "token") {
+				display = "***"
+			}
+			items = append(items, fmt.Sprintf("%s(len=%d)=%s", k, len(val), display))
+		}
+		sort.Strings(items)
+		logger.Printf("%s form: %s", prefix, strings.Join(items, ", "))
+		return
+	}
+	logger.Printf("%s form raw len=%d", prefix, len(body))
 }
 
 func serverBase(r *http.Request) string {

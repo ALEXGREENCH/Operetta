@@ -13,6 +13,7 @@ import (
 	"image/png"
 	"io"
 	"mime"
+	"net"
 	"net/http"
 	"net/url"
 	"path"
@@ -4215,29 +4216,27 @@ func prepareOperaMiniSubmission(baseURL, payload string) *formSubmission {
 			}
 			continue
 		}
-		if actionOverride == "" && looksLikeActionKey(key) {
+		isActionKey := looksLikeActionKey(key)
+		if actionOverride == "" && isActionKey {
 			actionOverride = key
 		}
 		lk := strings.ToLower(key)
 		if strings.Contains(lk, "pass") || strings.Contains(lk, "pwd") || strings.Contains(lk, "token") {
 			hasSensitive = hasSensitive || (val != "")
 		}
-		normalizedKey := key
-		if looksLikeActionKey(key) {
-			if strings.HasPrefix(key, "/") && len(key) > 1 {
-				normalizedKey = strings.TrimLeft(key, "/")
-			} else if strings.Contains(key, "://") {
-				normalizedKey = ""
-			}
-		}
-		if normalizedKey == "" {
+		if isActionKey {
 			continue
 		}
+		normalizedKey := key
 		values.Add(normalizedKey, val)
 	}
-	if method == http.MethodGet && !seenOPF && hasSensitive {
+	if method == http.MethodGet && hasSensitive {
 		if os.Getenv("OMS_HTTP_DEBUG") == "1" {
-			log.Printf("SUBMISSION heuristic: forcing POST (has sensitive fields, no opf)")
+			if seenOPF {
+				log.Printf("SUBMISSION heuristic: overriding OPF to POST (has sensitive fields)")
+			} else {
+				log.Printf("SUBMISSION heuristic: forcing POST (has sensitive fields, no opf)")
+			}
 		}
 		method = http.MethodPost
 	}
@@ -4275,6 +4274,9 @@ func prepareOperaMiniSubmission(baseURL, payload string) *formSubmission {
 			}
 			return &formSubmission{Method: http.MethodGet, URL: targetURL}
 		}
+		if hasSensitive && strings.HasPrefix(strings.ToLower(strings.TrimSpace(targetURL)), "http://") {
+			targetURL = upgradeURLStringToHTTPS(targetURL)
+		}
 		return &formSubmission{
 			Method:      http.MethodPost,
 			URL:         targetURL,
@@ -4292,12 +4294,66 @@ func prepareOperaMiniSubmission(baseURL, payload string) *formSubmission {
 		target.RawQuery = q.Encode()
 		return &formSubmission{Method: http.MethodGet, URL: target.String()}
 	}
+	if hasSensitive && method == http.MethodPost {
+		target = upgradeURLToHTTPS(target)
+	}
+	finalURL := target.String()
+	if hasSensitive && method == http.MethodPost {
+		finalURL = upgradeURLStringToHTTPS(finalURL)
+	}
 	return &formSubmission{
 		Method:      http.MethodPost,
-		URL:         target.String(),
+		URL:         finalURL,
 		Body:        values.Encode(),
 		ContentType: "application/x-www-form-urlencoded",
 	}
+}
+
+func upgradeURLToHTTPS(u *url.URL) *url.URL {
+	if u == nil {
+		return nil
+	}
+	if !strings.EqualFold(strings.TrimSpace(u.Scheme), "http") {
+		return u
+	}
+	clone := *u
+	clone.Scheme = "https"
+	clone.Host = stripDefaultPort(clone.Host, "80")
+	return &clone
+}
+
+func upgradeURLStringToHTTPS(raw string) string {
+	if raw == "" {
+		return raw
+	}
+	lower := strings.ToLower(strings.TrimSpace(raw))
+	if !strings.HasPrefix(lower, "http://") {
+		return raw
+	}
+	if u, err := url.Parse(raw); err == nil {
+		upgraded := upgradeURLToHTTPS(u)
+		if upgraded != nil {
+			return upgraded.String()
+		}
+	}
+	return "https://" + strings.TrimPrefix(raw, "http://")
+}
+
+func stripDefaultPort(hostPort, defaultPort string) string {
+	if hostPort == "" || defaultPort == "" {
+		return hostPort
+	}
+	if h, p, err := net.SplitHostPort(hostPort); err == nil {
+		if p == defaultPort {
+			return h
+		}
+		return hostPort
+	}
+	suffix := ":" + defaultPort
+	if strings.HasSuffix(hostPort, suffix) && !strings.Contains(hostPort, "]") {
+		return strings.TrimSuffix(hostPort, suffix)
+	}
+	return hostPort
 }
 
 func looksLikeActionKey(key string) bool {
