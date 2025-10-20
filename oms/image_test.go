@@ -71,3 +71,49 @@ func TestEncodeImageRespectsScreenWidth(t *testing.T) {
 		t.Fatalf("height mismatch: got %d want %d", h, expectedH)
 	}
 }
+
+func TestEncodeImageHighQualityRetainsRequestedQuality(t *testing.T) {
+	src := image.NewRGBA(image.Rect(0, 0, 200, 150))
+	for y := 0; y < 150; y++ {
+		for x := 0; x < 200; x++ {
+			src.Set(x, y, color.RGBA{uint8((x + y) % 256), uint8((x * 2) % 256), 0x55, 0xFF})
+		}
+	}
+
+	opts := defaultRenderPrefs()
+	opts.HighQuality = true
+	opts.ImageMIME = "image/jpeg"
+	_, _, _, _, quality, err := encodeImage(src, opts)
+	if err != nil {
+		t.Fatalf("encodeImage returned error: %v", err)
+	}
+	want := jpegQualityFor(opts)
+	if quality != want {
+		t.Fatalf("expected quality=%d in high quality mode, got %d", want, quality)
+	}
+}
+
+func TestEncodeImageGifHonorsMime(t *testing.T) {
+	src := image.NewRGBA(image.Rect(0, 0, 64, 64))
+	for y := 0; y < 64; y++ {
+		for x := 0; x < 64; x++ {
+			src.Set(x, y, color.RGBA{uint8((x * 5) % 256), uint8((y * 3) % 256), uint8((x + y) % 256), 0xFF})
+		}
+	}
+
+	opts := defaultRenderPrefs()
+	opts.ImageMIME = "image/gif"
+	data, w, h, mime, _, err := encodeImage(src, opts)
+	if err != nil {
+		t.Fatalf("encodeImage returned error: %v", err)
+	}
+	if len(data) == 0 {
+		t.Fatal("encodeImage returned empty payload for gif")
+	}
+	if mime != "image/gif" {
+		t.Fatalf("expected image/gif mime, got %s", mime)
+	}
+	if w != 64 || h != 64 {
+		t.Fatalf("unexpected dimensions: %dx%d", w, h)
+	}
+}

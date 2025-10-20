@@ -8,7 +8,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"image"
-	_ "image/gif"
+	"image/gif"
 	"image/jpeg"
 	"image/png"
 	"io"
@@ -1429,7 +1429,7 @@ func isLegacyOperaMiniUA(ua string) bool {
 func defaultRenderPrefs() RenderOptions {
 	// Default pagination disabled; can be overridden via env in loader
 	return RenderOptions{
-		ImagesOn:      false,
+		ImagesOn:      true,
 		HighQuality:   false,
 		ImageMIME:     "image/jpeg",
 		MaxInlineKB:   96,
@@ -3520,24 +3520,17 @@ func cacheCandidatesFor(prefs RenderOptions) []cacheCandidate {
 	if want == "" {
 		want = "image/jpeg"
 	}
-	var out []cacheCandidate
-	seen := make(map[string]struct{})
-	add := func(format string, quality int) {
-		key := format + "|" + strconv.Itoa(quality)
-		if _, ok := seen[key]; ok {
-			return
-		}
-		seen[key] = struct{}{}
-		out = append(out, cacheCandidate{format: format, quality: quality})
-	}
 	switch want {
 	case "image/png":
-		add("image/png", 0)
+		return []cacheCandidate{{format: "image/png", quality: 0}}
+	case "image/gif":
+		return []cacheCandidate{{format: "image/gif", quality: 0}}
 	default:
-		add("image/jpeg", jpegQualityFor(prefs))
-		add("image/png", 0)
+		return []cacheCandidate{
+			{format: "image/jpeg", quality: jpegQualityFor(prefs)},
+			{format: "image/png", quality: 0},
+		}
 	}
-	return out
 }
 
 func jpegQualityFor(prefs RenderOptions) int {
@@ -3711,17 +3704,24 @@ func encodeImage(img image.Image, prefs RenderOptions) ([]byte, int, int, string
 		if err := enc.Encode(&out, img); err != nil {
 			return nil, 0, 0, want, quality, err
 		}
-	default:
-		quality = jpegQualityFor(prefs)
-		if quality <= 0 {
-			quality = 60
+		return append([]byte(nil), out.Bytes()...), w, h, want, quality, nil
+	case "image/gif":
+		options := &gif.Options{NumColors: 128}
+		if prefs.HighQuality {
+			options.NumColors = 256
 		}
+		if err := gif.Encode(&out, img, options); err != nil {
+			return nil, 0, 0, want, quality, err
+		}
+		return append([]byte(nil), out.Bytes()...), w, h, want, quality, nil
+	default:
+		want = "image/jpeg"
+		quality = jpegQualityFor(prefs)
 		if err := jpeg.Encode(&out, img, &jpeg.Options{Quality: quality}); err != nil {
 			return nil, 0, 0, want, quality, err
 		}
+		return append([]byte(nil), out.Bytes()...), w, h, want, quality, nil
 	}
-
-	return append([]byte(nil), out.Bytes()...), w, h, want, quality, nil
 }
 
 // imageHasAlpha returns true if any sampled pixel has alpha != 0xff.
@@ -4114,7 +4114,11 @@ func LoadPageWithHeadersAndOptions(oURL string, hdr http.Header, opts *RenderOpt
 			}
 		}
 		if maxTags == 0 {
-			maxTags = 1200
+			if rp.ClientVersion == ClientVersion1 {
+				maxTags = 2400
+			} else {
+				maxTags = 1600
+			}
 		}
 	}
 	if pageIdx < 1 {

@@ -463,7 +463,11 @@ func (s *Server) headersFromParams(r *http.Request, params map[string]string) ht
 	}
 	// Pass stable client key downstream so oms can pick the right jar
 	hdr.Set("X-Operetta-Client-Key", s.clientJarKey(r, params))
-	hdr.Set("Accept", "text/html,application/xhtml+xml,*/*;q=0.8")
+	if acc := r.Header.Get("Accept"); acc != "" {
+		hdr.Set("Accept", acc)
+	} else {
+		hdr.Set("Accept", "text/html,application/xhtml+xml,*/*;q=0.8")
+	}
 	return hdr
 }
 
@@ -484,6 +488,9 @@ func (s *Server) headersFromQuery(r *http.Request) http.Header {
 		"c": strings.TrimSpace(r.URL.Query().Get("c")),
 	}
 	hdr.Set("X-Operetta-Client-Key", s.clientJarKey(r, params))
+	if acc := r.Header.Get("Accept"); acc != "" {
+		hdr.Set("Accept", acc)
+	}
 	return hdr
 }
 
@@ -571,6 +578,7 @@ func (s *Server) renderOptionsFromParams(r *http.Request, params map[string]stri
 	}
 	opt.Jar = s.cookieJars.Get(jarKey)
 	opt.WantFullCache = true
+	applyAcceptImagePreference(opt, hdr)
 	return opt
 }
 
@@ -660,12 +668,34 @@ func (s *Server) renderOptionsFromQuery(r *http.Request, hdr http.Header) *oms.R
 	opt.WantFullCache = true
 	key := s.renderPrefKeyWithOptions(r, q.Get("url"), opt)
 	s.renderPrefs.Apply(key, opt, q)
+	applyAcceptImagePreference(opt, hdr)
 	return opt
+}
+
+func applyAcceptImagePreference(opt *oms.RenderOptions, hdr http.Header) {
+	if opt == nil || hdr == nil {
+		return
+	}
+	if opt.ClientVersion != oms.ClientVersion1 {
+		return
+	}
+	accept := strings.ToLower(strings.TrimSpace(hdr.Get("Accept")))
+	if accept == "" {
+		return
+	}
+	current := strings.ToLower(strings.TrimSpace(opt.ImageMIME))
+	if strings.Contains(accept, "image/gif") {
+		opt.ImageMIME = "image/gif"
+		return
+	}
+	if current == "" {
+		opt.ImageMIME = "image/jpeg"
+	}
 }
 
 func defaultRenderOptions() *oms.RenderOptions {
 	return &oms.RenderOptions{
-		ImagesOn:      false,
+		ImagesOn:      true,
 		HighQuality:   false,
 		ImageMIME:     "image/jpeg",
 		MaxInlineKB:   96,
