@@ -49,123 +49,6 @@ const DefaultUpstreamUA = defaultUpstreamUA
 const defaultPaginationBytes = 32000
 const maxInlineBackgroundSize = 128
 
-// ---------------------- Minimal CSS support ----------------------
-
-// isWhiteHex returns true if the color equals #ffffff (case-insensitive).
-func isWhiteHex(hex string) bool {
-	return strings.EqualFold(strings.TrimSpace(hex), "#ffffff")
-}
-
-func hexBrightness(hex string) int {
-	hex = strings.TrimPrefix(strings.TrimSpace(hex), "#")
-	if len(hex) != 6 {
-		return 255
-	}
-	r, _ := strconv.ParseInt(hex[0:2], 16, 64)
-	g, _ := strconv.ParseInt(hex[2:4], 16, 64)
-	b, _ := strconv.ParseInt(hex[4:6], 16, 64)
-	return int(0.299*float64(r) + 0.587*float64(g) + 0.114*float64(b))
-}
-
-func isDarkHex(hex string) bool { return hexBrightness(hex) < 60 }
-
-func relLuma(hex string) float64 {
-	hex = strings.TrimPrefix(strings.TrimSpace(hex), "#")
-	if len(hex) != 6 {
-		return 1.0
-	}
-	toLin := func(c int64) float64 {
-		v := float64(c) / 255.0
-		if v <= 0.03928 {
-			return v / 12.92
-		}
-		return math.Pow((v+0.055)/1.055, 2.4)
-	}
-	r, _ := strconv.ParseInt(hex[0:2], 16, 64)
-	g, _ := strconv.ParseInt(hex[2:4], 16, 64)
-	b, _ := strconv.ParseInt(hex[4:6], 16, 64)
-	return 0.2126*toLin(r) + 0.7152*toLin(g) + 0.0722*toLin(b)
-}
-
-func contrastRatio(a, b string) float64 {
-	la := relLuma(a)
-	lb := relLuma(b)
-	if la < lb {
-		la, lb = lb, la
-	}
-	return (la + 0.05) / (lb + 0.05)
-}
-
-func lightenHex(hex string, percent int) string {
-	hex = strings.TrimPrefix(strings.TrimSpace(hex), "#")
-	if len(hex) != 6 {
-		return "#" + hex
-	}
-	r, _ := strconv.ParseInt(hex[0:2], 16, 64)
-	g, _ := strconv.ParseInt(hex[2:4], 16, 64)
-	b, _ := strconv.ParseInt(hex[4:6], 16, 64)
-	lighten := func(c int64) int64 {
-		c = c + (255-c)*int64(percent)/100
-		if c > 255 {
-			c = 255
-		}
-		return c
-	}
-	r = lighten(r)
-	g = lighten(g)
-	b = lighten(b)
-	return fmt.Sprintf("#%02x%02x%02x", r, g, b)
-}
-
-func ensureMinForRGB565(hex string) string {
-	hex = strings.TrimPrefix(strings.TrimSpace(hex), "#")
-	if len(hex) != 6 {
-		return "#" + hex
-	}
-	r, _ := strconv.ParseInt(hex[0:2], 16, 64)
-	g, _ := strconv.ParseInt(hex[2:4], 16, 64)
-	b, _ := strconv.ParseInt(hex[4:6], 16, 64)
-
-	const minR = 16
-	const minG = 16
-	const minB = 16
-
-	if r < minR {
-		r = minR
-	}
-	if g < minG {
-		g = minG
-	}
-	if b < minB {
-		b = minB
-	}
-
-	return fmt.Sprintf("#%02x%02x%02x", r, g, b)
-}
-
-func normalizeBgForBlackText(bg string) string {
-	bgHex := cssToHex(bg)
-	if bgHex == "" {
-		return ""
-	}
-	const targetCR = 4.5
-	const step = 12
-	const maxLoops = 8
-
-	if contrastRatio(bgHex, "#000000") >= targetCR {
-		return bgHex
-	}
-	cur := bgHex
-	for i := 0; i < maxLoops; i++ {
-		cur = lightenHex(cur, step)
-		if contrastRatio(cur, "#000000") >= targetCR {
-			break
-		}
-	}
-	cur = ensureMinForRGB565(cur)
-	return cur
-}
-
 func effectiveTextColor(n *html.Node, st *walkState) string {
 	a := n.Parent
 	for a != nil && a.Type != html.ElementNode {
@@ -211,101 +94,26 @@ func addTextWithColor(p *Page, st *walkState, n *html.Node, text string) {
 		return
 	}
 
-	want := findTextColorFor(n, st)
-	if want != "" && want != st.curColor {
-		prev := st.curColor
-		// Устанавливаем цвет без потери жирного/курсива:
-		p.AddStyle(st.curStyle | (uint32(calcColor(want)) << 8))
+	target := cssToHex(findTextColorFor(n, st))
+	current := cssToHex(st.curColor)
+	if current == "" {
+		current = defaultTextColorHex
+	}
+	if target == "" || target == current {
 		p.AddText(text)
-		// Восстановить предыдущий цвет (или чёрный как дефолт):
-		restore := prev
-		if restore == "" {
-			restore = "#000000"
-		}
-		p.AddStyle(st.curStyle | (uint32(calcColor(restore)) << 8))
 		return
 	}
+	style := st.curStyle
+	if len(st.styleStack) > 0 {
+		style = st.styleStack[len(st.styleStack)-1]
+	}
+	p.AddStyle(style | (uint32(calcColor(target)) << 8))
 	p.AddText(text)
-}
-
-// cssToHex normalizes common CSS color syntaxes into #rrggbb.
-// Supports: #rgb/#rrggbb, black/white, rgb()/rgba() with 0-255 or % values.
-func cssToHex(v string) string {
-	s := strings.ToLower(strings.TrimSpace(v))
-	if s == "" {
-		return ""
+	if current == defaultTextColorHex {
+		p.AddStyle(style)
+		return
 	}
-	if strings.HasPrefix(s, "#") {
-		if len(s) == 4 { // #rgb -> #rrggbb
-			r := string([]byte{s[1], s[1]})
-			g := string([]byte{s[2], s[2]})
-			b := string([]byte{s[3], s[3]})
-			return "#" + r + g + b
-		}
-		if len(s) >= 7 {
-			return s[:7]
-		}
-		return ""
-	}
-	switch s {
-	case "black":
-		return "#000000"
-	case "white":
-		return "#ffffff"
-	case "transparent":
-		return ""
-	}
-	if strings.HasPrefix(s, "rgb(") || strings.HasPrefix(s, "rgba(") {
-		open := strings.IndexByte(s, '(')
-		close := strings.IndexByte(s, ')')
-		if open != -1 && close != -1 && close > open+1 {
-			inner := s[open+1 : close]
-			parts := strings.Split(inner, ",")
-			if len(parts) < 3 {
-				parts = strings.Fields(inner)
-			}
-			if len(parts) >= 3 {
-				toByte := func(x string) int {
-					x = strings.TrimSpace(x)
-					if strings.HasSuffix(x, "%") {
-						x = strings.TrimSuffix(x, "%")
-						if p, err := strconv.Atoi(x); err == nil {
-							if p < 0 {
-								p = 0
-							} else if p > 100 {
-								p = 100
-							}
-							return int(float64(p) * 255.0 / 100.0)
-						}
-						return 0
-					}
-					if n, err := strconv.Atoi(x); err == nil {
-						if n < 0 {
-							n = 0
-						} else if n > 255 {
-							n = 255
-						}
-						return n
-					}
-					return 0
-				}
-				r := toByte(parts[0])
-				g := toByte(parts[1])
-				b := toByte(parts[2])
-				hexd := "0123456789abcdef"
-				out := make([]byte, 7)
-				out[0] = '#'
-				out[1] = hexd[r>>4]
-				out[2] = hexd[r&0xF]
-				out[3] = hexd[g>>4]
-				out[4] = hexd[g&0xF]
-				out[5] = hexd[b>>4]
-				out[6] = hexd[b&0xF]
-				return string(out)
-			}
-		}
-	}
-	return ""
+	p.AddStyle(style | (uint32(calcColor(current)) << 8))
 }
 
 // splitByTags splits a raw payload (without V2 header) into parts with at most
@@ -1474,15 +1282,21 @@ func (s *walkState) popStyle(p *Page) {
 }
 
 func (s *walkState) pushColor(p *Page, hex string) {
+	if normalized := cssToHex(hex); normalized != "" {
+		hex = normalized
+	} else {
+		hex = strings.TrimSpace(hex)
+	}
 	s.colorStack = append(s.colorStack, s.curColor)
 	s.curColor = hex
-	if hex != "" {
-		cur := s.curStyle
-		if len(s.styleStack) > 0 {
-			cur = s.styleStack[len(s.styleStack)-1]
-		}
-		p.AddStyle(cur | (uint32(calcColor(hex)) << 8))
+	if hex == "" {
+		return
 	}
+	cur := s.curStyle
+	if len(s.styleStack) > 0 {
+		cur = s.styleStack[len(s.styleStack)-1]
+	}
+	p.AddStyle(cur | (uint32(calcColor(hex)) << 8))
 }
 
 func (s *walkState) popColor(p *Page) {
@@ -1491,14 +1305,21 @@ func (s *walkState) popColor(p *Page) {
 	}
 	prev := s.colorStack[len(s.colorStack)-1]
 	s.colorStack = s.colorStack[:len(s.colorStack)-1]
+	if normalized := cssToHex(prev); normalized != "" {
+		prev = normalized
+	} else {
+		prev = ""
+	}
 	s.curColor = prev
 	cur := s.curStyle
 	if len(s.styleStack) > 0 {
 		cur = s.styleStack[len(s.styleStack)-1]
 	}
-	if prev != "" {
-		p.AddStyle(cur | (uint32(calcColor(prev)) << 8))
+	if prev == "" {
+		p.AddStyle(cur)
+		return
 	}
+	p.AddStyle(cur | (uint32(calcColor(prev)) << 8))
 }
 
 func isDisplayNone(style string) bool {
