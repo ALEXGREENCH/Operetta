@@ -1068,37 +1068,56 @@ func LoadPageWithHeaders(oURL string, hdr http.Header) (*Page, error) {
 		return errorPage(oURL, "Timeout loading page"), nil
 	}
 	defer resp.Body.Close()
-	// Decode body if Content-Encoding present; net/http auto-decodes only when
-	// Accept-Encoding wasn't set explicitly by the caller.
-	var reader io.ReadCloser = resp.Body
-	switch strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Encoding"))) {
-	case "gzip":
-		if gr, gerr := gzip.NewReader(resp.Body); gerr == nil {
-			reader = gr
-			defer gr.Close()
-		}
-	case "deflate":
-		if zr, zerr := zlib.NewReader(resp.Body); zerr == nil {
-			reader = zr
-			defer zr.Close()
-		} else if fr := flate.NewReader(resp.Body); fr != nil {
-			reader = io.NopCloser(fr)
-			defer fr.Close()
-		}
-	}
-	body, err := io.ReadAll(reader)
+	rawBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return errorPage(oURL, "Internal server error"), nil
 	}
+	transferBytes := len(rawBody)
+	body := rawBody
+	if encoding := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Encoding"))); encoding != "" {
+		switch encoding {
+		case "gzip":
+			if gr, gerr := gzip.NewReader(bytes.NewReader(rawBody)); gerr == nil {
+				if decoded, derr := io.ReadAll(gr); derr == nil {
+					body = decoded
+				}
+				_ = gr.Close()
+			}
+		case "deflate":
+			if zr, zerr := zlib.NewReader(bytes.NewReader(rawBody)); zerr == nil {
+				if decoded, derr := io.ReadAll(zr); derr == nil {
+					body = decoded
+				}
+				_ = zr.Close()
+			} else if fr := flate.NewReader(bytes.NewReader(rawBody)); fr != nil {
+				if decoded, derr := io.ReadAll(fr); derr == nil {
+					body = decoded
+				}
+				_ = fr.Close()
+			}
+		}
+	}
+	if len(body) == 0 {
+		body = rawBody
+	}
 	// Pass-through if the response already looks like an OMS payload
 	if looksLikeOMS(body) {
-		return &Page{Data: body}, nil
+		return &Page{
+			Data: body,
+			Stats: TrafficStats{
+				OriginTransferBytes: transferBytes,
+				OriginDecodedBytes:  len(body),
+				EncodedBytes:        len(body),
+			},
+		}, nil
 	}
 	doc, err := html.Parse(bytes.NewReader(body))
 	if err != nil {
 		return errorPage(oURL, "Internal server error while parsing"), nil
 	}
 	p := NewPage()
+	p.Stats.OriginTransferBytes = transferBytes
+	p.Stats.OriginDecodedBytes = len(body)
 	// Prefix page URL with "1/" as in legacy streams for better client compatibility
 	p.AddString("1/" + oURL)
 	p.AddStyle(styleDefault)
@@ -3715,33 +3734,33 @@ func LoadPageWithHeadersAndOptions(oURL string, hdr http.Header, opts *RenderOpt
 	}
 
 	if opts != nil {
-		debugForms := debugHTTP
+		////debugForms := debugHTTP
 		if fb := strings.TrimSpace(opts.FormBody); fb != "" && fb != "0" {
-			if debugForms {
-				if vals, err := url.ParseQuery(fb); err == nil {
-					var parts []string
-					for k, vs := range vals {
-						v := ""
-						if len(vs) > 0 {
-							v = vs[0]
-						}
-						masked := v
-						lk := strings.ToLower(k)
-						if strings.Contains(lk, "pass") || strings.Contains(lk, "pwd") || strings.Contains(lk, "token") {
-							masked = "***"
-						}
-						parts = append(parts, fmt.Sprintf("%s(len=%d)=%s", k, len(v), masked))
+			////if debugForms {
+			if vals, err := url.ParseQuery(fb); err == nil {
+				var parts []string
+				for k, vs := range vals {
+					v := ""
+					if len(vs) > 0 {
+						v = vs[0]
 					}
-					log.Printf("FORM payload keys: %s", strings.Join(parts, ", "))
-				} else {
-					log.Printf("FORM payload raw len=%d", len(fb))
+					masked := v
+					lk := strings.ToLower(k)
+					if strings.Contains(lk, "pass") || strings.Contains(lk, "pwd") || strings.Contains(lk, "token") {
+						masked = "***"
+					}
+					parts = append(parts, fmt.Sprintf("%s(len=%d)=%s", k, len(v), masked))
 				}
+				log.Printf("FORM payload keys: %s", strings.Join(parts, ", "))
+			} else {
+				log.Printf("FORM payload raw len=%d", len(fb))
 			}
+			////}
 		}
 		if submission := prepareOperaMiniSubmission(oURL, opts.FormBody); submission != nil {
-			if debugForms {
-				log.Printf("SUBMISSION plan method=%s url=%s body_len=%d ct=%s", submission.Method, submission.URL, len(submission.Body), submission.ContentType)
-			}
+			///if debugForms {
+			log.Printf("SUBMISSION plan method=%s url=%s body_len=%d ct=%s", submission.Method, submission.URL, len(submission.Body), submission.ContentType)
+			///}
 			if submission.URL != "" {
 				effectiveURL = submission.URL
 			}
@@ -3843,25 +3862,37 @@ func LoadPageWithHeadersAndOptions(oURL string, hdr http.Header, opts *RenderOpt
 		page := renderDownloadPage(effectiveURL, resp, opts)
 		return page, nil
 	}
-	var reader io.ReadCloser = resp.Body
-	switch strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Encoding"))) {
-	case "gzip":
-		if gr, gerr := gzip.NewReader(resp.Body); gerr == nil {
-			reader = gr
-			defer gr.Close()
-		}
-	case "deflate":
-		if zr, zerr := zlib.NewReader(resp.Body); zerr == nil {
-			reader = zr
-			defer zr.Close()
-		} else if fr := flate.NewReader(resp.Body); fr != nil {
-			reader = io.NopCloser(fr)
-			defer fr.Close()
-		}
-	}
-	body, err := io.ReadAll(reader)
+	rawBody, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return errorPage(effectiveURL, "Internal server error"), nil
+	}
+	transferBytes := len(rawBody)
+	body := rawBody
+	if encoding := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Encoding"))); encoding != "" {
+		switch encoding {
+		case "gzip":
+			if gr, gerr := gzip.NewReader(bytes.NewReader(rawBody)); gerr == nil {
+				if decoded, derr := io.ReadAll(gr); derr == nil {
+					body = decoded
+				}
+				_ = gr.Close()
+			}
+		case "deflate":
+			if zr, zerr := zlib.NewReader(bytes.NewReader(rawBody)); zerr == nil {
+				if decoded, derr := io.ReadAll(zr); derr == nil {
+					body = decoded
+				}
+				_ = zr.Close()
+			} else if fr := flate.NewReader(bytes.NewReader(rawBody)); fr != nil {
+				if decoded, derr := io.ReadAll(fr); derr == nil {
+					body = decoded
+				}
+				_ = fr.Close()
+			}
+		}
+	}
+	if len(body) == 0 {
+		body = rawBody
 	}
 	// Log response status and set-cookies (after potential redirects)
 	if debugHTTP {
@@ -3885,9 +3916,18 @@ func LoadPageWithHeadersAndOptions(oURL string, hdr http.Header, opts *RenderOpt
 		}
 	}
 	if looksLikeOMS(body) {
-		return &Page{Data: body, SetCookies: resp.Header["Set-Cookie"]}, nil
+		return &Page{
+			Data:       body,
+			SetCookies: resp.Header["Set-Cookie"],
+			Stats: TrafficStats{
+				OriginTransferBytes: transferBytes,
+				OriginDecodedBytes:  len(body),
+				EncodedBytes:        len(body),
+			},
+		}, nil
 	}
 	utf8Body := decodeLegacyToUTF8(body, resp.Header.Get("Content-Type"))
+	decodedLen := len(utf8Body)
 	doc, err := html.Parse(bytes.NewReader(utf8Body))
 	if err != nil {
 		return errorPage(effectiveURL, "Internal server error while parsing"), nil
@@ -3899,6 +3939,8 @@ func LoadPageWithHeadersAndOptions(oURL string, hdr http.Header, opts *RenderOpt
 		jar = opts.Jar
 	}
 	p := NewPage()
+	p.Stats.OriginTransferBytes = transferBytes
+	p.Stats.OriginDecodedBytes = decodedLen
 	p.AddString("1/" + effectiveURL)
 	if rp.AuthCode != "" {
 		p.AddAuthcode(rp.AuthCode)
@@ -4231,13 +4273,13 @@ func prepareOperaMiniSubmission(baseURL, payload string) *formSubmission {
 		values.Add(normalizedKey, val)
 	}
 	if method == http.MethodGet && hasSensitive {
-		if os.Getenv("OMS_HTTP_DEBUG") == "1" {
-			if seenOPF {
-				log.Printf("SUBMISSION heuristic: overriding OPF to POST (has sensitive fields)")
-			} else {
-				log.Printf("SUBMISSION heuristic: forcing POST (has sensitive fields, no opf)")
-			}
+		////if os.Getenv("OMS_HTTP_DEBUG") == "1" {
+		if seenOPF {
+			log.Printf("SUBMISSION heuristic: overriding OPF to POST (has sensitive fields)")
+		} else {
+			log.Printf("SUBMISSION heuristic: forcing POST (has sensitive fields, no opf)")
 		}
+		////}
 		method = http.MethodPost
 	}
 	base, err := url.Parse(baseURL)

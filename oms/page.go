@@ -39,6 +39,8 @@ type Page struct {
 	FormHidden map[string]map[string]string
 	// NoCache indicates that the page should not be persisted in the render cache.
 	NoCache bool
+	// Stats carries size metrics for debug/telemetry (origin vs encoded OMS).
+	Stats TrafficStats
 }
 
 // NewPage allocates an empty page.
@@ -53,6 +55,16 @@ func (p *Page) addData(b []byte) { p.Data = append(p.Data, b...) }
 func (p *Page) addTag(tag byte) {
 	p.addData([]byte{tag})
 	p.tagCount++
+}
+
+// TrafficStats holds size metrics useful for reporting traffic savings.
+type TrafficStats struct {
+	// OriginTransferBytes counts raw bytes read from the origin response (after HTTP encoding).
+	OriginTransferBytes int
+	// OriginDecodedBytes counts bytes after decoding/decompression prior to rendering.
+	OriginDecodedBytes int
+	// EncodedBytes counts bytes returned to the client after OMS packing.
+	EncodedBytes int
 }
 
 // AddString stores a string prefixed with its big-endian length.
@@ -464,6 +476,7 @@ func (p *Page) finalize() {
 	binary.LittleEndian.PutUint16(header[:2], headerWord)
 	binary.BigEndian.PutUint32(header[2:], uint32(size))
 	p.Data = append(header, payload...)
+	p.Stats.EncodedBytes = len(p.Data)
 	// Preserve pre-set packed full-page if caller prepared it earlier.
 	// Otherwise, default to caching the finalized data.
 	if len(p.CachePacked) == 0 {
@@ -478,6 +491,7 @@ func (p *Page) Normalize() {
 	nb, err := NormalizeOMS(p.Data)
 	if err == nil && nb != nil {
 		p.Data = nb
+		p.Stats.EncodedBytes = len(p.Data)
 	}
 }
 

@@ -13,6 +13,7 @@ type cacheEntry struct {
 	data       []byte
 	setCookies []string
 	created    time.Time
+	stats      oms.TrafficStats
 }
 
 type pageCache struct {
@@ -63,6 +64,7 @@ func (c *pageCache) Store(target string, opt *oms.RenderOptions, _ http.Header, 
 		data:       append([]byte(nil), data...),
 		setCookies: append([]string(nil), page.SetCookies...),
 		created:    c.now(),
+		stats:      page.Stats,
 	}
 	key := cacheKey(target, opt)
 	c.mu.Lock()
@@ -70,16 +72,16 @@ func (c *pageCache) Store(target string, opt *oms.RenderOptions, _ http.Header, 
 	c.mu.Unlock()
 }
 
-func (c *pageCache) Select(target string, opt *oms.RenderOptions) ([]byte, []string, int, int, bool) {
+func (c *pageCache) Select(target string, opt *oms.RenderOptions) ([]byte, []string, int, int, oms.TrafficStats, bool) {
 	if opt == nil || opt.Page <= 1 || opt.MaxTagsPerPage <= 0 {
-		return nil, nil, 0, 0, false
+		return nil, nil, 0, 0, oms.TrafficStats{}, false
 	}
 	key := cacheKey(target, opt)
 	c.mu.RLock()
 	entry, ok := c.data[key]
 	c.mu.RUnlock()
 	if !ok {
-		return nil, nil, 0, 0, false
+		return nil, nil, 0, 0, oms.TrafficStats{}, false
 	}
 	var raw []byte
 	var cur, cnt int
@@ -90,7 +92,7 @@ func (c *pageCache) Select(target string, opt *oms.RenderOptions) ([]byte, []str
 		raw, cur, cnt, err = oms.SelectOMSPartFromPacked(entry.data, opt.Page, opt.MaxTagsPerPage)
 	}
 	if err != nil {
-		return nil, nil, 0, 0, false
+		return nil, nil, 0, 0, oms.TrafficStats{}, false
 	}
-	return append([]byte(nil), raw...), append([]string(nil), entry.setCookies...), cur, cnt, true
+	return append([]byte(nil), raw...), append([]string(nil), entry.setCookies...), cur, cnt, entry.stats, true
 }

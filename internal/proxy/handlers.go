@@ -44,38 +44,38 @@ func (s *Server) clientJarKey(r *http.Request, params map[string]string) string 
 func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodPost {
 		body, _ := io.ReadAll(r.Body)
-		debugHTTP := os.Getenv("OMS_HTTP_DEBUG") == "1"
+		debugHTTP := os.Getenv("OMS_HTTP_DEBUG") != "1"
 
-		if debugHTTP {
-			s.logger.Printf("===> Incoming %s %s from %s", r.Method, r.URL.Path, r.RemoteAddr)
-			s.logger.Printf("Headers:")
-			for k, v := range r.Header {
-				s.logger.Printf("  %s: %s", k, strings.Join(v, "; "))
-			}
-			s.logger.Printf("Body length: %d", len(body))
-			if bytes.Contains(body, []byte("h=")) || bytes.Contains(body, []byte("c=")) {
-				reH := regexp.MustCompile(`h=([^\x00]+)`)
-				reC := regexp.MustCompile(`c=([^\x00]+)`)
-				mH := reH.FindSubmatch(body)
-				mC := reC.FindSubmatch(body)
-				s.logger.Printf("Auth fields detected in body: prefix=%q code=%q",
-					func() string {
-						if len(mH) > 1 {
-							return string(mH[1])
-						}
-						return ""
-					}(),
-					func() string {
-						if len(mC) > 1 {
-							return string(mC[1])
-						}
-						return ""
-					}(),
-				)
-			} else {
-				s.logger.Printf("No h=/c= fields found in POST body.")
-			}
+		////if debugHTTP {
+		s.logger.Printf("===> Incoming %s %s from %s", r.Method, r.URL.Path, r.RemoteAddr)
+		s.logger.Printf("Headers:")
+		for k, v := range r.Header {
+			s.logger.Printf("  %s: %s", k, strings.Join(v, "; "))
 		}
+		s.logger.Printf("Body length: %d", len(body))
+		if bytes.Contains(body, []byte("h=")) || bytes.Contains(body, []byte("c=")) {
+			reH := regexp.MustCompile(`h=([^\x00]+)`)
+			reC := regexp.MustCompile(`c=([^\x00]+)`)
+			mH := reH.FindSubmatch(body)
+			mC := reC.FindSubmatch(body)
+			s.logger.Printf("Auth fields detected in body: prefix=%q code=%q",
+				func() string {
+					if len(mH) > 1 {
+						return string(mH[1])
+					}
+					return ""
+				}(),
+				func() string {
+					if len(mC) > 1 {
+						return string(mC[1])
+					}
+					return ""
+				}(),
+			)
+		} else {
+			s.logger.Printf("No h=/c= fields found in POST body.")
+		}
+		////}
 
 		r.Body.Close()
 		params := parseNullKV(body)
@@ -156,7 +156,7 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			page := s.renderBootstrapPage(tok.Code, tok.Prefix)
-			s.writeOMS(w, page.Data, page.SetCookies)
+			s.writeOMS(w, page.Data, page.SetCookies, &page.Stats)
 			return
 		}
 		if raw := params["u"]; raw != "" {
@@ -195,7 +195,7 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 			}
 			if s.isInternalAboutRequest(raw, effectiveTarget) {
 				page := s.renderAboutPage(params)
-				s.writeOMS(w, page.Data, page.SetCookies)
+				s.writeOMS(w, page.Data, page.SetCookies, &page.Stats)
 				return
 			}
 			if s.shouldServeLocalBookmarks() && looksLikeBookmarksPortal(effectiveTarget) {
@@ -208,7 +208,7 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 							s.logger.Printf("Set auth cookie for %q: %+v", clientKey, s.auth.cookieFor(clientKey))
 						}
 					}
-					s.writeOMS(w, page.Data, page.SetCookies)
+					s.writeOMS(w, page.Data, page.SetCookies, &page.Stats)
 					return
 				}
 			}
@@ -240,7 +240,7 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 					s.logger.Printf("Set auth cookie for %q: %+v", clientKey, s.auth.cookieFor(clientKey))
 				}
 			}
-			s.writeOMS(w, page.Data, page.SetCookies)
+			s.writeOMS(w, page.Data, page.SetCookies, &page.Stats)
 			return
 		}
 		w.Header().Set("Content-Type", "application/xml; charset=utf-8")
@@ -293,7 +293,7 @@ func (s *Server) handleFetch(w http.ResponseWriter, r *http.Request) {
 	}
 	page.Normalize()
 	s.cache.Store(finalURL, opt, hdr, page)
-	s.writeOMS(w, page.Data, page.SetCookies)
+	s.writeOMS(w, page.Data, page.SetCookies, &page.Stats)
 }
 
 func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
@@ -675,7 +675,7 @@ func defaultRenderOptions() *oms.RenderOptions {
 }
 
 func (s *Server) serveFromCache(w http.ResponseWriter, target string, opt *oms.RenderOptions) bool {
-	if raw, cookies, cur, cnt, ok := s.cache.Select(target, opt); ok {
+	if raw, cookies, cur, cnt, stats, ok := s.cache.Select(target, opt); ok {
 		if cur > 0 || cnt > 0 {
 			w.Header().Set("X-Operetta-Page", strconv.Itoa(cur))
 			w.Header().Set("X-Operetta-Pages", strconv.Itoa(cnt))
@@ -683,7 +683,8 @@ func (s *Server) serveFromCache(w http.ResponseWriter, target string, opt *oms.R
 		for _, sc := range cookies {
 			w.Header().Add("Set-Cookie", sc)
 		}
-		s.writeOMS(w, raw, cookies)
+		statsCopy := stats
+		s.writeOMS(w, raw, cookies, &statsCopy)
 		return true
 	}
 	return false
@@ -868,12 +869,63 @@ func (s *Server) loadPage(target string, hdr http.Header, opt *oms.RenderOptions
 	return oms.LoadPageWithHeadersAndOptions(target, header, opt)
 }
 
-func (s *Server) writeOMS(w http.ResponseWriter, data []byte, _ []string) {
+func (s *Server) writeOMS(w http.ResponseWriter, data []byte, _ []string, stats *oms.TrafficStats) {
 	w.Header().Set("Content-Type", "application/octet-stream")
 	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
 	w.Header().Set("Connection", "close")
 	dumpOMS(s.logger, data)
+	s.logTrafficSavings(stats, len(data))
 	_, _ = w.Write(data)
+}
+
+func (s *Server) logTrafficSavings(stats *oms.TrafficStats, encoded int) {
+	if s.logger == nil || stats == nil {
+		return
+	}
+	////if os.Getenv("OMS_HTTP_DEBUG") != "1" {
+	////	return
+	////}
+	if encoded <= 0 {
+		return
+	}
+	stats.EncodedBytes = encoded
+	origin := stats.OriginTransferBytes
+	basis := "transfer"
+	if origin <= 0 {
+		origin = stats.OriginDecodedBytes
+		basis = "decoded"
+	}
+	if origin <= encoded && stats.OriginDecodedBytes > encoded {
+		origin = stats.OriginDecodedBytes
+		basis = "decoded"
+	}
+	if origin <= 0 && stats.OriginDecodedBytes <= 0 {
+		return
+	}
+	if origin <= 0 {
+		origin = stats.OriginDecodedBytes
+		basis = "decoded"
+	}
+	if origin <= 0 {
+		return
+	}
+	saved := origin - encoded
+	if saved < 0 && basis != "decoded" && stats.OriginDecodedBytes > encoded {
+		origin = stats.OriginDecodedBytes
+		basis = "decoded"
+		saved = origin - encoded
+	}
+	if saved < 0 {
+		extra := -saved
+		percent := (float64(extra) / float64(origin)) * 100
+		s.logger.Printf("Traffic delta (%s): origin=%dB operetta=%dB extra=%dB (+%.1f%%)", basis, origin, encoded, extra, percent)
+	} else {
+		percent := (float64(saved) / float64(origin)) * 100
+		s.logger.Printf("Traffic saved (%s): origin=%dB operetta=%dB saved=%dB (%.1f%%)", basis, origin, encoded, saved, percent)
+	}
+	if stats.OriginTransferBytes > 0 && stats.OriginDecodedBytes > 0 && stats.OriginTransferBytes != stats.OriginDecodedBytes {
+		s.logger.Printf("Traffic reference: transfer=%dB decoded=%dB", stats.OriginTransferBytes, stats.OriginDecodedBytes)
+	}
 }
 
 func (s *Server) isInternalAboutRequest(raw, normalized string) bool {
