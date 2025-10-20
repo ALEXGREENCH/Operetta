@@ -1094,6 +1094,27 @@ func resolveFormActionURL(base, action string) string {
 	return action
 }
 
+func ensureHiddenFieldOverrides(actionKey string, fields map[string]string) {
+	if len(fields) == 0 || strings.TrimSpace(actionKey) == "" {
+		return
+	}
+	u, err := url.Parse(actionKey)
+	if err != nil {
+		return
+	}
+	host := strings.ToLower(u.Host)
+	if host == "" || !strings.Contains(host, "google.") {
+		return
+	}
+	path := strings.Trim(strings.ToLower(u.Path), "/")
+	if path != "search" {
+		return
+	}
+	if _, exists := fields["udm"]; !exists {
+		fields["udm"] = "2"
+	}
+}
+
 // RenderOptions define client rendering preferences relevant to OBML generation.
 type RenderOptions struct {
 	ImagesOn      bool
@@ -2878,6 +2899,7 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 						if _, exists := p.FormHidden[actionKey][name]; !exists {
 							p.FormHidden[actionKey][name] = value
 						}
+						ensureHiddenFieldOverrides(actionKey, p.FormHidden[actionKey])
 					}
 				}
 			case "button":
