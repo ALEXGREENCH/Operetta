@@ -1583,6 +1583,22 @@ func hasAnyClass(n *html.Node, classes ...string) bool {
 	return false
 }
 
+func hasAncestorClass(n *html.Node, class string) bool {
+	class = strings.ToLower(strings.TrimSpace(class))
+	if class == "" {
+		return false
+	}
+	for p := n.Parent; p != nil; p = p.Parent {
+		if p.Type != html.ElementNode {
+			continue
+		}
+		if hasClass(p, class) {
+			return true
+		}
+	}
+	return false
+}
+
 func parseCssValue(style, prop string) string {
 	if style == "" {
 		return ""
@@ -1907,25 +1923,58 @@ func resetComputedStyles(st *walkState, p *Page, colorPushed *bool, stylePushed 
 }
 
 func condenseSpaces(s string) string {
-	s = strings.ReplaceAll(strings.ReplaceAll(s, "\n", " "), "\r", " ")
-	if !strings.Contains(s, "  ") {
-		return strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	// Remember whether original text ended with whitespace so we can restore
+	// expected spacing after punctuation (e.g. ", " sequences commonly used
+	// between inline links on legacy portals).
+	hadTrailingWhitespace := false
+	for i := len(s) - 1; i >= 0; i-- {
+		c := s[i]
+		if c == ' ' || c == '\n' || c == '\r' || c == '\t' {
+			hadTrailingWhitespace = true
+		} else {
+			break
+		}
+	}
+	s = strings.ReplaceAll(s, "\r", " ")
+	s = strings.ReplaceAll(s, "\n", " ")
+	trimmed := strings.TrimSpace(s)
+	if trimmed == "" {
+		return ""
+	}
+	if !strings.Contains(trimmed, "  ") && !strings.Contains(trimmed, "\t") {
+		if hadTrailingWhitespace && trimmed != "" {
+			last := trimmed[len(trimmed)-1]
+			if last == ',' || last == ';' || last == ':' {
+				return trimmed + " "
+			}
+		}
+		return trimmed
 	}
 	var b strings.Builder
-	prev := false
-	for i := 0; i < len(s); i++ {
-		c := s[i]
-		if c == '\t' || c == ' ' {
-			if !prev {
+	prevSpace := false
+	for i := 0; i < len(trimmed); i++ {
+		c := trimmed[i]
+		if c == ' ' || c == '\t' {
+			if !prevSpace {
 				b.WriteByte(' ')
-				prev = true
+				prevSpace = true
 			}
 			continue
 		}
-		prev = false
+		prevSpace = false
 		b.WriteByte(c)
 	}
-	return strings.TrimSpace(b.String())
+	out := b.String()
+	if hadTrailingWhitespace && out != "" {
+		last := out[len(out)-1]
+		if last == ',' || last == ';' || last == ':' {
+			out += " "
+		}
+	}
+	return out
 }
 
 // parseBackgroundPosition parses simple background-position values like "-24px 0" or "0 0".
@@ -2626,9 +2675,17 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 					shouldBreak = false
 				}
 			} else {
-				if ns := nextSignificantSibling(c); ns != nil && ns.Type == html.TextNode &&
-					hasPrefixAny(strings.TrimLeft(ns.Data, " \t\n"), "]", "|", ")") {
-					shouldBreak = false
+				if ns := nextSignificantSibling(c); ns != nil {
+					if ns.Type == html.TextNode {
+						trimmed := strings.TrimLeft(ns.Data, " \t\n")
+						if hasPrefixAny(trimmed, "]", "|", ")", ",", ";", ":") {
+							shouldBreak = false
+						}
+					} else if ns.Type == html.ElementNode && strings.EqualFold(ns.Data, "a") {
+						if hasAncestorClass(c, "bottom") || hasAncestorClass(c, "list_menu") {
+							shouldBreak = false
+						}
+					}
 				}
 			}
 			if !shouldBreak && iconOnly {
@@ -2656,9 +2713,14 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 					src = strings.TrimSpace(getAttr(c, "data-lazy-src"))
 				}
 			}
-			alt := strings.TrimSpace(getAttr(c, "alt"))
+			rawAlt := strings.TrimSpace(getAttr(c, "alt"))
+			alt := rawAlt
 			if alt == "" {
-				alt = "Image"
+				if hasAncestorClass(c, "nl") {
+					alt = "Icon"
+				} else {
+					alt = "Image"
+				}
 			}
 			if !prefs.ImagesOn || src == "" {
 				p.AddText("[" + alt + "]")
