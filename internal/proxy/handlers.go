@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -217,7 +218,7 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 			if cacheHit {
 				return
 			}
-			page, err := s.loadPage(effectiveTarget, hdr, opt)
+			page, err := s.loadPage(r.Context(), effectiveTarget, hdr, opt)
 			if err != nil {
 				http.Error(w, err.Error(), http.StatusBadGateway)
 				return
@@ -276,7 +277,7 @@ func (s *Server) handleFetch(w http.ResponseWriter, r *http.Request) {
 	if s.serveFromCache(w, finalURL, opt) {
 		return
 	}
-	page, err := s.loadPage(finalURL, hdr, opt)
+	page, err := s.loadPage(r.Context(), finalURL, hdr, opt)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadGateway)
 		return
@@ -579,6 +580,7 @@ func (s *Server) renderOptionsFromParams(r *http.Request, params map[string]stri
 	opt.Jar = s.cookieJars.Get(jarKey)
 	opt.WantFullCache = true
 	applyAcceptImagePreference(opt, hdr)
+	applyJSOptionsFromParams(opt, params)
 	return opt
 }
 
@@ -669,6 +671,7 @@ func (s *Server) renderOptionsFromQuery(r *http.Request, hdr http.Header) *oms.R
 	key := s.renderPrefKeyWithOptions(r, q.Get("url"), opt)
 	s.renderPrefs.Apply(key, opt, q)
 	applyAcceptImagePreference(opt, hdr)
+	applyJSOptionsFromQuery(opt, q)
 	return opt
 }
 
@@ -691,6 +694,171 @@ func applyAcceptImagePreference(opt *oms.RenderOptions, hdr http.Header) {
 	if current == "" {
 		opt.ImageMIME = "image/jpeg"
 	}
+}
+
+func ensureJSOptions(opt *oms.RenderOptions) *oms.JSBakingOptions {
+	if opt.JS == nil {
+		opt.JS = &oms.JSBakingOptions{}
+	}
+	return opt.JS
+}
+
+func parseJSModeToken(raw string) (oms.JSExecutionMode, bool) {
+	mode := strings.TrimSpace(strings.ToLower(raw))
+	switch mode {
+	case "", "auto", "default":
+		return oms.JSExecutionModeAuto, true
+	case "0", "off", "false", "disabled":
+		return oms.JSExecutionModeDisabled, true
+	case "1", "on", "true", "enabled":
+		return oms.JSExecutionModeEnabled, true
+	case "force", "required", "require":
+		return oms.JSExecutionModeRequired, true
+	}
+	return oms.JSExecutionModeAuto, false
+}
+
+func applyJSOptionsFromQuery(opt *oms.RenderOptions, q url.Values) {
+	if opt == nil || q == nil {
+		return
+	}
+	if modeRaw := q.Get("js"); modeRaw != "" {
+		if mode, ok := parseJSModeToken(modeRaw); ok {
+			js := ensureJSOptions(opt)
+			js.Mode = mode
+		}
+	}
+	if wait := strings.TrimSpace(q.Get("js_wait")); wait != "" {
+		if n, err := strconv.Atoi(wait); err == nil && n >= 0 {
+			js := ensureJSOptions(opt)
+			js.WaitAfterLoadMS = n
+		}
+	}
+	if idle := strings.TrimSpace(q.Get("js_idle")); idle != "" {
+		if n, err := strconv.Atoi(idle); err == nil && n >= 0 {
+			js := ensureJSOptions(opt)
+			js.WaitNetworkIdleMS = n
+		}
+	}
+	if sel := strings.TrimSpace(q.Get("js_selector")); sel != "" {
+		js := ensureJSOptions(opt)
+		js.WaitSelector = sel
+	}
+	if to := strings.TrimSpace(q.Get("js_timeout")); to != "" {
+		if n, err := strconv.Atoi(to); err == nil && n >= 0 {
+			js := ensureJSOptions(opt)
+			js.TimeoutMS = n
+		}
+	}
+	if scripts := q["js_script"]; len(scripts) > 0 {
+		js := ensureJSOptions(opt)
+		for _, sc := range scripts {
+			if trimmed := strings.TrimSpace(sc); trimmed != "" {
+				js.Scripts = append(js.Scripts, trimmed)
+			}
+		}
+	}
+}
+
+func applyJSOptionsFromParams(opt *oms.RenderOptions, params map[string]string) {
+	if opt == nil || params == nil {
+		return
+	}
+	if modeRaw := params["js"]; modeRaw != "" {
+		if mode, ok := parseJSModeToken(modeRaw); ok {
+			js := ensureJSOptions(opt)
+			js.Mode = mode
+		}
+	}
+	if wait := strings.TrimSpace(params["js_wait"]); wait != "" {
+		if n, err := strconv.Atoi(wait); err == nil && n >= 0 {
+			js := ensureJSOptions(opt)
+			js.WaitAfterLoadMS = n
+		}
+	}
+	if idle := strings.TrimSpace(params["js_idle"]); idle != "" {
+		if n, err := strconv.Atoi(idle); err == nil && n >= 0 {
+			js := ensureJSOptions(opt)
+			js.WaitNetworkIdleMS = n
+		}
+	}
+	if sel := strings.TrimSpace(params["js_selector"]); sel != "" {
+		js := ensureJSOptions(opt)
+		js.WaitSelector = sel
+	}
+	if to := strings.TrimSpace(params["js_timeout"]); to != "" {
+		if n, err := strconv.Atoi(to); err == nil && n >= 0 {
+			js := ensureJSOptions(opt)
+			js.TimeoutMS = n
+		}
+	}
+	if script := strings.TrimSpace(params["js_script"]); script != "" {
+		js := ensureJSOptions(opt)
+		js.Scripts = append(js.Scripts, script)
+	}
+}
+
+func mergeJSOptions(base, override *oms.JSBakingOptions) *oms.JSBakingOptions {
+	if base == nil && override == nil {
+		return nil
+	}
+	result := &oms.JSBakingOptions{}
+	if base != nil {
+		*result = *base
+		if len(base.Scripts) > 0 {
+			result.Scripts = append([]string(nil), base.Scripts...)
+		}
+	}
+	if override != nil {
+		if override.Mode != oms.JSExecutionModeAuto {
+			result.Mode = override.Mode
+		}
+		if override.WaitAfterLoadMS > 0 {
+			result.WaitAfterLoadMS = override.WaitAfterLoadMS
+		}
+		if override.WaitNetworkIdleMS > 0 {
+			result.WaitNetworkIdleMS = override.WaitNetworkIdleMS
+		}
+		if override.WaitSelector != "" {
+			result.WaitSelector = override.WaitSelector
+		}
+		if override.TimeoutMS > 0 {
+			result.TimeoutMS = override.TimeoutMS
+		}
+		if len(override.Scripts) > 0 {
+			result.Scripts = append(result.Scripts, override.Scripts...)
+		}
+	}
+	if result.Mode == oms.JSExecutionModeAuto &&
+		result.WaitAfterLoadMS == 0 &&
+		result.WaitNetworkIdleMS == 0 &&
+		result.WaitSelector == "" &&
+		result.TimeoutMS == 0 &&
+		len(result.Scripts) == 0 {
+		return nil
+	}
+	return result
+}
+
+func shouldUseJS(opts *oms.JSBakingOptions) bool {
+	if opts == nil {
+		return false
+	}
+	switch opts.Mode {
+	case oms.JSExecutionModeDisabled:
+		return false
+	case oms.JSExecutionModeEnabled, oms.JSExecutionModeRequired:
+		return true
+	case oms.JSExecutionModeAuto:
+		if opts.WaitAfterLoadMS > 0 ||
+			opts.WaitNetworkIdleMS > 0 ||
+			opts.WaitSelector != "" ||
+			opts.TimeoutMS > 0 ||
+			len(opts.Scripts) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func defaultRenderOptions() *oms.RenderOptions {
@@ -746,7 +914,8 @@ func (s *Server) prefetchFormHidden(r *http.Request, params map[string]string, t
 	hdrCopy.Del("Content-Type")
 	opt := s.renderOptionsFromParams(r, paramsCopy, hdrCopy, jarKey)
 	opt.FormBody = ""
-	page, err := s.loadPage(target, hdrCopy, opt)
+	opt.JS = nil
+	page, err := s.loadPage(r.Context(), target, hdrCopy, opt)
 	if err != nil {
 		if debug {
 			s.logger.Printf("Form prefetch error for %q: %v", target, err)
@@ -883,7 +1052,7 @@ func serverBase(r *http.Request) string {
 	return scheme + "://" + r.Host
 }
 
-func (s *Server) loadPage(target string, hdr http.Header, opt *oms.RenderOptions) (*oms.Page, error) {
+func (s *Server) loadPage(ctx context.Context, target string, hdr http.Header, opt *oms.RenderOptions) (*oms.Page, error) {
 	cfg := s.sites.Find(target)
 	header := http.Header{}
 	copyHeader(header, hdr)
@@ -896,7 +1065,49 @@ func (s *Server) loadPage(target string, hdr http.Header, opt *oms.RenderOptions
 			return oms.LoadCompactPageWithHeaders(target, header)
 		}
 	}
-	return oms.LoadPageWithHeadersAndOptions(target, header, opt)
+	var cfgJS *oms.JSBakingOptions
+	if cfg != nil {
+		cfgJS = cfg.JSOptions()
+	}
+	var mergedJS *oms.JSBakingOptions
+	if opt != nil && opt.JS != nil {
+		mergedJS = mergeJSOptions(cfgJS, opt.JS)
+	} else {
+		mergedJS = mergeJSOptions(cfgJS, nil)
+	}
+	if shouldUseJS(mergedJS) {
+		baker, err := s.getJSBaker()
+		if err != nil {
+			if mergedJS != nil && mergedJS.Mode == oms.JSExecutionModeRequired {
+				return nil, err
+			}
+			if s.logger != nil {
+				s.logger.Printf("js baker unavailable: %v", err)
+			}
+		} else {
+			doc, err := baker.Fetch(ctx, target, header, opt, mergedJS)
+			if err == nil && doc != nil {
+				page, renderErr := oms.RenderDocument(doc, header, opt)
+				if renderErr == nil {
+					return page, nil
+				}
+				if mergedJS != nil && mergedJS.Mode == oms.JSExecutionModeRequired {
+					return nil, renderErr
+				}
+				if s.logger != nil {
+					s.logger.Printf("js render fallback for %s: %v", target, renderErr)
+				}
+			} else if err != nil {
+				if mergedJS != nil && mergedJS.Mode == oms.JSExecutionModeRequired {
+					return nil, err
+				}
+				if s.logger != nil {
+					s.logger.Printf("js fetch fallback for %s: %v", target, err)
+				}
+			}
+		}
+	}
+	return oms.LoadPageWithHeadersAndOptionsCtx(ctx, target, header, opt)
 }
 
 func (s *Server) writeOMS(w http.ResponseWriter, data []byte, _ []string, stats *oms.TrafficStats) {

@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -112,6 +113,9 @@ type Server struct {
 	sites       *siteConfigStore
 	clock       func() time.Time
 	forms       *formStore
+	jsBakerOnce sync.Once
+	jsBaker     *jsBaker
+	jsBakerErr  error
 }
 
 // New wires a new proxy server with the provided configuration.
@@ -164,4 +168,11 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/validate", s.handleValidate)
 	s.mux.HandleFunc("/ping", s.handlePing)
 	s.mux.HandleFunc("/download", s.handleDownload)
+}
+
+func (s *Server) getJSBaker() (*jsBaker, error) {
+	s.jsBakerOnce.Do(func() {
+		s.jsBaker, s.jsBakerErr = newJSBaker(s.logger)
+	})
+	return s.jsBaker, s.jsBakerErr
 }

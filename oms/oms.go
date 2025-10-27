@@ -5,6 +5,7 @@ import (
 	"compress/flate"
 	"compress/gzip"
 	"compress/zlib"
+	"context"
 	"encoding/base64"
 	"encoding/binary"
 	"image"
@@ -1144,6 +1145,194 @@ type RenderOptions struct {
 	Styles        *Stylesheet
 	WantFullCache bool
 	ClientVersion ClientVersion
+	// Optional JavaScript baking configuration (nil = auto/off).
+	JS *JSBakingOptions
+}
+
+// JSExecutionMode controls whether JS baking should be applied.
+type JSExecutionMode int
+
+const (
+	JSExecutionModeAuto JSExecutionMode = iota
+	JSExecutionModeDisabled
+	JSExecutionModeEnabled
+	JSExecutionModeRequired
+)
+
+// JSBakingOptions capture additional tuning knobs for JS-enabled fetching.
+type JSBakingOptions struct {
+	Mode              JSExecutionMode
+	WaitAfterLoadMS   int
+	WaitNetworkIdleMS int
+	WaitSelector      string
+	TimeoutMS         int
+	Scripts           []string
+}
+
+// UpstreamDocument captures the result of fetching a page before it is rendered
+// into OMS. Body should contain the decoded payload (post-decompression) when
+// available; RawBody preserves the original bytes as received from the origin.
+type UpstreamDocument struct {
+	URL           string
+	Body          []byte
+	RawBody       []byte
+	TransferBytes int
+	Header        http.Header
+	Status        int
+	ContentLength int64
+	SetCookies    []string
+}
+
+func cloneHeader(h http.Header) http.Header {
+	if h == nil {
+		return http.Header{}
+	}
+	out := http.Header{}
+	for k, vs := range h {
+		for _, v := range vs {
+			out.Add(k, v)
+		}
+	}
+	return out
+}
+
+func shouldOfferDownload(header http.Header) bool {
+	if header == nil {
+		return false
+	}
+	if cd := strings.ToLower(header.Get("Content-Disposition")); cd != "" && strings.Contains(cd, "attachment") {
+		return true
+	}
+	ct := strings.TrimSpace(header.Get("Content-Type"))
+	if ct == "" {
+		return false
+	}
+	mediaType := strings.ToLower(ct)
+	if mt, _, err := mime.ParseMediaType(ct); err == nil {
+		mediaType = strings.ToLower(mt)
+	}
+	if mediaType == "" {
+		return false
+	}
+	if strings.Contains(mediaType, "html") || strings.Contains(mediaType, "xml") {
+		return false
+	}
+	if strings.HasPrefix(mediaType, "text/") {
+		return false
+	}
+	switch mediaType {
+	case "application/json", "application/javascript":
+		return false
+	case "application/octet-stream":
+		if cd := header.Get("Content-Disposition"); cd == "" {
+			return false
+		}
+	}
+	return true
+}
+
+func renderDownloadPageFromDocument(doc *UpstreamDocument, opts *RenderOptions) *Page {
+	effectiveURL := doc.URL
+	if effectiveURL == "" {
+		effectiveURL = "about:blank"
+	}
+	page := NewPage()
+	page.AddString("1/" + effectiveURL)
+	page.AddStyle(styleDefault)
+
+	ct := strings.TrimSpace(doc.Header.Get("Content-Type"))
+	if mt, _, err := mime.ParseMediaType(ct); err == nil {
+		ct = mt
+	}
+	filename := fileNameFromDocument(doc)
+	sizeText := humanReadableSize(doc.ContentLength)
+
+	page.AddText("Download file")
+	page.AddBreak()
+	page.AddBreak()
+	if filename != "" {
+		page.AddText("Name: " + filename)
+		page.AddBreak()
+	}
+	if sizeText != "" {
+		page.AddText("Size: " + sizeText)
+		page.AddBreak()
+	}
+	if ct != "" {
+		page.AddText("Type: " + ct)
+		page.AddBreak()
+	}
+	page.AddBreak()
+
+	downloadLink := buildDownloadLinkFromDocument(doc, opts, filename, false)
+	page.AddLink("0/"+downloadLink, "[Download]")
+
+	if strings.HasPrefix(strings.ToLower(ct), "video/3gpp") {
+		page.AddBreak()
+		streamLink := buildDownloadLinkFromDocument(doc, opts, filename, true)
+		page.AddLink("0/"+streamLink, "[Play]")
+		page.AddText(" Opens external player")
+	}
+
+	page.AddBreak()
+	page.AddLink("0/"+effectiveURL, "[Open original]")
+
+	if len(doc.SetCookies) > 0 {
+		page.SetCookies = append([]string(nil), doc.SetCookies...)
+	}
+	page.NoCache = true
+	page.finalize()
+	return page
+}
+
+func buildDownloadLinkFromDocument(doc *UpstreamDocument, opts *RenderOptions, filename string, stream bool) string {
+	values := url.Values{}
+	effectiveURL := doc.URL
+	if effectiveURL == "" {
+		effectiveURL = "about:blank"
+	}
+	values.Set("url", effectiveURL)
+	if ct := strings.TrimSpace(doc.Header.Get("Content-Type")); ct != "" {
+		values.Set("ct", ct)
+	}
+	if filename != "" {
+		values.Set("name", filename)
+	}
+	values.Set("ref", effectiveURL)
+	if stream {
+		values.Set("mode", "stream")
+	}
+	path := "/download?" + values.Encode()
+	if opts != nil && strings.TrimSpace(opts.ServerBase) != "" {
+		base := strings.TrimRight(opts.ServerBase, "/")
+		return base + path
+	}
+	return path
+}
+
+func fileNameFromDocument(doc *UpstreamDocument) string {
+	if doc == nil {
+		return ""
+	}
+	if cd := doc.Header.Get("Content-Disposition"); cd != "" {
+		if _, params, err := mime.ParseMediaType(cd); err == nil {
+			if name := params["filename"]; name != "" {
+				if decoded, err := url.QueryUnescape(name); err == nil {
+					return decoded
+				}
+				return name
+			}
+		}
+	}
+	if u, err := url.Parse(doc.URL); err == nil {
+		if base := path.Base(u.Path); base != "" && base != "/" {
+			if decoded, err := url.PathUnescape(base); err == nil {
+				return decoded
+			}
+			return base
+		}
+	}
+	return ""
 }
 
 // BuildPaginationQuery encodes paging parameters while preserving render options that affect output quality.
@@ -3625,215 +3814,44 @@ func decodeDataURI(uri string, prefs RenderOptions) ([]byte, int, int, string, i
 
 // ---------------------- Public API with options ----------------------
 
-// LoadPageWithHeadersAndOptions performs HTTP GET with optional headers and rendering options.
-
-func LoadPageWithHeadersAndOptions(oURL string, hdr http.Header, opts *RenderOptions) (*Page, error) {
-	effectiveURL := oURL
-	method := http.MethodGet
-	var bodyReader io.Reader
-	var contentTypeOverride string
-	debugHTTP := os.Getenv("OMS_HTTP_DEBUG") == "1"
-
-	if hdr == nil {
-		hdr = http.Header{}
+// RenderDocument takes a fetched upstream document and produces an OMS page
+// using the provided render options and request headers.
+func RenderDocument(doc *UpstreamDocument, hdr http.Header, opts *RenderOptions) (*Page, error) {
+	if doc == nil {
+		return errorPage("", "Internal server error"), nil
 	}
-
-	if opts != nil {
-		////debugForms := debugHTTP
-		if fb := strings.TrimSpace(opts.FormBody); fb != "" && fb != "0" {
-			////if debugForms {
-			if vals, err := url.ParseQuery(fb); err == nil {
-				var parts []string
-				for k, vs := range vals {
-					v := ""
-					if len(vs) > 0 {
-						v = vs[0]
-					}
-					masked := v
-					lk := strings.ToLower(k)
-					if strings.Contains(lk, "pass") || strings.Contains(lk, "pwd") || strings.Contains(lk, "token") {
-						masked = "***"
-					}
-					parts = append(parts, fmt.Sprintf("%s(len=%d)=%s", k, len(v), masked))
-				}
-				log.Printf("FORM payload keys: %s", strings.Join(parts, ", "))
-			} else {
-				log.Printf("FORM payload raw len=%d", len(fb))
-			}
-			////}
-		}
-		if submission := prepareOperaMiniSubmission(oURL, opts.FormBody); submission != nil {
-			///if debugForms {
-			log.Printf("SUBMISSION plan method=%s url=%s body_len=%d ct=%s", submission.Method, submission.URL, len(submission.Body), submission.ContentType)
-			///}
-			if submission.URL != "" {
-				effectiveURL = submission.URL
-			}
-			if submission.Method != "" {
-				method = submission.Method
-			}
-			if submission.Body != "" {
-				bodyReader = strings.NewReader(submission.Body)
-			}
-			if submission.ContentType != "" {
-				contentTypeOverride = submission.ContentType
-			}
-		}
+	effectiveURL := doc.URL
+	if effectiveURL == "" {
+		effectiveURL = "about:blank"
 	}
-
-	req, err := http.NewRequest(method, effectiveURL, bodyReader)
-	if err != nil {
-		return errorPage(effectiveURL, "Internal server error"), nil
+	if doc.Header == nil {
+		doc.Header = http.Header{}
 	}
-	if contentTypeOverride != "" && hdr.Get("Content-Type") == "" {
-		hdr.Set("Content-Type", contentTypeOverride)
+	if shouldOfferDownload(doc.Header) {
+		return renderDownloadPageFromDocument(doc, opts), nil
 	}
-	if hdr.Get("User-Agent") == "" {
-		hdr.Set("User-Agent", defaultUpstreamUA)
-	}
-	if hdr.Get("Accept") == "" {
-		hdr.Set("Accept", "text/html,application/xhtml+xml,*/*;q=0.8")
-	}
-	if hdr.Get("Accept-Language") == "" {
-		hdr.Set("Accept-Language", "ru,en;q=0.8")
-	}
-	if hdr.Get("Accept-Encoding") == "" {
-		hdr.Set("Accept-Encoding", "gzip")
-	}
-	for k, vs := range hdr {
-		for _, v := range vs {
-			req.Header.Add(k, v)
-		}
-	}
-	// For POST submissions, ensure Referer/Origin are present to mimic browser behavior
-	if req.Method == http.MethodPost {
-		if req.Header.Get("Referer") == "" {
-			if u, err := url.Parse(effectiveURL); err == nil {
-				ref := *u
-				ref.RawQuery = ""
-				req.Header.Set("Referer", ref.String())
-				if debugHTTP {
-					log.Printf("UPSTREAM add Referer=%s", ref.String())
-				}
-			}
-		}
-		if req.Header.Get("Origin") == "" {
-			if u, err := url.Parse(effectiveURL); err == nil {
-				origin := u.Scheme + "://" + u.Host
-				req.Header.Set("Origin", origin)
-				if debugHTTP {
-					log.Printf("UPSTREAM add Origin=%s", origin)
-				}
-			}
-		}
-	}
-	hc := &http.Client{Timeout: 15 * time.Second}
-	if opts != nil && opts.Jar != nil {
-		hc.Jar = opts.Jar
-	}
-	// Debug logging for upstream request and cookie jar behavior
-	if debugHTTP {
-		var ck string
-		if c := req.Header.Get("Cookie"); c != "" {
-			ck = c
-		}
-		xk := req.Header.Get("X-Operetta-Client-Key")
-		var jarInfo string
-		if hc.Jar != nil {
-			u := req.URL
-			if u != nil {
-				if cookies := hc.Jar.Cookies(u); len(cookies) > 0 {
-					names := make([]string, 0, len(cookies))
-					for _, c := range cookies {
-						names = append(names, c.Name)
-					}
-					jarInfo = "cookies=" + strings.Join(names, ",")
-				} else {
-					jarInfo = "cookies=0"
-				}
-			}
-		} else {
-			jarInfo = "jar=nil"
-		}
-		ct := req.Header.Get("Content-Type")
-		log.Printf("UPSTREAM req url=%s method=%s xkey=%q cookie_hdr_len=%d jar=%s ct=%q body=%t", effectiveURL, req.Method, xk, len(ck), jarInfo, ct, bodyReader != nil)
-	}
-	resp, err := hc.Do(req)
-	if err != nil {
-		return errorPage(effectiveURL, "Timeout loading page"), nil
-	}
-	defer resp.Body.Close()
-	if shouldOfferDownload(resp) {
-		page := renderDownloadPage(effectiveURL, resp, opts)
-		return page, nil
-	}
-	rawBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return errorPage(effectiveURL, "Internal server error"), nil
-	}
-	transferBytes := len(rawBody)
-	body := rawBody
-	if encoding := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Encoding"))); encoding != "" {
-		switch encoding {
-		case "gzip":
-			if gr, gerr := gzip.NewReader(bytes.NewReader(rawBody)); gerr == nil {
-				if decoded, derr := io.ReadAll(gr); derr == nil {
-					body = decoded
-				}
-				_ = gr.Close()
-			}
-		case "deflate":
-			if zr, zerr := zlib.NewReader(bytes.NewReader(rawBody)); zerr == nil {
-				if decoded, derr := io.ReadAll(zr); derr == nil {
-					body = decoded
-				}
-				_ = zr.Close()
-			} else if fr := flate.NewReader(bytes.NewReader(rawBody)); fr != nil {
-				if decoded, derr := io.ReadAll(fr); derr == nil {
-					body = decoded
-				}
-				_ = fr.Close()
-			}
-		}
+	body := doc.Body
+	if len(body) == 0 {
+		body = doc.RawBody
 	}
 	if len(body) == 0 {
-		body = rawBody
-	}
-	// Log response status and set-cookies (after potential redirects)
-	if debugHTTP {
-		sc := resp.Header["Set-Cookie"]
-		nsc := 0
-		if sc != nil {
-			nsc = len(sc)
-		}
-		finalURL := effectiveURL
-		if resp.Request != nil && resp.Request.URL != nil {
-			finalURL = resp.Request.URL.String()
-		}
-		log.Printf("UPSTREAM resp status=%d final=%s set-cookie=%d", resp.StatusCode, finalURL, nsc)
-		if nsc > 0 {
-			for i, v := range sc {
-				if i >= 3 {
-					break
-				}
-				log.Printf("UPSTREAM set-cookie[%d]=%s", i, v)
-			}
-		}
+		return errorPage(effectiveURL, "Empty response"), nil
 	}
 	if looksLikeOMS(body) {
-		return &Page{
-			Data:       body,
-			SetCookies: resp.Header["Set-Cookie"],
+		page := &Page{
+			Data:       append([]byte(nil), body...),
+			SetCookies: append([]string(nil), doc.SetCookies...),
 			Stats: TrafficStats{
-				OriginTransferBytes: transferBytes,
+				OriginTransferBytes: doc.TransferBytes,
 				OriginDecodedBytes:  len(body),
 				EncodedBytes:        len(body),
 			},
-		}, nil
+		}
+		return page, nil
 	}
-	utf8Body := decodeLegacyToUTF8(body, resp.Header.Get("Content-Type"))
+	utf8Body := decodeLegacyToUTF8(body, doc.Header.Get("Content-Type"))
 	decodedLen := len(utf8Body)
-	doc, err := html.Parse(bytes.NewReader(utf8Body))
+	parsed, err := html.Parse(bytes.NewReader(utf8Body))
 	if err != nil {
 		return errorPage(effectiveURL, "Internal server error while parsing"), nil
 	}
@@ -3844,7 +3862,8 @@ func LoadPageWithHeadersAndOptions(oURL string, hdr http.Header, opts *RenderOpt
 		jar = opts.Jar
 	}
 	p := NewPage()
-	p.Stats.OriginTransferBytes = transferBytes
+	p.SetCookies = append([]string(nil), doc.SetCookies...)
+	p.Stats.OriginTransferBytes = doc.TransferBytes
 	p.Stats.OriginDecodedBytes = decodedLen
 	p.AddString("1/" + effectiveURL)
 	if rp.AuthCode != "" {
@@ -3858,16 +3877,16 @@ func LoadPageWithHeadersAndOptions(oURL string, hdr http.Header, opts *RenderOpt
 	if i := strings.Index(base, "?"); i != -1 {
 		base = base[:i]
 	}
-	base = findBaseURL(doc, base)
+	base = findBaseURL(parsed, base)
 	rp.ReqHeaders = hdr
 	rp.Referrer = effectiveURL
-	rp.Styles = buildStylesheet(doc, base, hdr, jar)
+	rp.Styles = buildStylesheet(parsed, base, hdr, jar)
 	chosenCol := ""
 	chosenBg := ""
-	if body := findFirstByTag(doc, "body"); body != nil {
+	if bodyNode := findFirstByTag(parsed, "body"); bodyNode != nil {
 		var bgHex, fgHex string
 		if rp.Styles != nil {
-			if props := computeStyleFor(body, rp.Styles); props != nil {
+			if props := computeStyleFor(bodyNode, rp.Styles); props != nil {
 				if v := props["background-color"]; v != "" {
 					bgHex = v
 				}
@@ -3877,21 +3896,21 @@ func LoadPageWithHeadersAndOptions(oURL string, hdr http.Header, opts *RenderOpt
 			}
 		}
 		if fgHex == "" {
-			if v := getAttr(body, "text"); v != "" {
+			if v := getAttr(bodyNode, "text"); v != "" {
 				fgHex = v
 			}
 		}
 		if bgHex == "" {
-			if v := getAttr(body, "bgcolor"); v != "" {
+			if v := getAttr(bodyNode, "bgcolor"); v != "" {
 				bgHex = v
 			}
 		}
 		if bgHex == "" {
-			if v := getAttr(body, "bgcolor"); v != "" {
+			if v := getAttr(bodyNode, "bgcolor"); v != "" {
 				bgHex = v
 			}
 		}
-		if stl := getAttr(body, "style"); stl != "" {
+		if stl := getAttr(bodyNode, "style"); stl != "" {
 			if v := parseCssColor(stl, "background-color"); v != "" {
 				bgHex = v
 			}
@@ -3922,7 +3941,7 @@ func LoadPageWithHeadersAndOptions(oURL string, hdr http.Header, opts *RenderOpt
 	}
 	st.css = rp.Styles
 	p.AddStyle(styleDefault)
-	walkRich(doc, base, p, visited, &st, rp)
+	walkRich(parsed, base, p, visited, &st, rp)
 	if len(p.SetCookies) > 0 {
 		var pairs []string
 		for _, sc := range p.SetCookies {
@@ -3967,9 +3986,6 @@ func LoadPageWithHeadersAndOptions(oURL string, hdr http.Header, opts *RenderOpt
 	if pageIdx < 1 {
 		pageIdx = 1
 	}
-	// Pack full raw page once for cache so later selections (page>1) operate on
-	// the complete document, not on the already-sliced first page with nav.
-	// This fixes the issue where clicking page=2 could return page 1 from cache.
 	{
 		fullRaw := append([]byte(nil), p.Data...)
 		packed := NewPage()
@@ -3991,8 +4007,6 @@ func LoadPageWithHeadersAndOptions(oURL string, hdr http.Header, opts *RenderOpt
 	if rp.ClientVersion == ClientVersion3 {
 		styleDataLen = 6
 	}
-	// Rewrite only for pages >1 so OM2 history treats them as distinct.
-	// Do NOT rewrite page 1 to avoid style regressions on return.
 	if pageIdx > 1 {
 		sel = rewriteInitialURLRaw(sel, pageIdx)
 	}
@@ -4048,11 +4062,11 @@ func LoadPageWithHeadersAndOptions(oURL string, hdr http.Header, opts *RenderOpt
 		lastShown := 0
 		for _, n := range ordered {
 			if lastShown != 0 && n-lastShown > 1 {
-				nav.AddText("…")
+				nav.AddText("...")
 			}
 			label := fmt.Sprintf("[%d]", n)
 			if n == pageIdx {
-				nav.AddText("•" + label)
+				nav.AddText("*" + label)
 			} else {
 				pageURL := effectiveURL
 				if n > 1 {
@@ -4063,37 +4077,9 @@ func LoadPageWithHeadersAndOptions(oURL string, hdr http.Header, opts *RenderOpt
 			lastShown = n
 		}
 		nav.AddBreak()
-		/*
-			////nav.AddText(fmt.Sprintf("Выбор страницы (1…%d)", len(parts)))
-			////nav.AddBreak()
-			////formAction := "0/" + serverBase + "/fetch"
-			////nav.AddForm(formAction)
-			////nav.AddHidden("url", effectiveURL)
-			////if maxTags > 0 {
-			////	nav.AddHidden("pp", strconv.Itoa(maxTags))
-			////}
-			////if rp.ImagesOn {
-			////	nav.AddHidden("img", "1")
-			////}
-			////if rp.HighQuality {
-			////	nav.AddHidden("hq", "1")
-			////}
-			////if rp.ImageMIME != "" {
-			////	nav.AddHidden("mime", rp.ImageMIME)
-			////}
-			////if rp.MaxInlineKB > 0 {
-			////	nav.AddHidden("maxkb", strconv.Itoa(rp.MaxInlineKB))
-			////}
-			////nav.AddTextInput("page", "")
-			////nav.AddText(" ")
-			////nav.AddSubmit("go", "OK")
-			////nav.AddHr("")
-		*/
-		// Ensure final raw page (content + nav) does not exceed per-part byte budget.
-		// Shrink the selected chunk before appending nav.
 		budget := maxBytesBudget()
 		allowed := budget - len(nav.Data)
-		if allowed < 1024 { // keep a sane minimal room for content
+		if allowed < 1024 {
 			allowed = 1024
 		}
 		sel = shrinkPartToMaxBytes(sel, allowed, styleDataLen)
@@ -4105,6 +4091,210 @@ func LoadPageWithHeadersAndOptions(oURL string, hdr http.Header, opts *RenderOpt
 	p.SetTransport(rp.ClientVersion, rp.Compression)
 	p.finalize()
 	return p, nil
+}
+
+// LoadPageWithHeadersAndOptions performs HTTP GET with optional headers and rendering options.
+func LoadPageWithHeadersAndOptions(oURL string, hdr http.Header, opts *RenderOptions) (*Page, error) {
+	return LoadPageWithHeadersAndOptionsCtx(context.Background(), oURL, hdr, opts)
+}
+
+func LoadPageWithHeadersAndOptionsCtx(ctx context.Context, oURL string, hdr http.Header, opts *RenderOptions) (*Page, error) {
+	effectiveURL := oURL
+	method := http.MethodGet
+	var bodyReader io.Reader
+	var contentTypeOverride string
+	debugHTTP := os.Getenv("OMS_HTTP_DEBUG") == "1"
+
+	if hdr == nil {
+		hdr = http.Header{}
+	}
+
+	if opts != nil {
+		if fb := strings.TrimSpace(opts.FormBody); fb != "" && fb != "0" {
+			if vals, err := url.ParseQuery(fb); err == nil {
+				var parts []string
+				for k, vs := range vals {
+					v := ""
+					if len(vs) > 0 {
+						v = vs[0]
+					}
+					masked := v
+					lk := strings.ToLower(k)
+					if strings.Contains(lk, "pass") || strings.Contains(lk, "pwd") || strings.Contains(lk, "token") {
+						masked = "***"
+					}
+					parts = append(parts, fmt.Sprintf("%s(len=%d)=%s", k, len(v), masked))
+				}
+				log.Printf("FORM payload keys: %s", strings.Join(parts, ", "))
+			} else {
+				log.Printf("FORM payload raw len=%d", len(fb))
+			}
+		}
+		if submission := prepareOperaMiniSubmission(oURL, opts.FormBody); submission != nil {
+			log.Printf("SUBMISSION plan method=%s url=%s body_len=%d ct=%s", submission.Method, submission.URL, len(submission.Body), submission.ContentType)
+			if submission.URL != "" {
+				effectiveURL = submission.URL
+			}
+			if submission.Method != "" {
+				method = submission.Method
+			}
+			if submission.Body != "" {
+				bodyReader = strings.NewReader(submission.Body)
+			}
+			if submission.ContentType != "" {
+				contentTypeOverride = submission.ContentType
+			}
+		}
+	}
+
+	req, err := http.NewRequestWithContext(ctx, method, effectiveURL, bodyReader)
+	if err != nil {
+		return errorPage(effectiveURL, "Internal server error"), nil
+	}
+	if contentTypeOverride != "" && hdr.Get("Content-Type") == "" {
+		hdr.Set("Content-Type", contentTypeOverride)
+	}
+	if hdr.Get("User-Agent") == "" {
+		hdr.Set("User-Agent", defaultUpstreamUA)
+	}
+	if hdr.Get("Accept") == "" {
+		hdr.Set("Accept", "text/html,application/xhtml+xml,*/*;q=0.8")
+	}
+	if hdr.Get("Accept-Language") == "" {
+		hdr.Set("Accept-Language", "ru,en;q=0.8")
+	}
+	if hdr.Get("Accept-Encoding") == "" {
+		hdr.Set("Accept-Encoding", "gzip")
+	}
+	for k, vs := range hdr {
+		for _, v := range vs {
+			req.Header.Add(k, v)
+		}
+	}
+	if req.Method == http.MethodPost {
+		if req.Header.Get("Referer") == "" {
+			if u, err := url.Parse(effectiveURL); err == nil {
+				ref := *u
+				ref.RawQuery = ""
+				req.Header.Set("Referer", ref.String())
+				if debugHTTP {
+					log.Printf("UPSTREAM add Referer=%s", ref.String())
+				}
+			}
+		}
+		if req.Header.Get("Origin") == "" {
+			if u, err := url.Parse(effectiveURL); err == nil {
+				origin := u.Scheme + "://" + u.Host
+				req.Header.Set("Origin", origin)
+				if debugHTTP {
+					log.Printf("UPSTREAM add Origin=%s", origin)
+				}
+			}
+		}
+	}
+	hc := &http.Client{Timeout: 15 * time.Second}
+	if opts != nil && opts.Jar != nil {
+		hc.Jar = opts.Jar
+	}
+	if debugHTTP {
+		var ck string
+		if c := req.Header.Get("Cookie"); c != "" {
+			ck = c
+		}
+		xk := req.Header.Get("X-Operetta-Client-Key")
+		var jarInfo string
+		if hc.Jar != nil {
+			if u := req.URL; u != nil {
+				if cookies := hc.Jar.Cookies(u); len(cookies) > 0 {
+					names := make([]string, 0, len(cookies))
+					for _, c := range cookies {
+						names = append(names, c.Name)
+					}
+					jarInfo = "cookies=" + strings.Join(names, ",")
+				} else {
+					jarInfo = "cookies=0"
+				}
+			}
+		} else {
+			jarInfo = "jar=nil"
+		}
+		ct := req.Header.Get("Content-Type")
+		log.Printf("UPSTREAM req url=%s method=%s xkey=%q cookie_hdr_len=%d jar=%s ct=%q body=%t", effectiveURL, req.Method, xk, len(ck), jarInfo, ct, bodyReader != nil)
+	}
+	resp, err := hc.Do(req)
+	if err != nil {
+		return errorPage(effectiveURL, "Timeout loading page"), nil
+	}
+	defer resp.Body.Close()
+
+	rawBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return errorPage(effectiveURL, "Internal server error"), nil
+	}
+	transferBytes := len(rawBody)
+	body := rawBody
+	if encoding := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Encoding"))); encoding != "" {
+		switch encoding {
+		case "gzip":
+			if gr, gerr := gzip.NewReader(bytes.NewReader(rawBody)); gerr == nil {
+				if decoded, derr := io.ReadAll(gr); derr == nil {
+					body = decoded
+				}
+				_ = gr.Close()
+			}
+		case "deflate":
+			if zr, zerr := zlib.NewReader(bytes.NewReader(rawBody)); zerr == nil {
+				if decoded, derr := io.ReadAll(zr); derr == nil {
+					body = decoded
+				}
+				_ = zr.Close()
+			} else if fr := flate.NewReader(bytes.NewReader(rawBody)); fr != nil {
+				if decoded, derr := io.ReadAll(fr); derr == nil {
+					body = decoded
+				}
+				_ = fr.Close()
+			}
+		}
+	}
+	if len(body) == 0 {
+		body = rawBody
+	}
+	if debugHTTP {
+		sc := resp.Header["Set-Cookie"]
+		nsc := 0
+		if sc != nil {
+			nsc = len(sc)
+		}
+		finalURL := effectiveURL
+		if resp.Request != nil && resp.Request.URL != nil {
+			finalURL = resp.Request.URL.String()
+		}
+		log.Printf("UPSTREAM resp status=%d final=%s set-cookie=%d", resp.StatusCode, finalURL, nsc)
+		if nsc > 0 {
+			for i, v := range sc {
+				if i >= 3 {
+					break
+				}
+				log.Printf("UPSTREAM set-cookie[%d]=%s", i, v)
+			}
+		}
+	}
+
+	finalURL := effectiveURL
+	if resp.Request != nil && resp.Request.URL != nil {
+		finalURL = resp.Request.URL.String()
+	}
+	doc := &UpstreamDocument{
+		URL:           finalURL,
+		RawBody:       append([]byte(nil), rawBody...),
+		Body:          append([]byte(nil), body...),
+		TransferBytes: transferBytes,
+		Header:        cloneHeader(resp.Header),
+		Status:        resp.StatusCode,
+		ContentLength: resp.ContentLength,
+		SetCookies:    append([]string(nil), resp.Header["Set-Cookie"]...),
+	}
+	return RenderDocument(doc, hdr, opts)
 }
 
 type formSubmission struct {
@@ -4318,138 +4508,6 @@ func looksLikeActionKey(key string) bool {
 		return true
 	}
 	return strings.HasPrefix(key, "/")
-}
-
-func shouldOfferDownload(resp *http.Response) bool {
-	if resp == nil {
-		return false
-	}
-	if cd := strings.ToLower(resp.Header.Get("Content-Disposition")); cd != "" && strings.Contains(cd, "attachment") {
-		return true
-	}
-	ct := strings.TrimSpace(resp.Header.Get("Content-Type"))
-	if ct == "" {
-		return false
-	}
-	mediaType := strings.ToLower(ct)
-	if mt, _, err := mime.ParseMediaType(ct); err == nil {
-		mediaType = strings.ToLower(mt)
-	}
-	if mediaType == "" {
-		return false
-	}
-	if strings.Contains(mediaType, "html") || strings.Contains(mediaType, "xml") {
-		return false
-	}
-	if strings.HasPrefix(mediaType, "text/") {
-		return false
-	}
-	switch mediaType {
-	case "application/json", "application/javascript":
-		return false
-	case "application/octet-stream":
-		// Normal OMS responses use application/octet-stream; only treat as download
-		// when server explicitly marks it as an attachment.
-		if cd := resp.Header.Get("Content-Disposition"); cd == "" {
-			return false
-		}
-	}
-	return true
-}
-
-func renderDownloadPage(effectiveURL string, resp *http.Response, opts *RenderOptions) *Page {
-	page := NewPage()
-	page.AddString("1/" + effectiveURL)
-	page.AddStyle(styleDefault)
-
-	ct := strings.TrimSpace(resp.Header.Get("Content-Type"))
-	if mt, _, err := mime.ParseMediaType(ct); err == nil {
-		ct = mt
-	}
-	filename := fileNameFromResponse(resp, effectiveURL)
-	sizeText := humanReadableSize(resp.ContentLength)
-
-	page.AddText("Download file")
-	page.AddBreak()
-	page.AddBreak()
-	if filename != "" {
-		page.AddText("Name: " + filename)
-		page.AddBreak()
-	}
-	if sizeText != "" {
-		page.AddText("Size: " + sizeText)
-		page.AddBreak()
-	}
-	if ct != "" {
-		page.AddText("Type: " + ct)
-		page.AddBreak()
-	}
-	page.AddBreak()
-
-	downloadLink := buildDownloadLink(opts, effectiveURL, resp, filename, false)
-	page.AddLink("0/"+downloadLink, "[Download]")
-
-	if strings.HasPrefix(strings.ToLower(ct), "video/3gpp") {
-		page.AddBreak()
-		streamLink := buildDownloadLink(opts, effectiveURL, resp, filename, true)
-		page.AddLink("0/"+streamLink, "[Play]")
-		page.AddText(" Opens external player")
-	}
-
-	page.AddBreak()
-	page.AddLink("0/"+effectiveURL, "[Open original]")
-
-	if resp != nil {
-		page.SetCookies = append([]string(nil), resp.Header["Set-Cookie"]...)
-	}
-	page.NoCache = true
-	page.finalize()
-	return page
-}
-
-func buildDownloadLink(opts *RenderOptions, effectiveURL string, resp *http.Response, filename string, stream bool) string {
-	values := url.Values{}
-	values.Set("url", effectiveURL)
-	if ct := strings.TrimSpace(resp.Header.Get("Content-Type")); ct != "" {
-		values.Set("ct", ct)
-	}
-	if filename != "" {
-		values.Set("name", filename)
-	}
-	values.Set("ref", effectiveURL)
-	if stream {
-		values.Set("mode", "stream")
-	}
-	path := "/download?" + values.Encode()
-	if opts != nil && strings.TrimSpace(opts.ServerBase) != "" {
-		base := strings.TrimRight(opts.ServerBase, "/")
-		return base + path
-	}
-	return path
-}
-
-func fileNameFromResponse(resp *http.Response, rawURL string) string {
-	if resp != nil {
-		if cd := resp.Header.Get("Content-Disposition"); cd != "" {
-			if _, params, err := mime.ParseMediaType(cd); err == nil {
-				if name := params["filename"]; name != "" {
-					if decoded, err := url.QueryUnescape(name); err == nil {
-						return decoded
-					}
-					return name
-				}
-			}
-		}
-	}
-	if u, err := url.Parse(rawURL); err == nil {
-		if base := path.Base(u.Path); base != "" && base != "/" {
-			if decoded, err := url.PathUnescape(base); err == nil {
-				return decoded
-			}
-			return base
-		}
-	}
-	return ""
 }
 
 func humanReadableSize(n int64) string {
