@@ -42,6 +42,46 @@ func (s *Server) clientJarKey(r *http.Request, params map[string]string) string 
 	return DeriveClientKey(r)
 }
 
+func parseOperaBool(raw string) (bool, bool) {
+	val := strings.TrimSpace(strings.ToLower(raw))
+	if val == "" {
+		return false, false
+	}
+	switch val {
+	case "1", "true", "yes", "on", "enable", "enabled", "hi", "high":
+		return true, true
+	case "0", "false", "no", "off", "lo", "low", "disable", "disabled":
+		return false, true
+	}
+	if strings.HasPrefix(val, "hi") {
+		return true, true
+	}
+	if strings.HasPrefix(val, "lo") {
+		return false, true
+	}
+	if n, err := strconv.Atoi(val); err == nil {
+		return n != 0, true
+	}
+	return false, false
+}
+
+func interpretImageMode(raw string) (bool, bool) {
+	val := strings.TrimSpace(raw)
+	if val == "" {
+		return false, false
+	}
+	if n, err := strconv.Atoi(val); err == nil {
+		if n <= 1 {
+			return true, true
+		}
+		return false, true
+	}
+	if b, ok := parseOperaBool(val); ok {
+		return b, true
+	}
+	return false, false
+}
+
 func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodPost {
 		body, _ := io.ReadAll(r.Body)
@@ -90,7 +130,37 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if debugHTTP {
-			s.logger.Printf("Parsed params: c=%q, h=%q, u=%q", params["c"], params["h"], params["u"])
+			keys := keysOf(params)
+			sort.Strings(keys)
+			fullKeys := map[string]struct{}{
+				"d": {},
+				"w": {},
+				"g": {},
+				"n": {},
+				"t": {},
+				"s": {},
+			}
+			var pairs []string
+			for _, k := range keys {
+				if k == "" {
+					continue
+				}
+				v := params[k]
+				mask := strings.ToLower(k)
+				display := v
+				if strings.Contains(mask, "pass") || strings.Contains(mask, "pwd") {
+					display = "***"
+				} else {
+					if _, full := fullKeys[strings.ToLower(k)]; !full && len(display) > 32 {
+						display = display[:32] + "..."
+					}
+				}
+				pairs = append(pairs, fmt.Sprintf("%s=%q", k, display))
+			}
+			s.logger.Printf("Parsed params: c=%q, h=%q, u=%q keys=%v", params["c"], params["h"], params["u"], keys)
+			if len(pairs) > 0 {
+				s.logger.Printf("Param snapshot: %s", strings.Join(pairs, ", "))
+			}
 		}
 
 		// Ensure per-client auth tokens are present or create them.
@@ -500,20 +570,38 @@ func (s *Server) renderOptionsFromParams(r *http.Request, params map[string]stri
 	if km := params["k"]; strings.HasPrefix(strings.ToLower(km), "image/") {
 		opt.ImageMIME = km
 	}
+	if v := params["i"]; v != "" {
+		if b, ok := interpretImageMode(v); ok {
+			opt.ImagesOn = b
+		}
+	}
+	if v := params["img"]; v != "" {
+		if b, ok := interpretImageMode(v); ok {
+			opt.ImagesOn = b
+		}
+	}
 	opt.Compression = oms.CompressionFromParam(params["e"])
 	if dv := params["d"]; dv != "" {
 		for _, part := range strings.Split(dv, ";") {
-			kv := strings.SplitN(strings.TrimSpace(part), ":", 2)
-			if len(kv) != 2 {
+			item := strings.TrimSpace(part)
+			if item == "" {
 				continue
 			}
-			key := strings.TrimSpace(kv[0])
-			val := strings.TrimSpace(kv[1])
+			idx := strings.IndexAny(item, ":=")
+			if idx == -1 {
+				continue
+			}
+			key := strings.TrimSpace(strings.ToLower(item[:idx]))
+			val := strings.TrimSpace(item[idx+1:])
 			switch key {
 			case "i":
-				opt.ImagesOn = val == "1"
+				if b, ok := interpretImageMode(val); ok {
+					opt.ImagesOn = b
+				}
 			case "q":
-				opt.HighQuality = val == "1"
+				if b, ok := parseOperaBool(val); ok {
+					opt.HighQuality = b
+				}
 			case "w":
 				if n, err := strconv.Atoi(val); err == nil && n > 0 {
 					opt.ScreenW = n
@@ -535,6 +623,11 @@ func (s *Server) renderOptionsFromParams(r *http.Request, params map[string]stri
 					opt.AlphaLevels = n
 				}
 			}
+		}
+	}
+	if v := params["hq"]; v != "" {
+		if b, ok := parseOperaBool(v); ok {
+			opt.HighQuality = b
 		}
 	}
 	opt.AuthCode = params["c"]
@@ -587,11 +680,15 @@ func (s *Server) renderOptionsFromParams(r *http.Request, params map[string]stri
 func (s *Server) renderOptionsFromQuery(r *http.Request, hdr http.Header) *oms.RenderOptions {
 	q := r.URL.Query()
 	opt := defaultRenderOptions()
-	if q.Get("img") == "1" {
-		opt.ImagesOn = true
+	if v := q.Get("img"); v != "" {
+		if b, ok := interpretImageMode(v); ok {
+			opt.ImagesOn = b
+		}
 	}
-	if q.Get("hq") == "1" {
-		opt.HighQuality = true
+	if v := q.Get("hq"); v != "" {
+		if b, ok := parseOperaBool(v); ok {
+			opt.HighQuality = b
+		}
 	}
 	if v := strings.TrimSpace(q.Get("mime")); strings.HasPrefix(strings.ToLower(v), "image/") {
 		opt.ImageMIME = v

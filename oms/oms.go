@@ -969,6 +969,24 @@ func getAttr(n *html.Node, name string) string {
 	return ""
 }
 
+func boolAttr(n *html.Node, name string) bool {
+	for _, a := range n.Attr {
+		if strings.EqualFold(a.Key, name) {
+			val := strings.TrimSpace(strings.ToLower(a.Val))
+			if val == "" {
+				return true
+			}
+			switch val {
+			case "0", "false", "no", "off":
+				return false
+			default:
+				return true
+			}
+		}
+	}
+	return false
+}
+
 func findTextNode(n *html.Node, visited map[*html.Node]bool) *html.Node {
 	for c := n.FirstChild; c != nil; c = c.NextSibling {
 		if c.Type == html.TextNode && !visited[c] {
@@ -1001,6 +1019,42 @@ func resolveLink(base, href string) string {
 	return "0/" + href
 }
 
+func renderImageFromURL(p *Page, st *walkState, base, src, alt string, prefs RenderOptions) {
+	src = strings.TrimSpace(src)
+	alt = strings.TrimSpace(alt)
+	if alt == "" {
+		alt = "Image"
+	}
+	if !prefs.ImagesOn || src == "" {
+		p.AddText("[" + alt + "]")
+		return
+	}
+	abs := resolveLink(base, src)
+	if ib, w, h, ok := fetchAndEncodeImage(abs[2:], prefs); ok {
+		if len(ib) <= prefs.MaxInlineKB*1024 {
+			p.AddImageInline(w, h, ib)
+		} else {
+			if st != nil && st.inLink {
+				p.AddImagePlaceholder(w, h)
+			} else {
+				p.addTag('L')
+				p.AddString(abs)
+				p.AddImagePlaceholder(w, h)
+				p.addTag('E')
+			}
+		}
+		return
+	}
+	if st != nil && st.inLink {
+		p.AddImagePlaceholder(0, 0)
+		return
+	}
+	p.addTag('L')
+	p.AddString(abs)
+	p.AddImagePlaceholder(0, 0)
+	p.addTag('E')
+}
+
 func walk(n *html.Node, base string, p *Page) {
 	visited := map[*html.Node]bool{}
 	// Apply a default style once to stabilize rendering
@@ -1016,18 +1070,50 @@ func pickSrcFromSrcset(srcset string) string {
 	if s == "" {
 		return ""
 	}
-	// srcset: comma-separated candidates; each candidate: URL [descriptor]
-	parts := strings.Split(s, ",")
-	for _, p := range parts {
-		p = strings.TrimSpace(p)
-		if p == "" {
-			continue
+	n := len(s)
+	i := 0
+	for i < n {
+		// Skip delimiters and whitespace
+		for i < n && (s[i] == ',' || s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r') {
+			i++
 		}
-		// URL is first token until space
-		sp := strings.SplitN(p, " ", 2)
-		url := strings.TrimSpace(sp[0])
+		if i >= n {
+			break
+		}
+		start := i
+		sawSpace := false
+		for i < n {
+			ch := s[i]
+			if ch == '\'' || ch == '"' {
+				quote := ch
+				i++
+				for i < n && s[i] != quote {
+					i++
+				}
+				if i < n {
+					i++
+				}
+				continue
+			}
+			if ch == ',' {
+				if sawSpace {
+					break
+				}
+				i++
+				continue
+			}
+			if ch == ' ' || ch == '\t' || ch == '\n' || ch == '\r' {
+				sawSpace = true
+				break
+			}
+			i++
+		}
+		url := strings.Trim(s[start:i], " \t\r\n\"'")
 		if url != "" {
 			return url
+		}
+		for i < n && s[i] != ',' {
+			i++
 		}
 	}
 	return ""
@@ -1758,12 +1844,6 @@ func renderBackgroundImage(n *html.Node, props map[string]string, base string, p
 	if n == nil || p == nil {
 		return false
 	}
-	// Render small decorative backgrounds even when images are globally off
-	// (icons, sprites). We keep hard limit by dimensions below.
-	allowWhenImagesOff := true
-	if !prefs.ImagesOn && !allowWhenImagesOff {
-		return false
-	}
 	// Never draw background sprites directly on form controls to avoid
 	// covering native widgets (search button/inputs etc.).
 	if n.Type == html.ElementNode && isFormControlTag(n.Data) {
@@ -1784,6 +1864,13 @@ func renderBackgroundImage(n *html.Node, props map[string]string, base string, p
 	urlVal := extractBackgroundImageURL(bgVal)
 	if urlVal == "" {
 		return false
+	}
+	if !prefs.ImagesOn {
+		if hasTextContent(n) {
+			return false
+		}
+		p.AddText("*")
+		return true
 	}
 	// No tag restriction: any element can carry a small decorative background
 	if hasTextContent(n) {
@@ -2744,8 +2831,7 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 					src = strings.TrimSpace(getAttr(c, "data-lazy-src"))
 				}
 			}
-			rawAlt := strings.TrimSpace(getAttr(c, "alt"))
-			alt := rawAlt
+			alt := strings.TrimSpace(getAttr(c, "alt"))
 			if alt == "" {
 				if hasAncestorClass(c, "nl") {
 					alt = "Icon"
@@ -2753,43 +2839,13 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 					alt = "Image"
 				}
 			}
-			if !prefs.ImagesOn || src == "" {
-				p.AddText("[" + alt + "]")
-				recurse = false
-				break
-			}
-			abs := resolveLink(base, src)
-			// Try to inline small images; otherwise use a link+placeholder
-			if ib, w, h, ok := fetchAndEncodeImage(abs[2:], prefs); ok { // abs has leading "0/"
-				if len(ib) <= prefs.MaxInlineKB*1024 {
-					p.AddImageInline(w, h, ib)
-				} else {
-					if st.inLink {
-						p.AddImagePlaceholder(w, h)
-					} else {
-						p.addTag('L')
-						p.AddString(abs)
-						p.AddImagePlaceholder(w, h)
-						p.addTag('E')
-					}
-				}
-			} else {
-				// Fallback: clickable image link with placeholder (unknown size)
-				if st.inLink {
-					p.AddImagePlaceholder(0, 0)
-				} else {
-					p.addTag('L')
-					p.AddString(abs)
-					p.AddImagePlaceholder(0, 0)
-					p.addTag('E')
-				}
-			}
+			renderImageFromURL(p, st, base, src, alt, prefs)
 			recurse = false
 		case "caption":
-			if t := findTextNode(c, visited); t != nil {
-				visited[t] = true
+			if txt := strings.TrimSpace(collectText(c)); txt != "" {
+				markTextNodes(c, visited)
 				p.AddPlus()
-				p.AddText(strings.TrimSpace(t.Data))
+				p.AddText(txt)
 				p.AddBreak()
 			}
 			recurse = false
@@ -2837,15 +2893,16 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 			st.pushList("dl")
 		case "dt":
 			p.AddPlus()
-			if c.FirstChild != nil {
-				walkRich(c.FirstChild, base, p, visited, st, prefs)
+			if txt := strings.TrimSpace(collectText(c)); txt != "" {
+				markTextNodes(c, visited)
+				p.AddText(txt)
 			}
 			p.AddBreak()
 			recurse = false
 		case "dd":
-			p.AddText(": ")
-			if c.FirstChild != nil {
-				walkRich(c.FirstChild, base, p, visited, st, prefs)
+			if txt := strings.TrimSpace(collectText(c)); txt != "" {
+				markTextNodes(c, visited)
+				p.AddText(": " + txt)
 			}
 			p.AddBreak()
 			recurse = false
@@ -2857,8 +2914,16 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 			}
 			recurse = false
 		case "blockquote":
+			txt := strings.TrimSpace(collectText(c))
 			p.AddParagraph()
-			p.AddText("> ")
+			if txt != "" {
+				markTextNodes(c, visited)
+				p.AddText("> " + txt)
+			} else {
+				p.AddText("> ")
+			}
+			p.AddBreak()
+			recurse = false
 		case "label":
 			if t := findTextNode(c, visited); t != nil {
 				visited[t] = true
@@ -2923,6 +2988,14 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 			if hasFormControls(c) || hasAnchorLinks(c) {
 				// let recursion process interactive content to preserve links
 			} else {
+				if cap := findFirstChild(c, "caption"); cap != nil {
+					if txt := strings.TrimSpace(collectText(cap)); txt != "" {
+						markTextNodes(cap, visited)
+						p.AddPlus()
+						p.AddText(txt)
+						p.AddBreak()
+					}
+				}
 				// Traverse sections and rows: thead/tbody/tfoot/tr
 				for sec := c.FirstChild; sec != nil; sec = sec.NextSibling {
 					if sec.Type != html.ElementNode {
@@ -3002,7 +3075,13 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 				}
 			}
 			if chosen != "" {
-				p.AddLink(resolveLink(base, chosen), "[Image]")
+				alt := "Image"
+				if img := findFirstChild(c, "img"); img != nil {
+					if a := strings.TrimSpace(getAttr(img, "alt")); a != "" {
+						alt = a
+					}
+				}
+				renderImageFromURL(p, st, base, chosen, alt, prefs)
 			}
 			recurse = false
 		case "form":
@@ -3062,13 +3141,13 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 			case "submit":
 				p.AddSubmit(name, value)
 			case "checkbox":
-				checked := strings.EqualFold(getAttr(c, "checked"), "true")
+				checked := boolAttr(c, "checked")
 				if value == "" {
 					value = "on"
 				}
 				p.AddCheckbox(name, value, checked)
 			case "radio":
-				checked := strings.EqualFold(getAttr(c, "checked"), "true")
+				checked := boolAttr(c, "checked")
 				if value == "" {
 					value = "on"
 				}
@@ -3101,7 +3180,7 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 			if name == "" {
 				name = "dname"
 			}
-			multiple := strings.EqualFold(getAttr(c, "multiple"), "true") || getAttr(c, "multiple") != ""
+			multiple := boolAttr(c, "multiple")
 			type option struct {
 				label, value string
 				selected     bool
@@ -3119,7 +3198,7 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 					if val == "" {
 						val = label
 					}
-					sel := strings.EqualFold(getAttr(oc, "selected"), "true") || getAttr(oc, "selected") != ""
+					sel := boolAttr(oc, "selected")
 					opts = append(opts, option{label: label, value: val, selected: sel, textNode: txt})
 				}
 			}
