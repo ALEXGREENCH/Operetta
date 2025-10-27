@@ -1421,77 +1421,62 @@ func fileNameFromDocument(doc *UpstreamDocument) string {
 	return ""
 }
 
-// BuildPaginationQuery encodes paging parameters while preserving render options that affect output quality.
-func BuildPaginationQuery(target string, opts *RenderOptions, page, maxTags int) string {
-	// For page 1, return a minimal query and strip our internal paging marker
-	// from target ("__p=") so the first page opens exactly like the initial
-	// load and can be satisfied from client cache.
-	if page <= 1 {
-		t := target
-		if u, err := url.Parse(target); err == nil {
-			q := u.Query()
-			if q.Has("__p") {
-				q.Del("__p")
-				u.RawQuery = q.Encode()
-				t = u.String()
-			}
+// BuildPaginationLink returns a target URL with a pseudo-anchor that preserves render options without leaking the proxy endpoint.
+func BuildPaginationLink(target string, opts *RenderOptions, page, maxTags int) string {
+	clean := target
+	if u, err := url.Parse(target); err == nil {
+		q := u.Query()
+		if q.Has("__p") && page <= 1 {
+			q.Del("__p")
+			u.RawQuery = q.Encode()
 		}
-		vals := url.Values{}
-		vals.Set("url", t)
-		return vals.Encode()
+		u.Fragment = ""
+		clean = u.String()
 	}
-	vals := url.Values{}
-	vals.Set("url", target)
+	if page <= 1 {
+		return clean
+	}
+	frag := url.Values{}
+	frag.Set("page", strconv.Itoa(page))
 	if maxTags > 0 {
-		vals.Set("pp", strconv.Itoa(maxTags))
+		frag.Set("pp", strconv.Itoa(maxTags))
 	}
-	vals.Set("page", strconv.Itoa(page))
 	if opts != nil {
 		if opts.ImagesOn {
-			vals.Set("img", "1")
+			frag.Set("img", "1")
+		} else {
+			frag.Set("img", "2")
 		}
 		if opts.HighQuality {
-			vals.Set("hq", "1")
+			frag.Set("hq", "1")
 		}
 		if opts.ImageMIME != "" {
-			vals.Set("mime", opts.ImageMIME)
+			frag.Set("mime", opts.ImageMIME)
 		}
 		if opts.MaxInlineKB > 0 {
-			vals.Set("maxkb", strconv.Itoa(opts.MaxInlineKB))
+			frag.Set("maxkb", strconv.Itoa(opts.MaxInlineKB))
 		}
 		if opts.ScreenW > 0 {
-			vals.Set("w", strconv.Itoa(opts.ScreenW))
+			frag.Set("w", strconv.Itoa(opts.ScreenW))
 		}
 		if opts.ScreenH > 0 {
-			vals.Set("h", strconv.Itoa(opts.ScreenH))
+			frag.Set("h", strconv.Itoa(opts.ScreenH))
 		}
-		// Only propagate memory/alpha when client explicitly provided them (>0)
 		if opts.HeapBytes > 0 {
-			vals.Set("m", strconv.Itoa(opts.HeapBytes))
+			frag.Set("m", strconv.Itoa(opts.HeapBytes))
 		}
 		if opts.AlphaLevels > 0 {
-			vals.Set("l", strconv.Itoa(opts.AlphaLevels))
+			frag.Set("l", strconv.Itoa(opts.AlphaLevels))
 		}
-		// Preserve Opera Mini auth echo and client discriminator so
-		// subsequent navigations render with the same context as the first load.
-		if strings.TrimSpace(opts.AuthCode) != "" {
-			vals.Set("c", opts.AuthCode)
-		}
-		if strings.TrimSpace(opts.AuthPrefix) != "" {
-			vals.Set("h", opts.AuthPrefix)
-		}
-		if opts.GatewayVersion > 0 {
-			vals.Set("o", strconv.Itoa(opts.GatewayVersion))
-		}
-		// Some clients pass explicit protocol version; keep it if caller set it.
-		switch normalizeClientVersion(opts.ClientVersion) {
-		case ClientVersion1:
-			vals.Set("version", "1")
-		case ClientVersion3:
-			vals.Set("version", "3")
+		if opts.NumColors > 0 {
+			frag.Set("c", strconv.Itoa(opts.NumColors))
 		}
 	}
-	return vals.Encode()
+	encoded := frag.Encode()
+	if encoded == "" {
+		return clean
+	}
+	return clean + "#__om=" + encoded
 }
 
 // GetAttr is an exported helper for debug code paths.
@@ -4097,19 +4082,14 @@ func RenderDocument(doc *UpstreamDocument, hdr http.Header, opts *RenderOptions)
 		nav := NewPage()
 		nav.AddHr("")
 		if pageIdx > 1 {
-			var prevURL string
-			if pageIdx-1 <= 1 {
-				prevURL = effectiveURL
-			} else {
-				prevURL = serverBase + "/fetch?" + BuildPaginationQuery(effectiveURL, &rp, pageIdx-1, maxTags)
-			}
+			prevURL := BuildPaginationLink(effectiveURL, &rp, pageIdx-1, maxTags)
 			nav.AddLink("0/"+prevURL, "[<<]")
 		} else {
 			nav.AddText("[<<]")
 		}
 		nav.AddText(" ")
 		if pageIdx < len(parts) {
-			nextURL := serverBase + "/fetch?" + BuildPaginationQuery(effectiveURL, &rp, pageIdx+1, maxTags)
+			nextURL := BuildPaginationLink(effectiveURL, &rp, pageIdx+1, maxTags)
 			nav.AddLink("0/"+nextURL, "[>>]")
 		} else {
 			nav.AddText("[>>]")
@@ -4147,10 +4127,7 @@ func RenderDocument(doc *UpstreamDocument, hdr http.Header, opts *RenderOptions)
 			if n == pageIdx {
 				nav.AddText("*" + label)
 			} else {
-				pageURL := effectiveURL
-				if n > 1 {
-					pageURL = serverBase + "/fetch?" + BuildPaginationQuery(effectiveURL, &rp, n, maxTags)
-				}
+				pageURL := BuildPaginationLink(effectiveURL, &rp, n, maxTags)
 				nav.AddLink("0/"+pageURL, label)
 			}
 			lastShown = n

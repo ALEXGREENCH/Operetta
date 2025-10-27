@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"net/http"
+	"net/url"
 	"strings"
 )
 
@@ -50,6 +51,34 @@ func normalizeObmlURL(u string) string {
 		s = "http://" + s
 	}
 	return s
+}
+
+func extractOMFragment(raw string) (string, map[string]string) {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		return raw, nil
+	}
+	frag := strings.TrimSpace(parsed.Fragment)
+	parsed.Fragment = ""
+	base := parsed.String()
+	if frag == "" {
+		return base, nil
+	}
+	if !strings.HasPrefix(frag, "__om=") {
+		return base, nil
+	}
+	data := strings.TrimPrefix(frag, "__om=")
+	vals, err := url.ParseQuery(data)
+	if err != nil {
+		return base, nil
+	}
+	out := make(map[string]string, len(vals))
+	for k, vs := range vals {
+		if len(vs) > 0 {
+			out[k] = vs[0]
+		}
+	}
+	return base, out
 }
 
 func firstNonEmpty(values ...string) string {

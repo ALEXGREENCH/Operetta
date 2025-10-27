@@ -303,13 +303,8 @@ func SelectOMSPartFromPackedWithNav(data []byte, page, maxTags int, serverBase, 
 		nav.AddHr("")
 		// Prev block
 		if cur > 1 {
-			firstURL := target
-			var prevURL string
-			if cur-1 <= 1 {
-				prevURL = target
-			} else {
-				prevURL = serverBase + "/fetch?" + BuildPaginationQuery(target, &rp, cur-1, maxTags)
-			}
+			firstURL := BuildPaginationLink(target, &rp, 1, maxTags)
+			prevURL := BuildPaginationLink(target, &rp, cur-1, maxTags)
 			nav.AddLink("0/"+firstURL, "[<<]")
 			nav.AddText(" ")
 			nav.AddLink("0/"+prevURL, "[<]")
@@ -351,7 +346,7 @@ func SelectOMSPartFromPackedWithNav(data []byte, page, maxTags int, serverBase, 
 				if n == 1 {
 					url = "0/" + target
 				} else {
-					url = "0/" + serverBase + "/fetch?" + BuildPaginationQuery(target, &rp, n, maxTags)
+					url = "0/" + BuildPaginationLink(target, &rp, n, maxTags)
 				}
 				nav.AddLink(url, label)
 			}
@@ -360,8 +355,8 @@ func SelectOMSPartFromPackedWithNav(data []byte, page, maxTags int, serverBase, 
 		}
 		// Next block
 		if cur < total {
-			nextURL := serverBase + "/fetch?" + BuildPaginationQuery(target, &rp, cur+1, maxTags)
-			lastURL := serverBase + "/fetch?" + BuildPaginationQuery(target, &rp, total, maxTags)
+			nextURL := BuildPaginationLink(target, &rp, cur+1, maxTags)
+			lastURL := BuildPaginationLink(target, &rp, total, maxTags)
 			nav.AddLink("0/"+nextURL, "[>]")
 			nav.AddText(" ")
 			nav.AddLink("0/"+lastURL, "[>>]")

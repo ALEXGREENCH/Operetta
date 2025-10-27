@@ -121,6 +121,16 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 		r.Body.Close()
 		params := parseNullKV(body)
 
+		if raw := params["u"]; raw != "" {
+			base, extras := extractOMFragment(raw)
+			if len(extras) > 0 {
+				for k, v := range extras {
+					params[k] = v
+				}
+			}
+			params["u"] = base
+		}
+
 		if strings.Contains(params["h"], ".") && params["c"] == "" {
 			parts := strings.SplitN(params["h"], ".", 2)
 			params["h"] = parts[0]
@@ -662,6 +672,16 @@ func (s *Server) renderOptionsFromParams(r *http.Request, params map[string]stri
 			if n, err := strconv.Atoi(strings.TrimSpace(seg[0])); err == nil && n > 0 {
 				opt.Page = n
 			}
+		}
+	}
+	if pv := strings.TrimSpace(params["page"]); pv != "" {
+		if n, err := strconv.Atoi(pv); err == nil && n > 0 {
+			opt.Page = n
+		}
+	}
+	if ppv := strings.TrimSpace(params["pp"]); ppv != "" {
+		if n, err := strconv.Atoi(ppv); err == nil && n > 0 {
+			opt.MaxTagsPerPage = n
 		}
 	}
 	opt.ServerBase = serverBase(r)

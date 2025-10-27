@@ -88,6 +88,23 @@ func TestRenderOptionsFromParamsQuality(t *testing.T) {
 	if !imgOn.ImagesOn {
 		t.Fatalf("expected ImagesOn true for img=1, got %v", imgOn.ImagesOn)
 	}
+
+	fragParams := map[string]string{"u": "https://example.com/page#__om=page=2&pp=1600&img=2"}
+	base, extras := extractOMFragment(fragParams["u"])
+	fragParams["u"] = base
+	for k, v := range extras {
+		fragParams[k] = v
+	}
+	fragOpt := s.renderOptionsFromParams(r, fragParams, hdr, "")
+	if fragOpt.ImagesOn {
+		t.Fatalf("expected ImagesOn false from fragment, got %v", fragOpt.ImagesOn)
+	}
+	if fragOpt.Page != 2 {
+		t.Fatalf("expected fragment page=2, got %d", fragOpt.Page)
+	}
+	if fragOpt.MaxTagsPerPage != 1600 {
+		t.Fatalf("expected fragment pp=1600, got %d", fragOpt.MaxTagsPerPage)
+	}
 }
 
 func TestRenderOptionsFromQueryQuality(t *testing.T) {
