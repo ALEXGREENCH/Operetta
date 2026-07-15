@@ -8,14 +8,15 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 )
 
 // Heuristic default text style for OM2 streams (no bold by default)
 const (
 	styleDefault   uint32 = 0x00000000
-	styleBoldBit   uint32 = 0x00000001
-	styleItalicBit uint32 = 0x00000004
-	styleUnderBit  uint32 = 0x00000008
+	styleItalicBit uint32 = 0x00000001
+	styleBoldBit   uint32 = 0x00000002
+	styleUnderBit  uint32 = 0x00000004
 	styleCenterBit uint32 = 0x00000010
 	styleRightBit  uint32 = 0x00000020
 )
@@ -69,6 +70,13 @@ type TrafficStats struct {
 
 // AddString stores a string prefixed with its big-endian length.
 func (p *Page) AddString(s string) {
+	const maxOMSStringBytes = 0xffff
+	if len(s) > maxOMSStringBytes {
+		s = s[:maxOMSStringBytes]
+		for !utf8.ValidString(s) && len(s) > 0 {
+			s = s[:len(s)-1]
+		}
+	}
 	var lenBuf [2]byte
 	binary.BigEndian.PutUint16(lenBuf[:], uint16(len(s)))
 	p.addData(lenBuf[:])
@@ -111,9 +119,11 @@ func calcColor(color string) uint16 {
 }
 
 func rgb565ToRGB24(c uint16) uint32 {
-	r5 := (c >> 11) & 0x1F
+	// Historical OMS stores red in the low five bits and blue in the high
+	// five bits (the inverse of conventional RGB565 naming).
+	r5 := c & 0x1F
 	g6 := (c >> 5) & 0x3F
-	b5 := c & 0x1F
+	b5 := (c >> 11) & 0x1F
 	r8 := (r5 << 3) | (r5 >> 2)
 	g8 := (g6 << 2) | (g6 >> 4)
 	b8 := (b5 << 3) | (b5 >> 2)
@@ -164,11 +174,39 @@ func (p *Page) AddBreak() { p.addTag('B') }
 
 // AddLink adds a hyperlink with accompanying text.
 func (p *Page) AddLink(url, text string) {
-	p.addTag('L')
-	p.AddString(url)
+	p.BeginLink(url)
 	p.AddText(text)
 	p.AddBreak()
-	p.addTag('E')
+	p.EndLink()
+}
+
+// BeginLink and EndLink expose the compound link boundaries used by the
+// protocol-independent content transformer.
+func (p *Page) BeginLink(url string) {
+	p.addTag('L')
+	p.AddString(url)
+}
+
+func (p *Page) EndLink() { p.addTag('E') }
+
+// UnitCount reports emitted logical operations. It intentionally mirrors the
+// old tagCount checks used by the HTML walker.
+func (p *Page) UnitCount() int { return p.tagCount }
+
+// RecordHidden keeps form metadata alongside the encoded page.
+func (p *Page) RecordHidden(action, name, value string) {
+	if action == "" || name == "" {
+		return
+	}
+	if p.FormHidden == nil {
+		p.FormHidden = make(map[string]map[string]string)
+	}
+	if p.FormHidden[action] == nil {
+		p.FormHidden[action] = make(map[string]string)
+	}
+	if _, exists := p.FormHidden[action][name]; !exists {
+		p.FormHidden[action][name] = value
+	}
 }
 
 // AddBgcolor sets the page background color.
@@ -182,9 +220,7 @@ func (p *Page) AddBgcolor(color string) {
 	}
 	safe = ensureMinForRGB565(safe)
 	p.addTag('D')
-	var buf [2]byte
-	binary.BigEndian.PutUint16(buf[:], calcColor(safe))
-	p.addData(buf[:])
+	p.addColor(calcColor(safe))
 }
 
 // AddHr writes a horizontal line (tag 'R') with optional color.
@@ -197,8 +233,19 @@ func (p *Page) AddHr(color string) {
 	} else {
 		c = calcColor(color)
 	}
+	p.addColor(c)
+}
+
+func (p *Page) addColor(color565 uint16) {
+	if normalizeClientVersion(p.clientVersion) == ClientVersion3 {
+		var buf [4]byte
+		binary.BigEndian.PutUint32(buf[:], rgb565ToRGB24(color565))
+		p.addData(buf[:])
+		return
+	}
+
 	var buf [2]byte
-	binary.BigEndian.PutUint16(buf[:], c)
+	binary.BigEndian.PutUint16(buf[:], color565)
 	p.addData(buf[:])
 }
 
@@ -217,14 +264,20 @@ func (p *Page) AddImagePlaceholder(width, height int) {
 	p.addData(buf[:])
 }
 
-// AddImageInline writes tag 'I' (PNG/JPEG bytes) with dimensions.
-// The actual codec is implied by the client request (k=image/jpeg/png).
+// AddImageInline writes tag 'I' with dimensions and codec-specific bytes.
+// The codec is implied by the client request (for example JPEG, PNG or RGB565).
 func (p *Page) AddImageInline(width, height int, data []byte) {
 	if width < 0 {
 		width = 0
 	}
 	if height < 0 {
 		height = 0
+	}
+	if len(data) > 0xffff {
+		// The inline image tag stores payload length as uint16. Oversized
+		// payloads corrupt the tag stream for Opera Mini/OMPD parsers.
+		p.AddImagePlaceholder(width, height)
+		return
 	}
 	p.addTag('I')
 	var hdr [8]byte
@@ -245,13 +298,30 @@ func (p *Page) AddParagraph() { p.addTag('V') }
 
 // AddForm begins a form description.
 func (p *Page) AddForm(action string) {
+	p.AddFormWithMethod(action, "get")
+}
+
+// AddFormWithMethod begins a form description.
+//
+// OMPD renders tag 'h' as a hidden input, so the action travels as the input
+// name and the method code travels as its value.
+func (p *Page) AddFormWithMethod(action, method string) {
 	p.addTag('h')
 	if action == "" {
 		p.AddString("1")
 	} else {
 		p.AddString(action)
 	}
-	p.AddString("1")
+	p.AddString(formMethodCode(method))
+}
+
+func formMethodCode(method string) string {
+	switch strings.ToLower(strings.TrimSpace(method)) {
+	case "post", "2":
+		return "2"
+	default:
+		return "1"
+	}
 }
 
 // AddTextInput adds a text input field.
@@ -532,10 +602,8 @@ func analyzePayloadCounts(b []byte, clientVersion ClientVersion) (int, int) {
 	n := 0
 	strings := 1 // initial URL string
 	limit := len(b)
-	styleDataLen := 4
-	if normalizeClientVersion(clientVersion) == ClientVersion3 {
-		styleDataLen = 6
-	}
+	styleDataLen := stylePayloadSize(clientVersion)
+	colorDataLen := colorPayloadSize(clientVersion)
 	for p < limit {
 		tag := b[p]
 		n++
@@ -550,7 +618,7 @@ func analyzePayloadCounts(b []byte, clientVersion ClientVersion) (int, int) {
 			p += 2 + l
 		case 'E', 'B', '+', 'V', 'Q', 'l':
 		case 'D', 'R':
-			p += 2
+			p += colorDataLen
 		case 'S':
 			p += styleDataLen
 		case 'J':
@@ -661,6 +729,11 @@ func (p *Page) SetPart(cur, cnt int) {
 	}
 	p.partCur = cur
 	p.partCnt = cnt
+}
+
+// PartInfo returns the selected 1-based part and total number of parts.
+func (p *Page) PartInfo() (current, total int) {
+	return p.partCur, p.partCnt
 }
 
 // Finalize exposes page finalization for external callers.

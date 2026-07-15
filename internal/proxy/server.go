@@ -40,12 +40,13 @@ const (
 
 // Config describes server wiring and runtime behaviour.
 type Config struct {
-	IndexHTML    string
-	Bookmarks    []Bookmark
-	BookmarkMode BookmarkMode
-	SitesDir     string
-	Logger       *log.Logger
-	Clock        func() time.Time
+	IndexHTML         string
+	Bookmarks         []Bookmark
+	BookmarkMode      BookmarkMode
+	SitesDir          string
+	Logger            *log.Logger
+	Clock             func() time.Time
+	EnableDiagnostics bool
 }
 
 // DefaultConfig populates configuration from environment variables.
@@ -60,6 +61,7 @@ func DefaultConfig() Config {
 		cfg.SitesDir = defaultSitesDir
 	}
 	mode := strings.ToLower(strings.TrimSpace(os.Getenv("OMS_BOOKMARKS_MODE")))
+	cfg.EnableDiagnostics = os.Getenv("OMS_ENABLE_DIAGNOSTICS") == "1"
 	switch mode {
 	case "remote", "pass", "passthrough":
 		cfg.BookmarkMode = BookmarkModeRemote
@@ -165,7 +167,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("/", s.handleRoot)
 	s.mux.HandleFunc("/fetch", s.handleFetch)
-	s.mux.HandleFunc("/validate", s.handleValidate)
+	if s.cfg.EnableDiagnostics {
+		s.mux.HandleFunc("/validate", s.handleValidate)
+	} else {
+		s.mux.HandleFunc("/validate", http.NotFound)
+	}
 	s.mux.HandleFunc("/ping", s.handlePing)
 	s.mux.HandleFunc("/download", s.handleDownload)
 }
@@ -175,4 +181,12 @@ func (s *Server) getJSBaker() (*jsBaker, error) {
 		s.jsBaker, s.jsBakerErr = newJSBaker(s.logger)
 	})
 	return s.jsBaker, s.jsBakerErr
+}
+
+// Close releases lazily-created external resources owned by the server.
+func (s *Server) Close() error {
+	if s != nil && s.jsBaker != nil {
+		s.jsBaker.Close()
+	}
+	return nil
 }

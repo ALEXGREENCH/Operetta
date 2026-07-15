@@ -1,11 +1,27 @@
 package proxy
 
 import (
+	"bytes"
+	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 	"time"
+
+	"operetta/oms"
 )
+
+func TestRootRejectsOversizedOperaRequest(t *testing.T) {
+	server := New(Config{SitesDir: t.TempDir(), Logger: log.New(io.Discard, "", 0)})
+	body := bytes.Repeat([]byte{'x'}, (256<<10)+1)
+	req := httptest.NewRequest(http.MethodPost, "http://operetta/", bytes.NewReader(body))
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, req)
+	if response.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("status=%d, want %d", response.Code, http.StatusRequestEntityTooLarge)
+	}
+}
 
 func TestParseOperaBool(t *testing.T) {
 	t.Parallel()
@@ -32,6 +48,41 @@ func TestParseOperaBool(t *testing.T) {
 				t.Fatalf("parseOperaBool(%q) = (%v,%v), want (%v,%v)", tc.in, got, ok, tc.want, tc.ok)
 			}
 		})
+	}
+}
+
+func TestSafeInlineMediaTypeRejectsActiveContent(t *testing.T) {
+	for _, contentType := range []string{"text/html", "application/javascript", "image/svg+xml"} {
+		if safeInlineMediaType(contentType) {
+			t.Fatalf("safeInlineMediaType(%q)=true", contentType)
+		}
+	}
+	for _, contentType := range []string{"video/3gpp", "audio/mpeg", "image/jpeg"} {
+		if !safeInlineMediaType(contentType) {
+			t.Fatalf("safeInlineMediaType(%q)=false", contentType)
+		}
+	}
+}
+
+func TestOriginHeadersDoNotForwardBrowserCookies(t *testing.T) {
+	s := newTestServer()
+
+	req := httptest.NewRequest(http.MethodPost, "http://operetta/", nil)
+	req.Header.Set("Cookie", "OPERETTA_AUTH=client; WMF-DP=dark; PHPSESS=foreign")
+	params := map[string]string{
+		"i": "Opera Mini",
+		"q": "ru",
+	}
+	hdr := s.headersFromParams(req, params)
+	if got := hdr.Get("Cookie"); got != "" {
+		t.Fatalf("headersFromParams forwarded browser Cookie=%q", got)
+	}
+
+	qreq := httptest.NewRequest(http.MethodGet, "http://operetta/fetch?url=http://example.test/&ua=Opera", nil)
+	qreq.Header.Set("Cookie", "OPERETTA_AUTH=client; WMF-DP=dark")
+	qhdr := s.headersFromQuery(qreq)
+	if got := qhdr.Get("Cookie"); got != "" {
+		t.Fatalf("headersFromQuery forwarded browser Cookie=%q", got)
 	}
 }
 
@@ -69,6 +120,11 @@ func TestRenderOptionsFromParamsQuality(t *testing.T) {
 		t.Fatalf("expected HighQuality true for Q=HI, got %v", hi2.HighQuality)
 	}
 
+	viewport := s.renderOptionsFromParams(r, map[string]string{"d": "w:240;h:320;c:65536;m:1966084;i:1;q:0;f:0;j:0;l:256"}, hdr, "")
+	if viewport.ScreenW != 240 || viewport.ScreenH != 320 {
+		t.Fatalf("expected 240x320 viewport, got %dx%d", viewport.ScreenW, viewport.ScreenH)
+	}
+
 	dOff := s.renderOptionsFromParams(r, map[string]string{"d": "i:2"}, hdr, "")
 	if dOff.ImagesOn {
 		t.Fatalf("expected ImagesOn false for d=i:2, got %v", dOff.ImagesOn)
@@ -92,9 +148,7 @@ func TestRenderOptionsFromParamsQuality(t *testing.T) {
 	fragParams := map[string]string{"u": "https://example.com/page#__om=page=2&pp=1600&img=2"}
 	base, extras := extractOMFragment(fragParams["u"])
 	fragParams["u"] = base
-	for k, v := range extras {
-		fragParams[k] = v
-	}
+	mergeOMOptions(fragParams, extras)
 	fragOpt := s.renderOptionsFromParams(r, fragParams, hdr, "")
 	if fragOpt.ImagesOn {
 		t.Fatalf("expected ImagesOn false from fragment, got %v", fragOpt.ImagesOn)
@@ -104,6 +158,45 @@ func TestRenderOptionsFromParamsQuality(t *testing.T) {
 	}
 	if fragOpt.MaxTagsPerPage != 1600 {
 		t.Fatalf("expected fragment pp=1600, got %d", fragOpt.MaxTagsPerPage)
+	}
+
+	omDevice := s.renderOptionsFromParams(r, map[string]string{
+		"om_w": "240",
+		"om_h": "320",
+		"om_c": "65536",
+		"om_m": "16777216",
+		"om_l": "256",
+	}, hdr, "")
+	if omDevice.ScreenW != 240 || omDevice.ScreenH != 320 || omDevice.NumColors != 65536 || omDevice.HeapBytes != 16777216 || omDevice.AlphaLevels != 256 {
+		t.Fatalf("unexpected safe OM device options: %+v", omDevice)
+	}
+
+	rgb565 := s.renderOptionsFromParams(r, map[string]string{
+		"k": "image/x-rgb565", "maxkb": "16", "maxpagekb": "128", "d": "i:1",
+	}, hdr, "")
+	if rgb565.ImageMIME != oms.RGB565MIME || rgb565.MaxInlineKB != 16 || rgb565.MaxBytesPerPage != 128*1024 || !rgb565.ImagesOn {
+		t.Fatalf("unexpected RGB565 options: %+v", rgb565)
+	}
+}
+
+func TestRenderOptionsNegotiatesOperaClientVersion(t *testing.T) {
+	server := newTestServer()
+	req := httptest.NewRequest(http.MethodPost, "http://operetta/", nil)
+
+	om3 := server.renderOptionsFromParams(req, map[string]string{
+		"o": "285",
+		"v": "Opera Mini/3.2",
+	}, http.Header{}, "session")
+	if om3.ClientVersion != oms.ClientVersion3 || om3.DialectID != "3.2" {
+		t.Fatalf("OM3 negotiation=%d/%q", om3.ClientVersion, om3.DialectID)
+	}
+
+	om2 := server.renderOptionsFromParams(req, map[string]string{
+		"o": "280",
+		"v": "Opera Mini/2.0.4509/hifi/woodland/ru",
+	}, http.Header{}, "session")
+	if om2.ClientVersion != oms.ClientVersion2 || om2.DialectID != "2.0" {
+		t.Fatalf("OM2 negotiation=%d/%q", om2.ClientVersion, om2.DialectID)
 	}
 }
 

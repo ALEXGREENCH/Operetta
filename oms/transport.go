@@ -20,6 +20,20 @@ func normalizeClientVersion(v ClientVersion) ClientVersion {
 	}
 }
 
+func colorPayloadSize(v ClientVersion) int {
+	if normalizeClientVersion(v) == ClientVersion3 {
+		return 4
+	}
+	return 2
+}
+
+func stylePayloadSize(v ClientVersion) int {
+	if normalizeClientVersion(v) == ClientVersion3 {
+		return 6
+	}
+	return 4
+}
+
 func versionHeaderByte(v ClientVersion) byte {
 	switch normalizeClientVersion(v) {
 	case ClientVersion1:

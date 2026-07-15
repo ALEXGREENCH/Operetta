@@ -20,6 +20,7 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"unicode"
 
 	_ "golang.org/x/image/webp"
 
@@ -33,6 +34,9 @@ import (
 
 	"golang.org/x/image/draw"
 	"golang.org/x/net/html"
+
+	"operetta/origin"
+	"operetta/presentation"
 )
 
 var ProxyCookieJarStore interface {
@@ -49,10 +53,11 @@ const DefaultUpstreamUA = defaultUpstreamUA
 
 const defaultPaginationBytes = 32000
 const maxInlineBackgroundSize = 128
+const RGB565MIME = "image/x-rgb565"
 
 func effectiveTextColor(n *html.Node, st *walkState) string {
-	a := n.Parent
-	for a != nil && a.Type != html.ElementNode {
+	a := n
+	if a != nil && a.Type != html.ElementNode {
 		a = a.Parent
 	}
 	for cur := a; cur != nil; cur = cur.Parent {
@@ -90,12 +95,12 @@ func effectiveTextColor(n *html.Node, st *walkState) string {
 	return ""
 }
 
-func addTextWithColor(p *Page, st *walkState, n *html.Node, text string) {
+func addTextWithColor(p renderTarget, st *walkState, n *html.Node, text string) {
 	if text == "" {
 		return
 	}
 
-	target := cssToHex(findTextColorFor(n, st))
+	target := cssToHex(effectiveTextColor(n, st))
 	current := cssToHex(st.curColor)
 	if current == "" {
 		current = defaultTextColorHex
@@ -105,15 +110,14 @@ func addTextWithColor(p *Page, st *walkState, n *html.Node, text string) {
 		return
 	}
 	style := st.curStyle
-	if len(st.styleStack) > 0 {
-		style = st.styleStack[len(st.styleStack)-1]
-	}
+	target = readableTextColorForOM(target, st.curBg)
 	p.AddStyle(style | (uint32(calcColor(target)) << 8))
 	p.AddText(text)
 	if current == defaultTextColorHex {
 		p.AddStyle(style)
 		return
 	}
+	current = readableTextColorForOM(current, st.curBg)
 	p.AddStyle(style | (uint32(calcColor(current)) << 8))
 }
 
@@ -140,10 +144,12 @@ func maxBytesBudget() int {
 
 // shrinkPartToMaxBytes trims a single part (prefix + tagged body) so that its
 // total raw size does not exceed limit. Trimming respects tag boundaries.
-func shrinkPartToMaxBytes(part []byte, limit int, styleDataLen int) []byte {
+func shrinkPartToMaxBytes(part []byte, limit int, clientVersion ClientVersion) []byte {
 	if limit <= 0 || len(part) <= limit || len(part) < 2 {
 		return part
 	}
+	styleDataLen := stylePayloadSize(clientVersion)
+	colorDataLen := colorPayloadSize(clientVersion)
 	// Prefix: initial OMS string
 	l := int(binary.BigEndian.Uint16(part[0:2]))
 	if 2+l > len(part) {
@@ -157,6 +163,8 @@ func shrinkPartToMaxBytes(part []byte, limit int, styleDataLen int) []byte {
 	allowedBody := limit - (2 + l)
 	start := 2 + l
 	p := start
+	lastSafe := start
+	linkDepth := 0
 	limitAll := len(part)
 	for p < limitAll {
 		tag := part[p]
@@ -173,7 +181,7 @@ func shrinkPartToMaxBytes(part []byte, limit int, styleDataLen int) []byte {
 		case 'E', 'B', '+', 'V', 'Q', 'l':
 			// no payload
 		case 'D', 'R':
-			np += 2
+			np += colorDataLen
 		case 'S':
 			if np+styleDataLen > limitAll {
 				np = limitAll
@@ -276,6 +284,20 @@ func shrinkPartToMaxBytes(part []byte, limit int, styleDataLen int) []byte {
 			break
 		}
 		p = np
+		switch tag {
+		case 'L':
+			linkDepth++
+		case 'E':
+			if linkDepth > 0 {
+				linkDepth--
+			}
+		}
+		if linkDepth == 0 {
+			lastSafe = p
+		}
+	}
+	if linkDepth != 0 {
+		p = lastSafe
 	}
 	if p <= start { // nothing fits beyond prefix
 		return append([]byte{}, part[:2+l]...)
@@ -284,14 +306,15 @@ func shrinkPartToMaxBytes(part []byte, limit int, styleDataLen int) []byte {
 }
 
 func splitByTags(b []byte, maxTags int, clientVersion ClientVersion) [][]byte {
+	return splitByTagsWithBudget(b, maxTags, clientVersion, maxBytesBudget())
+}
+
+func splitByTagsWithBudget(b []byte, maxTags int, clientVersion ClientVersion, maxBytes int) [][]byte {
 	if maxTags <= 0 || len(b) < 2 {
 		return [][]byte{b}
 	}
-	maxBytes := maxBytesBudget()
-	styleDataLen := 4
-	if clientVersion == ClientVersion3 {
-		styleDataLen = 6
-	}
+	styleDataLen := stylePayloadSize(clientVersion)
+	colorDataLen := colorPayloadSize(clientVersion)
 	// Prefix is initial page URL string (len + bytes)
 	if len(b) < 2 {
 		return [][]byte{b}
@@ -318,11 +341,11 @@ func splitByTags(b []byte, maxTags int, clientVersion ClientVersion) [][]byte {
 			}
 			pp += styleDataLen
 		case 'D':
-			if pp+2 > len(b) {
+			if pp+colorDataLen > len(b) {
 				pp = len(b)
 				break
 			}
-			pp += 2
+			pp += colorDataLen
 		case 'k':
 			// type + string
 			if pp+1 > len(b) {
@@ -383,13 +406,13 @@ PreludeDone:
 					sColor = buf
 				}
 			case 'D':
-				if pz+2 > len(src) {
+				if pz+colorDataLen > len(src) {
 					pz = len(src)
 					break
 				}
-				dTag = append([]byte(nil), src[start:pz+2]...)
+				dTag = append([]byte(nil), src[start:pz+colorDataLen]...)
 				haveD = true
-				pz += 2
+				pz += colorDataLen
 			case 'k':
 				if pz+1 > len(src) {
 					pz = len(src)
@@ -424,6 +447,7 @@ PreludeDone:
 	// Keep first part intact (with prelude). Later parts will get prelude inserted.
 	start := p
 	tags := 0
+	linkDepth := 0
 	limit := len(b)
 	parts := make([][]byte, 0, 2)
 	partIdx := 0
@@ -441,7 +465,7 @@ PreludeDone:
 		case 'E', 'B', '+', 'V', 'Q', 'l':
 			// no payload
 		case 'D', 'R':
-			p += 2
+			p += colorDataLen
 		case 'S':
 			if p+styleDataLen > limit {
 				p = limit
@@ -539,8 +563,16 @@ PreludeDone:
 			p = limit
 		}
 		tags++
+		switch tag {
+		case 'L':
+			linkDepth++
+		case 'E':
+			if linkDepth > 0 {
+				linkDepth--
+			}
+		}
 		chunkBytes := p - start
-		if tags >= maxTags || (maxBytes > 0 && chunkBytes >= maxBytes) {
+		if linkDepth == 0 && (tags >= maxTags || (maxBytes > 0 && chunkBytes >= maxBytes)) {
 			// Cut part [start:p)
 			chunk := append([]byte(nil), b[start:p]...)
 			part := append([]byte(nil), prefix...)
@@ -683,14 +715,14 @@ func imgCacheKey(format string, quality int, url string) string {
 }
 
 func imgCacheGet(format string, quality int, url string) ([]byte, int, int, bool) {
-	if globalImgCache == nil {
+	if globalImgCache == nil || url == "" {
 		return nil, 0, 0, false
 	}
 	return globalImgCache.get(imgCacheKey(format, quality, url))
 }
 
 func imgCachePut(format string, quality int, url string, data []byte, w, h int) {
-	if globalImgCache == nil {
+	if globalImgCache == nil || url == "" {
 		return
 	}
 	globalImgCache.put(imgCacheKey(format, quality, url), data, w, h)
@@ -711,6 +743,19 @@ func errorPage(url, reason string) *Page {
 	p.AddText(url)
 	p.finalize()
 	return p
+}
+
+func encodeErrorPage(url, reason string, opts *RenderOptions) (*Page, error) {
+	target := newContentTarget("internal:error")
+	target.AddStyle(styleDefault)
+	target.AddPlus()
+	target.AddText("Internal server error")
+	target.AddText(reason)
+	target.AddBreak()
+	target.AddText(url)
+	model := target.Document()
+	model.NoCache = true
+	return EncodeDocument(model, opts)
 }
 
 // LoadPage loads the given URL and converts it into OMS format.
@@ -949,9 +994,25 @@ func looksLikeOMS(b []byte) bool {
 		return false
 	}
 	headerWord := binary.LittleEndian.Uint16(b[:2])
+	versionByte := byte(headerWord & 0xFF)
 	compression := compressionFromHeaderByte(byte(headerWord >> 8))
 	dec, err := decompressPayload(compression, b[6:])
 	if err != nil || len(dec) == 0 {
+		return false
+	}
+	// Validate version byte: must be a known OMS version marker
+	switch versionByte {
+	case 0x0d, 0x18, 0x1a:
+		// valid version markers
+	default:
+		return false
+	}
+	// Ensure minimum header length for the detected version
+	minHeaderLen := 35
+	if versionByte == 0x0d {
+		minHeaderLen = 33
+	}
+	if len(dec) < minHeaderLen {
 		return false
 	}
 	if dec[len(dec)-1] != 'Q' {
@@ -1019,7 +1080,30 @@ func resolveLink(base, href string) string {
 	return "0/" + href
 }
 
-func renderImageFromURL(p *Page, st *walkState, base, src, alt string, prefs RenderOptions) {
+func resolveNavigableLink(base, href string) (string, bool) {
+	href = strings.TrimSpace(href)
+	if href == "" {
+		return "", false
+	}
+	lower := strings.ToLower(href)
+	switch {
+	case lower == "#":
+		return "", false
+	case strings.HasPrefix(lower, "javascript:"):
+		if strings.TrimPrefix(lower, "javascript:") == "" || strings.Contains(lower, "void") {
+			return "", false
+		}
+	case strings.HasPrefix(lower, "mailto:"), strings.HasPrefix(lower, "tel:"):
+		return "", false
+	}
+	link := resolveLink(base, href)
+	if link == "" || link == "error:link" || link == "0/error:link" {
+		return "", false
+	}
+	return link, true
+}
+
+func renderImageFromURL(p renderTarget, st *walkState, base, src, alt string, prefs RenderOptions) {
 	src = strings.TrimSpace(src)
 	alt = strings.TrimSpace(alt)
 	if alt == "" {
@@ -1037,10 +1121,9 @@ func renderImageFromURL(p *Page, st *walkState, base, src, alt string, prefs Ren
 			if st != nil && st.inLink {
 				p.AddImagePlaceholder(w, h)
 			} else {
-				p.addTag('L')
-				p.AddString(abs)
+				p.BeginLink(abs)
 				p.AddImagePlaceholder(w, h)
-				p.addTag('E')
+				p.EndLink()
 			}
 		}
 		return
@@ -1049,10 +1132,9 @@ func renderImageFromURL(p *Page, st *walkState, base, src, alt string, prefs Ren
 		p.AddImagePlaceholder(0, 0)
 		return
 	}
-	p.addTag('L')
-	p.AddString(abs)
+	p.BeginLink(abs)
 	p.AddImagePlaceholder(0, 0)
-	p.addTag('E')
+	p.EndLink()
 }
 
 func walk(n *html.Node, base string, p *Page) {
@@ -1226,11 +1308,18 @@ type RenderOptions struct {
 	// Pagination: 1-based page index and max tags per page (0=disabled)
 	Page           int
 	MaxTagsPerPage int
+	// MaxBytesPerPage is negotiated by clients independently from image size.
+	// Zero retains the legacy OMS_PAGINATE_BYTES/default budget.
+	MaxBytesPerPage int
 	// Optional absolute base (scheme://host) for building navigation links
 	ServerBase    string
 	Styles        *Stylesheet
 	WantFullCache bool
 	ClientVersion ClientVersion
+	DialectID     string
+	// CachePartition isolates temporary packed-page artifacts by gateway
+	// session. It is not sent to origins or encoded into the document.
+	CachePartition string
 	// Optional JavaScript baking configuration (nil = auto/off).
 	JS *JSBakingOptions
 }
@@ -1255,19 +1344,9 @@ type JSBakingOptions struct {
 	Scripts           []string
 }
 
-// UpstreamDocument captures the result of fetching a page before it is rendered
-// into OMS. Body should contain the decoded payload (post-decompression) when
-// available; RawBody preserves the original bytes as received from the origin.
-type UpstreamDocument struct {
-	URL           string
-	Body          []byte
-	RawBody       []byte
-	TransferBytes int
-	Header        http.Header
-	Status        int
-	ContentLength int64
-	SetCookies    []string
-}
+// UpstreamDocument is kept as a source-compatible alias. New code should use
+// origin.Response so acquisition does not depend on the Opera Mini codec.
+type UpstreamDocument = origin.Response
 
 func cloneHeader(h http.Header) http.Header {
 	if h == nil {
@@ -1371,6 +1450,55 @@ func renderDownloadPageFromDocument(doc *UpstreamDocument, opts *RenderOptions) 
 	return page
 }
 
+func transformDownloadDocument(doc *UpstreamDocument, opts *RenderOptions) *presentation.Document {
+	effectiveURL := doc.URL
+	if effectiveURL == "" {
+		effectiveURL = "about:blank"
+	}
+	target := newContentTarget(effectiveURL)
+	target.AddStyle(styleDefault)
+
+	ct := strings.TrimSpace(doc.Header.Get("Content-Type"))
+	if mt, _, err := mime.ParseMediaType(ct); err == nil {
+		ct = mt
+	}
+	filename := fileNameFromDocument(doc)
+	sizeText := humanReadableSize(doc.ContentLength)
+
+	target.AddText("Download file")
+	target.AddBreak()
+	target.AddBreak()
+	if filename != "" {
+		target.AddText("Name: " + filename)
+		target.AddBreak()
+	}
+	if sizeText != "" {
+		target.AddText("Size: " + sizeText)
+		target.AddBreak()
+	}
+	if ct != "" {
+		target.AddText("Type: " + ct)
+		target.AddBreak()
+	}
+	target.AddBreak()
+	target.AddLink("0/"+buildDownloadLinkFromDocument(doc, opts, filename, false), "[Download]")
+	if strings.HasPrefix(strings.ToLower(ct), "video/3gpp") {
+		target.AddBreak()
+		target.AddLink("0/"+buildDownloadLinkFromDocument(doc, opts, filename, true), "[Play]")
+		target.AddText(" Opens external player")
+	}
+	target.AddBreak()
+	target.AddLink("0/"+effectiveURL, "[Open original]")
+
+	model := target.Document()
+	model.SetCookies = append([]string(nil), doc.SetCookies...)
+	model.Metrics.OriginTransferBytes = doc.TransferBytes
+	model.Metrics.OriginDecodedBytes = len(doc.Body)
+	model.NoCache = true
+	model.DownloadOnly = true
+	return model
+}
+
 func buildDownloadLinkFromDocument(doc *UpstreamDocument, opts *RenderOptions, filename string, stream bool) string {
 	values := url.Values{}
 	effectiveURL := doc.URL
@@ -1421,62 +1549,72 @@ func fileNameFromDocument(doc *UpstreamDocument) string {
 	return ""
 }
 
-// BuildPaginationLink returns a target URL with a pseudo-anchor that preserves render options without leaking the proxy endpoint.
+// BuildPaginationLink returns a target URL with internal pagination options.
+// Use a query parameter instead of a fragment because browser extension viewers
+// wrap these links in their own query strings, where raw fragments are fragile.
 func BuildPaginationLink(target string, opts *RenderOptions, page, maxTags int) string {
-	clean := target
-	if u, err := url.Parse(target); err == nil {
-		q := u.Query()
-		if q.Has("__p") && page <= 1 {
-			q.Del("__p")
-			u.RawQuery = q.Encode()
+	u, err := url.Parse(target)
+	if err != nil {
+		if page <= 1 {
+			return target
 		}
-		u.Fragment = ""
-		clean = u.String()
+		u = &url.URL{Path: target}
 	}
+	q := u.Query()
+	q.Del("__p")
+	q.Del("__om")
+	u.RawQuery = q.Encode()
+	u.Fragment = ""
 	if page <= 1 {
-		return clean
+		return u.String()
 	}
-	frag := url.Values{}
-	frag.Set("page", strconv.Itoa(page))
+	om := url.Values{}
+	om.Set("page", strconv.Itoa(page))
 	if maxTags > 0 {
-		frag.Set("pp", strconv.Itoa(maxTags))
+		om.Set("pp", strconv.Itoa(maxTags))
 	}
 	if opts != nil {
 		if opts.ImagesOn {
-			frag.Set("img", "1")
+			om.Set("img", "1")
 		} else {
-			frag.Set("img", "2")
+			om.Set("img", "2")
 		}
 		if opts.HighQuality {
-			frag.Set("hq", "1")
+			om.Set("hq", "1")
 		}
 		if opts.ImageMIME != "" {
-			frag.Set("mime", opts.ImageMIME)
+			om.Set("mime", opts.ImageMIME)
 		}
 		if opts.MaxInlineKB > 0 {
-			frag.Set("maxkb", strconv.Itoa(opts.MaxInlineKB))
+			om.Set("maxkb", strconv.Itoa(opts.MaxInlineKB))
+		}
+		if opts.MaxBytesPerPage > 0 {
+			om.Set("maxpagekb", strconv.Itoa((opts.MaxBytesPerPage+1023)/1024))
 		}
 		if opts.ScreenW > 0 {
-			frag.Set("w", strconv.Itoa(opts.ScreenW))
+			om.Set("w", strconv.Itoa(opts.ScreenW))
 		}
 		if opts.ScreenH > 0 {
-			frag.Set("h", strconv.Itoa(opts.ScreenH))
+			om.Set("h", strconv.Itoa(opts.ScreenH))
 		}
 		if opts.HeapBytes > 0 {
-			frag.Set("m", strconv.Itoa(opts.HeapBytes))
+			om.Set("m", strconv.Itoa(opts.HeapBytes))
 		}
 		if opts.AlphaLevels > 0 {
-			frag.Set("l", strconv.Itoa(opts.AlphaLevels))
+			om.Set("l", strconv.Itoa(opts.AlphaLevels))
 		}
 		if opts.NumColors > 0 {
-			frag.Set("c", strconv.Itoa(opts.NumColors))
+			om.Set("c", strconv.Itoa(opts.NumColors))
 		}
 	}
-	encoded := frag.Encode()
+	encoded := om.Encode()
 	if encoded == "" {
-		return clean
+		return u.String()
 	}
-	return clean + "#__om=" + encoded
+	q = u.Query()
+	q.Set("__om", encoded)
+	u.RawQuery = q.Encode()
+	return u.String()
 }
 
 // GetAttr is an exported helper for debug code paths.
@@ -1539,30 +1677,37 @@ func (s *walkState) currentList() *listCtx {
 	return &s.lists[len(s.lists)-1]
 }
 
-func (s *walkState) pushStyle(p *Page, style uint32) {
-	s.styleStack = append(s.styleStack, s.curStyle)
-	s.curStyle = style
-	var colorPart uint32
-	if s.curColor != "" {
-		colorPart = uint32(calcColor(s.curColor)) << 8
+func (s *walkState) styleWithTextColor(style uint32, color string) uint32 {
+	if color == "" {
+		return style
 	}
-	p.AddStyle(style | colorPart)
+	safe := readableTextColorForOM(color, s.curBg)
+	if safe == "" {
+		return style
+	}
+	return style | (uint32(calcColor(safe)) << 8)
 }
 
-func (s *walkState) popStyle(p *Page) {
+func (s *walkState) emitCurrentStyle(p renderTarget) {
+	p.AddStyle(s.styleWithTextColor(s.curStyle, s.curColor))
+}
+
+func (s *walkState) pushStyle(p renderTarget, style uint32) {
+	s.styleStack = append(s.styleStack, s.curStyle)
+	s.curStyle = style
+	s.emitCurrentStyle(p)
+}
+
+func (s *walkState) popStyle(p renderTarget) {
 	if len(s.styleStack) == 0 {
 		return
 	}
 	s.curStyle = s.styleStack[len(s.styleStack)-1]
 	s.styleStack = s.styleStack[:len(s.styleStack)-1]
-	var colorPart uint32
-	if s.curColor != "" {
-		colorPart = uint32(calcColor(s.curColor)) << 8
-	}
-	p.AddStyle(s.curStyle | colorPart)
+	s.emitCurrentStyle(p)
 }
 
-func (s *walkState) pushColor(p *Page, hex string) {
+func (s *walkState) pushColor(p renderTarget, hex string) {
 	if normalized := cssToHex(hex); normalized != "" {
 		hex = normalized
 	} else {
@@ -1573,14 +1718,10 @@ func (s *walkState) pushColor(p *Page, hex string) {
 	if hex == "" {
 		return
 	}
-	cur := s.curStyle
-	if len(s.styleStack) > 0 {
-		cur = s.styleStack[len(s.styleStack)-1]
-	}
-	p.AddStyle(cur | (uint32(calcColor(hex)) << 8))
+	s.emitCurrentStyle(p)
 }
 
-func (s *walkState) popColor(p *Page) {
+func (s *walkState) popColor(p renderTarget) {
 	if len(s.colorStack) == 0 {
 		return
 	}
@@ -1592,15 +1733,11 @@ func (s *walkState) popColor(p *Page) {
 		prev = ""
 	}
 	s.curColor = prev
-	cur := s.curStyle
-	if len(s.styleStack) > 0 {
-		cur = s.styleStack[len(s.styleStack)-1]
-	}
 	if prev == "" {
-		p.AddStyle(cur)
+		p.AddStyle(s.curStyle)
 		return
 	}
-	p.AddStyle(cur | (uint32(calcColor(prev)) << 8))
+	s.emitCurrentStyle(p)
 }
 
 func isDisplayNone(style string) bool {
@@ -1825,7 +1962,7 @@ func hasTextContent(n *html.Node) bool {
 	return false
 }
 
-func renderBackgroundImage(n *html.Node, props map[string]string, base string, p *Page, prefs RenderOptions) bool {
+func renderBackgroundImage(n *html.Node, props map[string]string, base string, p renderTarget, prefs RenderOptions) bool {
 	if n == nil || p == nil {
 		return false
 	}
@@ -1908,15 +2045,19 @@ func renderBackgroundImage(n *html.Node, props map[string]string, base string, p
 		// Negative values mean the sprite is shifted left/up, so visible region starts at -pos.
 		cropX := -posX
 		cropY := -posY
-		if cropped, ok := fetchAndEncodeImageRegion(abs, prefs, cropX, cropY, widthHint, heightHint); ok {
+		if cropped, croppedW, croppedH, ok := fetchAndEncodeImageRegion(abs, prefs, cropX, cropY, widthHint, heightHint); ok {
 			if prefs.MaxInlineKB <= 0 || len(cropped) <= prefs.MaxInlineKB*1024 {
-				p.AddImageInline(widthHint, heightHint, cropped)
+				p.AddImageInline(croppedW, croppedH, cropped)
 				return true
 			}
 		}
 		// If cropping fails, fall back to full image rendering.
 	}
-	p.AddImageInline(widthHint, heightHint, data)
+	if strings.EqualFold(prefs.ImageMIME, RGB565MIME) && len(data) != widthHint*heightHint*2 {
+		p.AddImageInline(w, h, data)
+	} else {
+		p.AddImageInline(widthHint, heightHint, data)
+	}
 	return true
 }
 
@@ -1928,6 +2069,21 @@ func isBgPaintableTag(tag string) bool {
 	switch strings.ToLower(tag) {
 	case "div", "section", "article", "header", "footer", "main", "nav", "aside",
 		"ul", "ol", "li", "table", "tbody", "thead", "tr", "td", "th":
+		return true
+	}
+	return false
+}
+
+func isInlineCSSBox(n *html.Node, props map[string]string) bool {
+	if n == nil || n.Type != html.ElementNode {
+		return false
+	}
+	display := strings.ToLower(cssPropValue(props, getAttr(n, "style"), "display"))
+	if strings.Contains(display, "inline") {
+		return true
+	}
+	switch strings.ToLower(n.Data) {
+	case "a", "span", "b", "strong", "i", "em", "small", "font", "sup", "sub":
 		return true
 	}
 	return false
@@ -1990,15 +2146,16 @@ func cssEffectiveProp(n *html.Node, ss *Stylesheet, self map[string]string, prop
 	return ""
 }
 
-func (s *walkState) pushBgcolor(p *Page, hex string) {
+func (s *walkState) pushBgcolor(p renderTarget, hex string) {
 	s.bgStack = append(s.bgStack, s.curBg)
 	s.curBg = hex
 	if hex != "" {
 		p.AddBgcolor(hex)
+		s.emitCurrentStyle(p)
 	}
 }
 
-func (s *walkState) popBgcolor(p *Page) {
+func (s *walkState) popBgcolor(p renderTarget) {
 	if len(s.bgStack) == 0 {
 		return
 	}
@@ -2007,10 +2164,13 @@ func (s *walkState) popBgcolor(p *Page) {
 	s.curBg = prev
 	if prev != "" {
 		p.AddBgcolor(prev)
+	} else {
+		p.AddBgcolor("#ffffff")
 	}
+	s.emitCurrentStyle(p)
 }
 
-func resetComputedStyles(st *walkState, p *Page, colorPushed *bool, stylePushed *bool, alignedPushed *bool) {
+func resetComputedStyles(st *walkState, p renderTarget, colorPushed *bool, stylePushed *bool, alignedPushed *bool) {
 	if *colorPushed {
 		st.popColor(p)
 		*colorPushed = false
@@ -2080,6 +2240,50 @@ func condenseSpaces(s string) string {
 	return out
 }
 
+func collapseHTMLWhitespace(s string) string {
+	if s == "" {
+		return ""
+	}
+	var b strings.Builder
+	prevSpace := false
+	for _, r := range s {
+		if unicode.IsSpace(r) {
+			if !prevSpace {
+				b.WriteByte(' ')
+				prevSpace = true
+			}
+			continue
+		}
+		b.WriteRune(r)
+		prevSpace = false
+	}
+	return b.String()
+}
+
+func textNodeContent(n *html.Node, st *walkState) string {
+	if n == nil {
+		return ""
+	}
+	if st != nil && st.pre {
+		return n.Data
+	}
+	collapsed := collapseHTMLWhitespace(n.Data)
+	trimmed := strings.TrimSpace(collapsed)
+	if trimmed == "" {
+		if shouldPreserveInlineWhitespace(n) {
+			return " "
+		}
+		return ""
+	}
+	if strings.HasPrefix(collapsed, " ") && isInlineContentBoundary(previousSignificantSibling(n)) {
+		trimmed = " " + trimmed
+	}
+	if strings.HasSuffix(collapsed, " ") && isInlineContentBoundary(nextSignificantSibling(n)) {
+		trimmed += " "
+	}
+	return trimmed
+}
+
 // parseBackgroundPosition parses simple background-position values like "-24px 0" or "0 0".
 // Returns x, y pixel offsets; boolean indicates if any value was parsed.
 func parseBackgroundPosition(val string) (int, int, bool) {
@@ -2128,43 +2332,49 @@ func parseBackgroundPosition(val string) (int, int, bool) {
 
 // fetchAndEncodeImageRegion fetches an image, crops the (x,y,w,h) rectangle and encodes it.
 // Uses existing caches with a region-specific key.
-func fetchAndEncodeImageRegion(absURL string, prefs RenderOptions, x, y, w, h int) ([]byte, bool) {
+func fetchAndEncodeImageRegion(absURL string, prefs RenderOptions, x, y, w, h int) ([]byte, int, int, bool) {
 	if w <= 0 || h <= 0 {
-		return nil, false
+		return nil, 0, 0, false
 	}
 	// Region cache key
-	regionKey := absURL + "#rect=" + strconv.Itoa(x) + "," + strconv.Itoa(y) + "," + strconv.Itoa(w) + "," + strconv.Itoa(h)
+	fullKey := imageCacheVariantKey(absURL, prefs)
+	regionKey := ""
+	if fullKey != "" {
+		regionKey = fullKey + "#rect=" + strconv.Itoa(x) + "," + strconv.Itoa(y) + "," + strconv.Itoa(w) + "," + strconv.Itoa(h)
+	}
 	candidates := cacheCandidatesFor(prefs)
 	for _, cand := range candidates {
-		if data, _, _, ok := imgCacheGet(cand.format, cand.quality, regionKey); ok {
-			return data, true
+		if data, cachedW, cachedH, ok := imgCacheGet(cand.format, cand.quality, regionKey); ok {
+			return data, cachedW, cachedH, true
 		}
-		if data, _, _, ok := diskCacheGet(cand.format, cand.quality, regionKey); ok {
-			imgCachePut(cand.format, cand.quality, regionKey, data, w, h)
-			return data, true
+		if data, cachedW, cachedH, ok := diskCacheGet(cand.format, cand.quality, regionKey); ok {
+			imgCachePut(cand.format, cand.quality, regionKey, data, cachedW, cachedH)
+			return data, cachedW, cachedH, true
 		}
 	}
 
 	// Attempt to reuse cached full image first
 	var srcBytes []byte
 	var have bool
-	for _, cand := range candidates {
-		if data, _, _, ok := imgCacheGet(cand.format, cand.quality, absURL); ok {
-			srcBytes = data
-			have = true
-			break
-		}
-		if data, _, _, ok := diskCacheGet(cand.format, cand.quality, absURL); ok {
-			srcBytes = data
-			have = true
-			break
+	if !strings.EqualFold(prefs.ImageMIME, RGB565MIME) {
+		for _, cand := range candidates {
+			if data, _, _, ok := imgCacheGet(cand.format, cand.quality, fullKey); ok {
+				srcBytes = data
+				have = true
+				break
+			}
+			if data, _, _, ok := diskCacheGet(cand.format, cand.quality, fullKey); ok {
+				srcBytes = data
+				have = true
+				break
+			}
 		}
 	}
 	if !have {
 		// Fallback to fetching from network
 		req, err := http.NewRequest(http.MethodGet, absURL, nil)
 		if err != nil {
-			return nil, false
+			return nil, 0, 0, false
 		}
 		req.Header.Set("Accept", "image/*")
 		if prefs.ReqHeaders != nil {
@@ -2197,7 +2407,7 @@ func fetchAndEncodeImageRegion(absURL string, prefs RenderOptions, x, y, w, h in
 		}
 		resp, err := client.Do(req)
 		if err != nil {
-			return nil, false
+			return nil, 0, 0, false
 		}
 		defer resp.Body.Close()
 		var rc io.ReadCloser = resp.Body
@@ -2218,7 +2428,7 @@ func fetchAndEncodeImageRegion(absURL string, prefs RenderOptions, x, y, w, h in
 		}
 		b, err := io.ReadAll(rc)
 		if err != nil || len(b) == 0 {
-			return nil, false
+			return nil, 0, 0, false
 		}
 		srcBytes = b
 	}
@@ -2226,7 +2436,7 @@ func fetchAndEncodeImageRegion(absURL string, prefs RenderOptions, x, y, w, h in
 	// Decode and crop
 	img, _, err := image.Decode(bytes.NewReader(srcBytes))
 	if err != nil {
-		return nil, false
+		return nil, 0, 0, false
 	}
 	b := img.Bounds()
 	if x < 0 {
@@ -2248,7 +2458,7 @@ func fetchAndEncodeImageRegion(absURL string, prefs RenderOptions, x, y, w, h in
 		h = b.Dy() - y
 	}
 	if w <= 0 || h <= 0 {
-		return nil, false
+		return nil, 0, 0, false
 	}
 	rect := image.Rect(b.Min.X+x, b.Min.Y+y, b.Min.X+x+w, b.Min.Y+y+h)
 
@@ -2264,16 +2474,16 @@ func fetchAndEncodeImageRegion(absURL string, prefs RenderOptions, x, y, w, h in
 		region = dst
 	}
 
-	data, _, _, format, quality, err := encodeImage(region, prefs)
+	data, encodedW, encodedH, format, quality, err := encodeImage(region, prefs)
 	if err != nil {
-		return nil, false
+		return nil, 0, 0, false
 	}
-	imgCachePut(format, quality, regionKey, data, w, h)
-	diskCachePut(format, quality, regionKey, data, w, h)
-	return data, true
+	imgCachePut(format, quality, regionKey, data, encodedW, encodedH)
+	diskCachePut(format, quality, regionKey, data, encodedW, encodedH)
+	return data, encodedW, encodedH, true
 }
 
-func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool, st *walkState, prefs RenderOptions) {
+func walkRich(cur *html.Node, base string, p renderTarget, visited map[*html.Node]bool, st *walkState, prefs RenderOptions) {
 	for c := cur; c != nil; c = c.NextSibling {
 		recurse := true
 		var colorPushed bool
@@ -2281,13 +2491,31 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 		var alignedPushed bool
 		var bgColorPushed bool
 		var bgRendered bool
+		var props map[string]string
+		finishCurrent := func() {
+			if stylePushed {
+				st.popStyle(p)
+				stylePushed = false
+			}
+			if colorPushed {
+				st.popColor(p)
+				colorPushed = false
+			}
+			if alignedPushed {
+				st.popStyle(p)
+				alignedPushed = false
+			}
+			if bgColorPushed {
+				st.popBgcolor(p)
+				bgColorPushed = false
+			}
+		}
 		if c.Type == html.ElementNode {
 			// Skip hidden elements
 			if stAttr := getAttr(c, "style"); stAttr != "" && isDisplayNone(stAttr) {
 				continue
 			}
 			// Apply computed CSS: honor display:none, text-align and color (from stylesheet)
-			var props map[string]string
 			if st.css != nil {
 				props = computeStyleFor(c, st.css)
 				if props != nil && strings.Contains(strings.ToLower(props["display"]), "none") {
@@ -2385,9 +2613,14 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 			}
 		}
 		tag := strings.ToLower(c.Data)
+		if bgRendered && isInlineCSSBox(c, props) {
+			finishCurrent()
+			continue
+		}
 		if handler, ok := extraHTML4Handlers[tag]; ok {
 			ctx := elementContext{node: c, base: base, page: p, visited: visited, state: st, prefs: prefs}
 			if handler(&ctx) {
+				finishCurrent()
 				continue
 			}
 		}
@@ -2396,25 +2629,28 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 		case "title":
 			if t := findTextNode(c, visited); t != nil {
 				visited[t] = true
-				p.AddPlus()
-				p.AddText(strings.TrimSpace(t.Data))
-				p.AddBreak()
 			}
 		case "body":
 			if l := getAttr(c, "bgcolor"); l != "" {
 				p.AddBgcolor(l)
+				if hx := cssToHex(l); hx != "" {
+					st.curBg = hx
+					st.emitCurrentStyle(p)
+				}
 			}
 			if l := cssToHex(getAttr(c, "text")); l != "" {
-				p.AddTextcolor(l)
 				st.curColor = l
+				st.emitCurrentStyle(p)
 			}
 			if stl := getAttr(c, "style"); stl != "" {
 				if col := parseCssColor(stl, "background-color"); col != "" {
 					p.AddBgcolor(col)
+					st.curBg = col
+					st.emitCurrentStyle(p)
 				}
 				if col := parseCssColor(stl, "color"); col != "" {
-					p.AddTextcolor(col)
 					st.curColor = col
+					st.emitCurrentStyle(p)
 				}
 			}
 		case "br":
@@ -2433,7 +2669,9 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 				}
 			}
 			if txt != "" {
-				p.AddPlus()
+				if st.curBg == "" {
+					p.AddPlus()
+				}
 				// Emphasize headings
 				st.pushStyle(p, st.curStyle|styleBoldBit)
 				p.AddText(txt)
@@ -2446,22 +2684,24 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 			if hasClass(c, "p") {
 				resetComputedStyles(st, p, &colorPushed, &stylePushed, &alignedPushed)
 				st.pushColor(p, "#007700")
-				p.AddPlus()
+				if !bgColorPushed {
+					p.AddPlus()
+				}
 				if c.FirstChild != nil {
 					walkRich(c.FirstChild, base, p, visited, st, prefs)
 				}
 				st.popColor(p)
 				p.AddBreak()
+				finishCurrent()
 				continue
 			}
 			if hasAnyClass(c, "ts", "tsb", "tso") {
 				resetComputedStyles(st, p, &colorPushed, &stylePushed, &alignedPushed)
-				st.pushColor(p, "#aaaaaa")
 				if c.FirstChild != nil {
 					walkRich(c.FirstChild, base, p, visited, st, prefs)
 				}
-				st.popColor(p)
 				p.AddBreak()
+				finishCurrent()
 				continue
 			}
 			if hasClass(c, "center") {
@@ -2472,6 +2712,7 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 				}
 				st.popStyle(p)
 				p.AddBreak()
+				finishCurrent()
 				continue
 			}
 			if hasClass(c, "nw") {
@@ -2479,6 +2720,7 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 				if c.FirstChild != nil {
 					walkRich(c.FirstChild, base, p, visited, st, prefs)
 				}
+				finishCurrent()
 				continue
 			}
 			if hasClass(c, "bro") {
@@ -2487,56 +2729,69 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 					walkRich(c.FirstChild, base, p, visited, st, prefs)
 				}
 				p.AddBreak()
+				finishCurrent()
 				continue
 			}
 			if hasClass(c, "copy") {
 				resetComputedStyles(st, p, &colorPushed, &stylePushed, &alignedPushed)
 				st.pushStyle(p, st.curStyle|styleBoldBit)
 				st.pushColor(p, "#ffffff")
-				p.AddPlus()
+				if !bgColorPushed {
+					p.AddPlus()
+				}
 				if c.FirstChild != nil {
 					walkRich(c.FirstChild, base, p, visited, st, prefs)
 				}
 				st.popColor(p)
 				st.popStyle(p)
 				p.AddBreak()
+				finishCurrent()
 				continue
 			}
 			if hasClass(c, "copy2") {
 				resetComputedStyles(st, p, &colorPushed, &stylePushed, &alignedPushed)
 				st.pushColor(p, "#060")
-				p.AddPlus()
+				if !bgColorPushed {
+					p.AddPlus()
+				}
 				if c.FirstChild != nil {
 					walkRich(c.FirstChild, base, p, visited, st, prefs)
 				}
 				st.popColor(p)
 				p.AddBreak()
+				finishCurrent()
 				continue
 			}
 			if hasClass(c, "pr") {
 				resetComputedStyles(st, p, &colorPushed, &stylePushed, &alignedPushed)
 				st.pushStyle(p, st.curStyle|styleBoldBit|styleCenterBit)
 				st.pushColor(p, "#ffffff")
-				p.AddPlus()
+				if !bgColorPushed {
+					p.AddPlus()
+				}
 				if c.FirstChild != nil {
 					walkRich(c.FirstChild, base, p, visited, st, prefs)
 				}
 				st.popColor(p)
 				st.popStyle(p)
 				p.AddBreak()
+				finishCurrent()
 				continue
 			}
 			if hasClass(c, "sepo") {
 				resetComputedStyles(st, p, &colorPushed, &stylePushed, &alignedPushed)
 				st.pushStyle(p, st.curStyle|styleBoldBit)
 				st.pushColor(p, "#060")
-				p.AddPlus()
+				if !bgColorPushed {
+					p.AddPlus()
+				}
 				if c.FirstChild != nil {
 					walkRich(c.FirstChild, base, p, visited, st, prefs)
 				}
 				st.popColor(p)
 				st.popStyle(p)
 				p.AddBreak()
+				finishCurrent()
 				continue
 			}
 			if hasClass(c, "bl") {
@@ -2546,6 +2801,7 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 					walkRich(c.FirstChild, base, p, visited, st, prefs)
 				}
 				p.AddBreak()
+				finishCurrent()
 				continue
 			}
 			if hasAnyClass(c, "str-up", "str-dw") {
@@ -2555,6 +2811,7 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 					walkRich(c.FirstChild, base, p, visited, st, prefs)
 				}
 				p.AddBreak()
+				finishCurrent()
 				continue
 			}
 			p.AddParagraph()
@@ -2621,6 +2878,7 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 				if c.FirstChild != nil {
 					walkRich(c.FirstChild, base, p, visited, st, prefs)
 				}
+				finishCurrent()
 				continue
 			}
 			if hasClass(c, "br350") {
@@ -2629,6 +2887,7 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 				if c.FirstChild != nil {
 					walkRich(c.FirstChild, base, p, visited, st, prefs)
 				}
+				finishCurrent()
 				continue
 			}
 			if hasClass(c, "sepo") {
@@ -2640,6 +2899,7 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 				}
 				st.popColor(p)
 				st.popStyle(p)
+				finishCurrent()
 				continue
 			}
 			if hasClass(c, "grn") {
@@ -2649,6 +2909,7 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 					walkRich(c.FirstChild, base, p, visited, st, prefs)
 				}
 				st.popColor(p)
+				finishCurrent()
 				continue
 			}
 			if hasClass(c, "red") {
@@ -2658,6 +2919,7 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 					walkRich(c.FirstChild, base, p, visited, st, prefs)
 				}
 				st.popColor(p)
+				finishCurrent()
 				continue
 			}
 			if hasClass(c, "zm") {
@@ -2667,6 +2929,7 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 					walkRich(c.FirstChild, base, p, visited, st, prefs)
 				}
 				st.popStyle(p)
+				finishCurrent()
 				continue
 			}
 			if sp := getAttr(c, "style"); sp != "" {
@@ -2714,12 +2977,11 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 			}
 		case "font":
 			if col := strings.TrimSpace(getAttr(c, "color")); col != "" {
-				st.pushStyle(p, st.curStyle)
-				p.AddTextcolor(col)
+				st.pushColor(p, col)
 				if c.FirstChild != nil {
 					walkRich(c.FirstChild, base, p, visited, st, prefs)
 				}
-				st.popStyle(p)
+				st.popColor(p)
 				recurse = false
 			}
 		case "a":
@@ -2737,33 +2999,50 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 				p.AddText("[")
 			}
 			href := getAttr(c, "href")
-			link := resolveLink(base, href)
-			name := "Link"
+			link, linkOK := resolveNavigableLink(base, href)
+			name := ""
 			if t := findTextNode(c, visited); t != nil {
-				visited[t] = true
 				if txt := strings.TrimSpace(t.Data); txt != "" {
 					name = txt
 				}
 			}
-			if name == "Link" {
+			if name == "" {
 				if alt := findFirstImgAlt(c); alt != "" {
 					name = alt
 				}
 			}
+			if !linkOK {
+				resetComputedStyles(st, p, &colorPushed, &stylePushed, &alignedPushed)
+				before := p.UnitCount()
+				if c.FirstChild != nil {
+					walkRich(c.FirstChild, base, p, visited, st, prefs)
+				}
+				if p.UnitCount() == before && name != "" && !iconOnly {
+					p.AddText(name)
+				}
+				if buttonWrap {
+					p.AddText("] ")
+				}
+				if blockWrap {
+					p.AddBreak()
+				}
+				recurse = false
+				finishCurrent()
+				continue
+			}
 			// Render link with children as content
-			p.addTag('L')
-			p.AddString(link)
-			before := p.tagCount
+			p.BeginLink(link)
+			before := p.UnitCount()
 			prevIn := st.inLink
 			st.inLink = true
 			if c.FirstChild != nil {
 				walkRich(c.FirstChild, base, p, visited, st, prefs)
 			}
 			st.inLink = prevIn
-			if p.tagCount == before {
+			if p.UnitCount() == before {
 				p.AddText(name)
 			}
-			p.addTag('E')
+			p.EndLink()
 			if buttonWrap {
 				p.AddText("]")
 				p.AddText(" ")
@@ -2772,26 +3051,36 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 			shouldBreak := true
 			if buttonWrap || blockWrap {
 				shouldBreak = true
+			} else if isCompactInlineLinkGroup(c) {
+				shouldBreak = false
 			} else if iconOnly {
-				if ns := nextSignificantSibling(c); ns != nil && ns.Type == html.ElementNode &&
-					strings.EqualFold(ns.Data, "a") && isIconOnlyLink(ns) {
-					shouldBreak = false
+				if ns := nextSignificantSibling(c); ns != nil {
+					if ns.Type == html.ElementNode && strings.EqualFold(ns.Data, "a") && isIconOnlyLink(ns) {
+						shouldBreak = false
+					} else if ns.Type == html.TextNode {
+						trimmed := strings.TrimLeft(ns.Data, " \t\n")
+						if hasPrefixAny(trimmed, "]", "|", ")", ",", ";", ":", ".", "/", "›", "»", ">") {
+							shouldBreak = false
+						}
+					}
 				}
 			} else {
 				if ns := nextSignificantSibling(c); ns != nil {
 					if ns.Type == html.TextNode {
 						trimmed := strings.TrimLeft(ns.Data, " \t\n")
-						if hasPrefixAny(trimmed, "]", "|", ")", ",", ";", ":") {
+						if hasPrefixAny(trimmed, "]", "|", ")", ",", ";", ":", ".", "/", "›", "»", ">") || isPhrasingParent(c.Parent) {
 							shouldBreak = false
 						}
 					} else if ns.Type == html.ElementNode && strings.EqualFold(ns.Data, "a") {
 						if hasAncestorClass(c, "bottom") || hasAncestorClass(c, "list_menu") {
 							shouldBreak = false
 						}
+					} else if ns.Type == html.ElementNode && isInlinePhrasingTag(ns.Data) && isPhrasingParent(c.Parent) {
+						shouldBreak = false
 					}
 				}
 			}
-			if !shouldBreak && iconOnly {
+			if !shouldBreak && shouldInsertInlineGapAfterLink(c) {
 				p.AddText(" ")
 			}
 			if shouldBreak {
@@ -2969,6 +3258,17 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 			}
 			p.AddText("+")
 			recurse = false
+		case "tr":
+			if hasAncestorClass(c, "tlist") {
+				before := p.UnitCount()
+				if c.FirstChild != nil {
+					walkRich(c.FirstChild, base, p, visited, st, prefs)
+				}
+				if p.UnitCount() > before {
+					p.AddBreak()
+				}
+				recurse = false
+			}
 		case "table":
 			if hasFormControls(c) || hasAnchorLinks(c) {
 				// let recursion process interactive content to preserve links
@@ -3071,8 +3371,12 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 			recurse = false
 		case "form":
 			action := getAttr(c, "action")
-			p.AddForm(action)
 			absAction := resolveFormActionURL(base, action)
+			formAction := absAction
+			if formAction == "" {
+				formAction = action
+			}
+			p.AddFormWithMethod(formAction, getAttr(c, "method"))
 			st.formStack = append(st.formStack, absAction)
 		case "button":
 			typ := strings.ToLower(getAttr(c, "type"))
@@ -3146,13 +3450,12 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 						actionKey = resolveFormActionURL(base, "")
 					}
 					if actionKey != "" {
-						if p.FormHidden[actionKey] == nil {
-							p.FormHidden[actionKey] = make(map[string]string)
+						p.RecordHidden(actionKey, name, value)
+						overrides := map[string]string{}
+						ensureHiddenFieldOverrides(actionKey, overrides)
+						for overrideName, overrideValue := range overrides {
+							p.RecordHidden(actionKey, overrideName, overrideValue)
 						}
-						if _, exists := p.FormHidden[actionKey][name]; !exists {
-							p.FormHidden[actionKey][name] = value
-						}
-						ensureHiddenFieldOverrides(actionKey, p.FormHidden[actionKey])
 					}
 				}
 			case "button":
@@ -3208,16 +3511,10 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 					}
 				}
 				if !skip {
-					var txt string
-					if st.pre {
-						txt = c.Data
-					} else {
-						txt = condenseSpaces(c.Data)
-					}
+					txt := textNodeContent(c, st)
 					if txt != "" {
 						if !visited[c] {
 							visited[c] = true
-							txt := c.Data
 							addTextWithColor(p, st, c, txt)
 						}
 					}
@@ -3227,18 +3524,7 @@ func walkRich(cur *html.Node, base string, p *Page, visited map[*html.Node]bool,
 		if recurse && c.FirstChild != nil {
 			walkRich(c.FirstChild, base, p, visited, st, prefs)
 		}
-		if stylePushed {
-			st.popStyle(p)
-		}
-		if colorPushed {
-			st.popColor(p)
-		}
-		if alignedPushed {
-			st.popStyle(p)
-		}
-		if bgColorPushed {
-			st.popBgcolor(p)
-		}
+		finishCurrent()
 		if c.Type == html.ElementNode && strings.EqualFold(c.Data, "form") {
 			if len(st.formStack) > 0 {
 				st.formStack = st.formStack[:len(st.formStack)-1]
@@ -3393,6 +3679,10 @@ func isIconOnlyLink(n *html.Node) bool {
 				switch tag {
 				case "img", "svg":
 					hasIcon = true
+				case "span", "div":
+					if hasAnyClass(c, "balls", "icon", "ico", "sprite") || strings.Contains(strings.ToLower(getAttr(c, "style")), "background") {
+						hasIcon = true
+					}
 				case "picture":
 					// picture wraps <img> / <source>; recurse to find the actual image.
 				case "title", "desc":
@@ -3617,6 +3907,8 @@ func cacheCandidatesFor(prefs RenderOptions) []cacheCandidate {
 		want = "image/jpeg"
 	}
 	switch want {
+	case RGB565MIME:
+		return []cacheCandidate{{format: RGB565MIME, quality: 0}}
 	case "image/png":
 		return []cacheCandidate{{format: "image/png", quality: 0}}
 	case "image/gif":
@@ -3639,16 +3931,17 @@ func jpegQualityFor(prefs RenderOptions) int {
 func fetchAndEncodeImage(absURL string, prefs RenderOptions) ([]byte, int, int, bool) {
 	debug := os.Getenv("OMS_IMG_DEBUG") == "1"
 	candidates := cacheCandidatesFor(prefs)
+	cacheKey := imageCacheVariantKey(absURL, prefs)
 
 	for _, cand := range candidates {
-		if data, w, h, ok := imgCacheGet(cand.format, cand.quality, absURL); ok {
+		if data, w, h, ok := imgCacheGet(cand.format, cand.quality, cacheKey); ok {
 			if debug {
 				log.Printf("IMG cache hit mem fmt=%s q=%d url=%s", cand.format, cand.quality, absURL)
 			}
 			return data, w, h, true
 		}
-		if data, w, h, ok := diskCacheGet(cand.format, cand.quality, absURL); ok {
-			imgCachePut(cand.format, cand.quality, absURL, data, w, h)
+		if data, w, h, ok := diskCacheGet(cand.format, cand.quality, cacheKey); ok {
+			imgCachePut(cand.format, cand.quality, cacheKey, data, w, h)
 			if debug {
 				log.Printf("IMG cache hit disk fmt=%s q=%d url=%s", cand.format, cand.quality, absURL)
 			}
@@ -3658,8 +3951,8 @@ func fetchAndEncodeImage(absURL string, prefs RenderOptions) ([]byte, int, int, 
 
 	if strings.HasPrefix(absURL, "data:") {
 		if data, w, h, format, quality, ok := decodeDataURI(absURL, prefs); ok {
-			imgCachePut(format, quality, absURL, data, w, h)
-			diskCachePut(format, quality, absURL, data, w, h)
+			imgCachePut(format, quality, cacheKey, data, w, h)
+			diskCachePut(format, quality, cacheKey, data, w, h)
 			return data, w, h, true
 		}
 		if debug {
@@ -3754,9 +4047,20 @@ func fetchAndEncodeImage(absURL string, prefs RenderOptions) ([]byte, int, int, 
 		return nil, 0, 0, false
 	}
 
-	imgCachePut(format, quality, absURL, data, w, h)
-	diskCachePut(format, quality, absURL, data, w, h)
+	imgCachePut(format, quality, cacheKey, data, w, h)
+	diskCachePut(format, quality, cacheKey, data, w, h)
 	return data, w, h, true
+}
+
+func imageCacheVariantKey(absURL string, prefs RenderOptions) string {
+	// Anonymous/private ambiguity is unsafe: without an explicit gateway
+	// partition, skip caching rather than share origin-dependent assets.
+	if strings.TrimSpace(prefs.CachePartition) == "" {
+		return ""
+	}
+	return fmt.Sprintf("%s|session=%s|viewport=%dx%d|mime=%s|quality=%t|inline=%d|v=2",
+		absURL, prefs.CachePartition, prefs.ScreenW, prefs.ScreenH, prefs.ImageMIME,
+		prefs.HighQuality, prefs.MaxInlineKB)
 }
 
 func clampImageToScreenWidth(img image.Image, maxWidth int) (image.Image, int, int) {
@@ -3777,6 +4081,73 @@ func clampImageToScreenWidth(img image.Image, maxWidth int) (image.Image, int, i
 	return dst, maxWidth, scaledH
 }
 
+// clampImageToRGB565Budget keeps the uncompressed handset payload within both
+// the OM3 uint16 tag limit and the client-advertised per-image memory budget.
+func clampImageToRGB565Budget(img image.Image, maxBytes int) (image.Image, int, int) {
+	b := img.Bounds()
+	w, h := b.Dx(), b.Dy()
+	if w <= 0 || h <= 0 {
+		return img, w, h
+	}
+	if maxBytes <= 0 || maxBytes > 0xfffe {
+		maxBytes = 0xfffe
+	}
+	maxPixels := maxBytes / 2
+	if maxPixels < 1 {
+		maxPixels = 1
+	}
+	if w <= maxPixels/h {
+		return img, w, h
+	}
+	scale := math.Sqrt(float64(maxPixels) / float64(w*h))
+	newW := int(math.Floor(float64(w) * scale))
+	newH := int(math.Floor(float64(h) * scale))
+	if newW < 1 {
+		newW = 1
+	}
+	if newH < 1 {
+		newH = 1
+	}
+	for newW*newH > maxPixels {
+		if newW >= newH && newW > 1 {
+			newW--
+		} else if newH > 1 {
+			newH--
+		} else {
+			break
+		}
+	}
+	dst := image.NewRGBA(image.Rect(0, 0, newW, newH))
+	draw.CatmullRom.Scale(dst, dst.Bounds(), img, b, draw.Over, nil)
+	return dst, newW, newH
+}
+
+func encodeRGB565BE(img image.Image, maxBytes int) ([]byte, int, int) {
+	img, w, h := clampImageToRGB565Budget(img, maxBytes)
+	if w <= 0 || h <= 0 {
+		return nil, w, h
+	}
+	out := make([]byte, w*h*2)
+	b := img.Bounds()
+	position := 0
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			r, g, bl, a := img.At(b.Min.X+x, b.Min.Y+y).RGBA()
+			// RGBA values are alpha-premultiplied. Composite transparency over
+			// white, matching the normal page background on old handsets.
+			r += 0xffff - a
+			g += 0xffff - a
+			bl += 0xffff - a
+			pixel := uint16(((r * 31 / 0xffff) << 11) |
+				((g * 63 / 0xffff) << 5) | (bl * 31 / 0xffff))
+			out[position] = byte(pixel >> 8)
+			out[position+1] = byte(pixel)
+			position += 2
+		}
+	}
+	return out, w, h
+}
+
 func encodeImage(img image.Image, prefs RenderOptions) ([]byte, int, int, string, int, error) {
 	img, w, h := clampImageToScreenWidth(img, prefs.ScreenW)
 
@@ -3792,6 +4163,10 @@ func encodeImage(img image.Image, prefs RenderOptions) ([]byte, int, int, string
 	quality := 0
 
 	switch want {
+	case RGB565MIME:
+		maxBytes := prefs.MaxInlineKB * 1024
+		data, rgbW, rgbH := encodeRGB565BE(img, maxBytes)
+		return data, rgbW, rgbH, want, quality, nil
 	case "image/png":
 		enc := png.Encoder{CompressionLevel: png.DefaultCompression}
 		if prefs.HighQuality {
@@ -3878,11 +4253,11 @@ func decodeDataURI(uri string, prefs RenderOptions) ([]byte, int, int, string, i
 
 // ---------------------- Public API with options ----------------------
 
-// RenderDocument takes a fetched upstream document and produces an OMS page
-// using the provided render options and request headers.
+// RenderDocument is the backwards-compatible Opera Mini facade. New formats
+// should reuse TransformDocument and provide their own presentation encoder.
 func RenderDocument(doc *UpstreamDocument, hdr http.Header, opts *RenderOptions) (*Page, error) {
 	if doc == nil {
-		return errorPage("", "Internal server error"), nil
+		return encodeErrorPage("", "Internal server error", opts)
 	}
 	effectiveURL := doc.URL
 	if effectiveURL == "" {
@@ -3891,17 +4266,17 @@ func RenderDocument(doc *UpstreamDocument, hdr http.Header, opts *RenderOptions)
 	if doc.Header == nil {
 		doc.Header = http.Header{}
 	}
-	if shouldOfferDownload(doc.Header) {
-		return renderDownloadPageFromDocument(doc, opts), nil
-	}
 	body := doc.Body
 	if len(body) == 0 {
 		body = doc.RawBody
 	}
 	if len(body) == 0 {
-		return errorPage(effectiveURL, "Empty response"), nil
+		return encodeErrorPage(effectiveURL, "Empty response", opts)
 	}
 	if looksLikeOMS(body) {
+		if os.Getenv("OMS_ALLOW_RAW_PASSTHROUGH") != "1" {
+			return encodeErrorPage(effectiveURL, "Pre-encoded OMS response rejected", opts)
+		}
 		page := &Page{
 			Data:       append([]byte(nil), body...),
 			SetCookies: append([]string(nil), doc.SetCookies...),
@@ -3913,11 +4288,45 @@ func RenderDocument(doc *UpstreamDocument, hdr http.Header, opts *RenderOptions)
 		}
 		return page, nil
 	}
+	model, err := TransformDocument(doc, hdr, opts)
+	if err != nil {
+		return encodeErrorPage(effectiveURL, "Internal server error while parsing", opts)
+	}
+	return EncodeDocument(model, opts)
+}
+
+// TransformDocument converts an origin response into a reusable presentation
+// display list. It performs HTML/CSS simplification and asset transcoding but
+// contains no Opera Mini auth, framing, version, compression or pagination.
+func TransformDocument(doc *UpstreamDocument, hdr http.Header, opts *RenderOptions) (*presentation.Document, error) {
+	if doc == nil {
+		return nil, fmt.Errorf("transform content: nil origin response")
+	}
+	effectiveURL := doc.URL
+	if effectiveURL == "" {
+		effectiveURL = "about:blank"
+	}
+	if doc.Header == nil {
+		doc.Header = http.Header{}
+	}
+	if shouldOfferDownload(doc.Header) {
+		return transformDownloadDocument(doc, opts), nil
+	}
+	body := doc.Body
+	if len(body) == 0 {
+		body = doc.RawBody
+	}
+	if len(body) == 0 {
+		return nil, fmt.Errorf("transform content: empty response")
+	}
+	if looksLikeOMS(body) {
+		return nil, fmt.Errorf("transform content: source is already OMS encoded")
+	}
 	utf8Body := decodeLegacyToUTF8(body, doc.Header.Get("Content-Type"))
 	decodedLen := len(utf8Body)
 	parsed, err := html.Parse(bytes.NewReader(utf8Body))
 	if err != nil {
-		return errorPage(effectiveURL, "Internal server error while parsing"), nil
+		return nil, fmt.Errorf("transform content: parse HTML: %w", err)
 	}
 	rp := defaultRenderPrefs()
 	var jar http.CookieJar
@@ -3925,18 +4334,8 @@ func RenderDocument(doc *UpstreamDocument, hdr http.Header, opts *RenderOptions)
 		rp = *opts
 		jar = opts.Jar
 	}
-	p := NewPage()
-	p.SetCookies = append([]string(nil), doc.SetCookies...)
-	p.Stats.OriginTransferBytes = doc.TransferBytes
-	p.Stats.OriginDecodedBytes = decodedLen
-	p.AddString("1/" + effectiveURL)
-	if rp.AuthCode != "" {
-		p.AddAuthcode(rp.AuthCode)
-	}
-	if rp.AuthPrefix != "" {
-		p.AddAuthprefix(rp.AuthPrefix)
-	}
-	p.AddStyle(styleDefault)
+	target := newContentTarget(effectiveURL)
+	target.AddStyle(styleDefault)
 	base := effectiveURL
 	if i := strings.Index(base, "?"); i != -1 {
 		base = base[:i]
@@ -3944,7 +4343,7 @@ func RenderDocument(doc *UpstreamDocument, hdr http.Header, opts *RenderOptions)
 	base = findBaseURL(parsed, base)
 	rp.ReqHeaders = hdr
 	rp.Referrer = effectiveURL
-	rp.Styles = buildStylesheet(parsed, base, hdr, jar)
+	rp.Styles = buildStylesheet(parsed, base, hdr, jar, &rp)
 	chosenCol := ""
 	chosenBg := ""
 	if bodyNode := findFirstByTag(parsed, "body"); bodyNode != nil {
@@ -3983,15 +4382,15 @@ func RenderDocument(doc *UpstreamDocument, hdr http.Header, opts *RenderOptions)
 			}
 		}
 		if bgHex != "" {
-			p.AddBgcolor(bgHex)
+			target.AddBgcolor(bgHex)
 		}
 		chosenBg = bgHex
 		chosenCol = ""
 		if fgHex != "" {
-			p.AddTextcolor(fgHex)
+			target.AddStyle(styleDefault | (uint32(calcColor(readableTextColorForOM(fgHex, chosenBg))) << 8))
 			chosenCol = fgHex
 		} else if bgHex != "" && isDarkHex(bgHex) {
-			p.AddTextcolor("#eeeeee")
+			target.AddStyle(styleDefault | (uint32(calcColor(readableTextColorForOM("#eeeeee", chosenBg))) << 8))
 			chosenCol = "#eeeeee"
 		}
 	}
@@ -4004,11 +4403,11 @@ func RenderDocument(doc *UpstreamDocument, hdr http.Header, opts *RenderOptions)
 		st.curBg = chosenBg
 	}
 	st.css = rp.Styles
-	p.AddStyle(styleDefault)
-	walkRich(parsed, base, p, visited, &st, rp)
-	if len(p.SetCookies) > 0 {
+	target.AddStyle(styleDefault)
+	walkRich(parsed, base, target, visited, &st, rp)
+	if len(doc.SetCookies) > 0 {
 		var pairs []string
-		for _, sc := range p.SetCookies {
+		for _, sc := range doc.SetCookies {
 			i := strings.IndexByte(sc, ';')
 			kv := sc
 			if i != -1 {
@@ -4023,14 +4422,59 @@ func RenderDocument(doc *UpstreamDocument, hdr http.Header, opts *RenderOptions)
 			rp.OriginCookies = strings.Join(pairs, "; ")
 		}
 	}
+	model := target.Document()
+	model.SetCookies = append([]string(nil), doc.SetCookies...)
+	model.Metrics.OriginTransferBytes = doc.TransferBytes
+	model.Metrics.OriginDecodedBytes = decodedLen
+
+	return model, nil
+}
+
+// EncodeDocument maps a protocol-independent presentation document to the
+// Opera Mini OMS/OBML dialect selected by opts. It owns framing, auth echo,
+// pagination, transport version and compression.
+func EncodeDocument(model *presentation.Document, opts *RenderOptions) (*Page, error) {
+	if model == nil {
+		return nil, fmt.Errorf("encode OMS: nil presentation document")
+	}
+	rp := defaultRenderPrefs()
+	if opts != nil {
+		rp = *opts
+	}
+	effectiveURL := model.URL
+	if effectiveURL == "" {
+		effectiveURL = "about:blank"
+	}
+
+	// Configure the dialect before emitting style records: OM3 uses a wider
+	// style payload than OM1/OM2.
+	p := NewPage()
+	p.SetTransport(rp.ClientVersion, rp.Compression)
+	p.SetCookies = append([]string(nil), model.SetCookies...)
+	p.Stats.OriginTransferBytes = model.Metrics.OriginTransferBytes
+	p.Stats.OriginDecodedBytes = model.Metrics.OriginDecodedBytes
+	p.FormHidden = cloneHiddenFields(model.FormHidden)
+	p.NoCache = model.NoCache
+	p.AddString("1/" + effectiveURL)
+	if rp.AuthCode != "" {
+		p.AddAuthcode(rp.AuthCode)
+	}
+	if rp.AuthPrefix != "" {
+		p.AddAuthprefix(rp.AuthPrefix)
+	}
+	encodeContentOperations(p, model)
 	pageIdx := 1
 	maxTags := 0
+	maxPageBytes := maxBytesBudget()
 	if opts != nil {
 		if opts.Page > 0 {
 			pageIdx = opts.Page
 		}
 		if opts.MaxTagsPerPage > 0 {
 			maxTags = opts.MaxTagsPerPage
+		}
+		if opts.MaxBytesPerPage > 0 {
+			maxPageBytes = opts.MaxBytesPerPage
 		}
 	}
 	if maxTags == 0 {
@@ -4058,7 +4502,7 @@ func RenderDocument(doc *UpstreamDocument, hdr http.Header, opts *RenderOptions)
 		packed.finalize()
 		p.CachePacked = append([]byte(nil), packed.Data...)
 	}
-	parts := splitByTags(p.Data, maxTags, rp.ClientVersion)
+	parts := splitByTagsWithBudget(p.Data, maxTags, rp.ClientVersion, maxPageBytes)
 	if len(parts) == 0 {
 		p.finalize()
 		return p, nil
@@ -4067,12 +4511,8 @@ func RenderDocument(doc *UpstreamDocument, hdr http.Header, opts *RenderOptions)
 		pageIdx = len(parts)
 	}
 	sel := parts[pageIdx-1]
-	styleDataLen := 4
-	if rp.ClientVersion == ClientVersion3 {
-		styleDataLen = 6
-	}
 	if pageIdx > 1 {
-		sel = rewriteInitialURLRaw(sel, pageIdx)
+		sel = rewriteInitialURLRaw(sel, pageIdx, maxTags)
 	}
 	serverBase := ""
 	if opts != nil {
@@ -4080,6 +4520,7 @@ func RenderDocument(doc *UpstreamDocument, hdr http.Header, opts *RenderOptions)
 	}
 	if len(parts) > 1 && serverBase != "" {
 		nav := NewPage()
+		nav.SetTransport(rp.ClientVersion, rp.Compression)
 		nav.AddHr("")
 		if pageIdx > 1 {
 			prevURL := BuildPaginationLink(effectiveURL, &rp, pageIdx-1, maxTags)
@@ -4133,12 +4574,12 @@ func RenderDocument(doc *UpstreamDocument, hdr http.Header, opts *RenderOptions)
 			lastShown = n
 		}
 		nav.AddBreak()
-		budget := maxBytesBudget()
+		budget := maxPageBytes
 		allowed := budget - len(nav.Data)
 		if allowed < 1024 {
 			allowed = 1024
 		}
-		sel = shrinkPartToMaxBytes(sel, allowed, styleDataLen)
+		sel = shrinkPartToMaxBytes(sel, allowed, rp.ClientVersion)
 		sel = append(sel, nav.Data...)
 	}
 	p.Data = sel
@@ -4155,6 +4596,17 @@ func LoadPageWithHeadersAndOptions(oURL string, hdr http.Header, opts *RenderOpt
 }
 
 func LoadPageWithHeadersAndOptionsCtx(ctx context.Context, oURL string, hdr http.Header, opts *RenderOptions) (*Page, error) {
+	doc, err := FetchDocumentWithHeadersAndOptionsCtx(ctx, oURL, hdr, opts)
+	if err != nil {
+		return nil, err
+	}
+	return RenderDocument(doc, hdr, opts)
+}
+
+// FetchDocumentWithHeadersAndOptionsCtx performs origin acquisition without
+// transforming or encoding the response. The RenderOptions argument remains a
+// temporary compatibility bridge for form submission and cookie-jar state.
+func FetchDocumentWithHeadersAndOptionsCtx(ctx context.Context, oURL string, hdr http.Header, opts *RenderOptions) (*UpstreamDocument, error) {
 	effectiveURL := oURL
 	method := http.MethodGet
 	var bodyReader io.Reader
@@ -4166,7 +4618,7 @@ func LoadPageWithHeadersAndOptionsCtx(ctx context.Context, oURL string, hdr http
 	}
 
 	if opts != nil {
-		if fb := strings.TrimSpace(opts.FormBody); fb != "" && fb != "0" {
+		if fb := strings.TrimSpace(opts.FormBody); debugHTTP && fb != "" && fb != "0" {
 			if vals, err := url.ParseQuery(fb); err == nil {
 				var parts []string
 				for k, vs := range vals {
@@ -4187,7 +4639,9 @@ func LoadPageWithHeadersAndOptionsCtx(ctx context.Context, oURL string, hdr http
 			}
 		}
 		if submission := prepareOperaMiniSubmission(oURL, opts.FormBody); submission != nil {
-			log.Printf("SUBMISSION plan method=%s url=%s body_len=%d ct=%s", submission.Method, submission.URL, len(submission.Body), submission.ContentType)
+			if debugHTTP {
+				log.Printf("SUBMISSION plan method=%s url=%s body_len=%d ct=%s", submission.Method, submission.URL, len(submission.Body), submission.ContentType)
+			}
 			if submission.URL != "" {
 				effectiveURL = submission.URL
 			}
@@ -4205,7 +4659,7 @@ func LoadPageWithHeadersAndOptionsCtx(ctx context.Context, oURL string, hdr http
 
 	req, err := http.NewRequestWithContext(ctx, method, effectiveURL, bodyReader)
 	if err != nil {
-		return errorPage(effectiveURL, "Internal server error"), nil
+		return nil, fmt.Errorf("build origin request: %w", err)
 	}
 	if contentTypeOverride != "" && hdr.Get("Content-Type") == "" {
 		hdr.Set("Content-Type", contentTypeOverride)
@@ -4227,6 +4681,8 @@ func LoadPageWithHeadersAndOptionsCtx(ctx context.Context, oURL string, hdr http
 			req.Header.Add(k, v)
 		}
 	}
+	// Internal session routing must never cross the origin trust boundary.
+	req.Header.Del("X-Operetta-Client-Key")
 	if req.Method == http.MethodPost {
 		if req.Header.Get("Referer") == "" {
 			if u, err := url.Parse(effectiveURL); err == nil {
@@ -4279,34 +4735,45 @@ func LoadPageWithHeadersAndOptionsCtx(ctx context.Context, oURL string, hdr http
 	}
 	resp, err := hc.Do(req)
 	if err != nil {
-		return errorPage(effectiveURL, "Timeout loading page"), nil
+		return nil, fmt.Errorf("fetch origin %q: %w", effectiveURL, err)
 	}
 	defer resp.Body.Close()
 
-	rawBody, err := io.ReadAll(resp.Body)
+	rawBody, err := readAllLimited(resp.Body, maxOriginTransferBytes)
 	if err != nil {
-		return errorPage(effectiveURL, "Internal server error"), nil
+		return nil, fmt.Errorf("read origin %q: %w", effectiveURL, err)
 	}
 	transferBytes := len(rawBody)
 	body := rawBody
 	if encoding := strings.ToLower(strings.TrimSpace(resp.Header.Get("Content-Encoding"))); encoding != "" {
 		switch encoding {
 		case "gzip":
-			if gr, gerr := gzip.NewReader(bytes.NewReader(rawBody)); gerr == nil {
-				if decoded, derr := io.ReadAll(gr); derr == nil {
-					body = decoded
-				}
-				_ = gr.Close()
+			gr, gerr := gzip.NewReader(bytes.NewReader(rawBody))
+			if gerr != nil {
+				return nil, fmt.Errorf("decode gzip response %q: %w", effectiveURL, gerr)
 			}
+			if decoded, derr := readAllLimited(gr, maxOriginDecodedBytes); derr == nil {
+				body = decoded
+			} else {
+				_ = gr.Close()
+				return nil, fmt.Errorf("decode gzip response %q: %w", effectiveURL, derr)
+			}
+			_ = gr.Close()
 		case "deflate":
 			if zr, zerr := zlib.NewReader(bytes.NewReader(rawBody)); zerr == nil {
-				if decoded, derr := io.ReadAll(zr); derr == nil {
+				if decoded, derr := readAllLimited(zr, maxOriginDecodedBytes); derr == nil {
 					body = decoded
+				} else {
+					_ = zr.Close()
+					return nil, fmt.Errorf("decode deflate response %q: %w", effectiveURL, derr)
 				}
 				_ = zr.Close()
 			} else if fr := flate.NewReader(bytes.NewReader(rawBody)); fr != nil {
-				if decoded, derr := io.ReadAll(fr); derr == nil {
+				if decoded, derr := readAllLimited(fr, maxOriginDecodedBytes); derr == nil {
 					body = decoded
+				} else {
+					_ = fr.Close()
+					return nil, fmt.Errorf("decode raw deflate response %q: %w", effectiveURL, derr)
 				}
 				_ = fr.Close()
 			}
@@ -4326,14 +4793,6 @@ func LoadPageWithHeadersAndOptionsCtx(ctx context.Context, oURL string, hdr http
 			finalURL = resp.Request.URL.String()
 		}
 		log.Printf("UPSTREAM resp status=%d final=%s set-cookie=%d", resp.StatusCode, finalURL, nsc)
-		if nsc > 0 {
-			for i, v := range sc {
-				if i >= 3 {
-					break
-				}
-				log.Printf("UPSTREAM set-cookie[%d]=%s", i, v)
-			}
-		}
 	}
 
 	finalURL := effectiveURL
@@ -4350,7 +4809,26 @@ func LoadPageWithHeadersAndOptionsCtx(ctx context.Context, oURL string, hdr http
 		ContentLength: resp.ContentLength,
 		SetCookies:    append([]string(nil), resp.Header["Set-Cookie"]...),
 	}
-	return RenderDocument(doc, hdr, opts)
+	return doc, nil
+}
+
+const (
+	maxOriginTransferBytes = 8 << 20
+	maxOriginDecodedBytes  = 32 << 20
+)
+
+func readAllLimited(r io.Reader, limit int64) ([]byte, error) {
+	if limit <= 0 {
+		return nil, fmt.Errorf("invalid read limit %d", limit)
+	}
+	b, err := io.ReadAll(io.LimitReader(r, limit+1))
+	if err != nil {
+		return nil, err
+	}
+	if int64(len(b)) > limit {
+		return nil, fmt.Errorf("response exceeds %d bytes", limit)
+	}
+	return b, nil
 }
 
 type formSubmission struct {
@@ -4370,6 +4848,7 @@ func prepareOperaMiniSubmission(baseURL, payload string) *formSubmission {
 	}
 	values := url.Values{}
 	actionOverride := ""
+	actionMethodCode := ""
 	method := http.MethodGet
 	seenOPF := false
 	hasSensitive := false
@@ -4422,10 +4901,16 @@ func prepareOperaMiniSubmission(baseURL, payload string) *formSubmission {
 			hasSensitive = hasSensitive || (val != "")
 		}
 		if isActionKey {
+			if actionMethodCode == "" {
+				actionMethodCode = val
+			}
 			continue
 		}
 		normalizedKey := key
 		values.Add(normalizedKey, val)
+	}
+	if !seenOPF && actionMethodCode != "" {
+		method = formMethodFromCode(actionMethodCode, method)
 	}
 	if method == http.MethodGet && hasSensitive {
 		////if os.Getenv("OMS_HTTP_DEBUG") == "1" {
@@ -4504,6 +4989,18 @@ func prepareOperaMiniSubmission(baseURL, payload string) *formSubmission {
 		Body:        values.Encode(),
 		ContentType: "application/x-www-form-urlencoded",
 	}
+}
+
+func formMethodFromCode(code, fallback string) string {
+	switch strings.ToLower(strings.TrimSpace(code)) {
+	case "2", "post":
+		return http.MethodPost
+	case "0", "1", "get", "":
+		if fallback != "" {
+			return fallback
+		}
+	}
+	return http.MethodGet
 }
 
 func upgradeURLToHTTPS(u *url.URL) *url.URL {
@@ -4586,7 +5083,7 @@ func humanReadableSize(n int64) string {
 func nextSignificantSibling(n *html.Node) *html.Node {
 	for s := n.NextSibling; s != nil; s = s.NextSibling {
 		if s.Type == html.TextNode {
-			if strings.TrimSpace(s.Data) == "" {
+			if strings.TrimSpace(collapseHTMLWhitespace(s.Data)) == "" {
 				continue
 			}
 			return s
@@ -4596,6 +5093,122 @@ func nextSignificantSibling(n *html.Node) *html.Node {
 		}
 	}
 	return nil
+}
+
+func previousSignificantSibling(n *html.Node) *html.Node {
+	for s := n.PrevSibling; s != nil; s = s.PrevSibling {
+		if s.Type == html.TextNode {
+			if strings.TrimSpace(collapseHTMLWhitespace(s.Data)) == "" {
+				continue
+			}
+			return s
+		}
+		if s.Type == html.ElementNode {
+			return s
+		}
+	}
+	return nil
+}
+
+func shouldPreserveInlineWhitespace(n *html.Node) bool {
+	if n == nil || n.Type != html.TextNode {
+		return false
+	}
+	if strings.TrimSpace(collapseHTMLWhitespace(n.Data)) != "" {
+		return false
+	}
+	return isInlineContentBoundary(previousSignificantSibling(n)) && isInlineContentBoundary(nextSignificantSibling(n))
+}
+
+func isInlineContentBoundary(n *html.Node) bool {
+	if n == nil {
+		return false
+	}
+	if n.Type == html.TextNode {
+		return strings.TrimSpace(collapseHTMLWhitespace(n.Data)) != ""
+	}
+	if n.Type != html.ElementNode {
+		return false
+	}
+	tag := strings.ToLower(n.Data)
+	return tag == "a" || isInlinePhrasingTag(tag)
+}
+
+func isCompactInlineLinkGroup(n *html.Node) bool {
+	if n == nil || n.Parent == nil || n.Parent.Type != html.ElementNode {
+		return false
+	}
+	parentTag := strings.ToLower(n.Parent.Data)
+	switch parentTag {
+	case "nav", "span":
+		return true
+	case "div", "p", "td", "th", "li":
+	default:
+		return false
+	}
+	if hasAnyClass(n.Parent, "breadcrumb", "breadcrumbs", "crumbs", "path", "pager", "pages", "pagination", "nav", "navbar", "bottom", "list_menu", "loc") {
+		return true
+	}
+	linkCount := 0
+	visibleText := 0
+	for c := n.Parent.FirstChild; c != nil; c = c.NextSibling {
+		switch c.Type {
+		case html.TextNode:
+			visibleText += len(strings.TrimSpace(c.Data))
+		case html.ElementNode:
+			tag := strings.ToLower(c.Data)
+			if tag == "a" {
+				linkCount++
+				visibleText += len(strings.TrimSpace(collectText(c)))
+				continue
+			}
+			if !isInlinePhrasingTag(tag) {
+				return false
+			}
+			visibleText += len(strings.TrimSpace(collectText(c)))
+		}
+		if visibleText > 96 {
+			return false
+		}
+	}
+	return linkCount >= 2 && visibleText <= 96
+}
+
+func isPhrasingParent(n *html.Node) bool {
+	if n == nil || n.Type != html.ElementNode {
+		return false
+	}
+	switch strings.ToLower(n.Data) {
+	case "p", "span", "small", "b", "strong", "i", "em", "u", "li", "td", "th", "label":
+		return true
+	}
+	return false
+}
+
+func isInlinePhrasingTag(tag string) bool {
+	switch strings.ToLower(tag) {
+	case "span", "small", "b", "strong", "i", "em", "u", "font", "img", "sup", "sub", "code", "time":
+		return true
+	}
+	return false
+}
+
+func shouldInsertInlineGapAfterLink(n *html.Node) bool {
+	for ns := n.NextSibling; ns != nil; ns = ns.NextSibling {
+		if ns.Type == html.TextNode {
+			if strings.TrimSpace(collapseHTMLWhitespace(ns.Data)) == "" {
+				if shouldPreserveInlineWhitespace(ns) {
+					return false
+				}
+				continue
+			}
+			return false
+		}
+		if ns.Type == html.ElementNode {
+			return strings.EqualFold(ns.Data, "a") || isInlinePhrasingTag(ns.Data)
+		}
+	}
+	return false
 }
 
 func hasPrefixAny(s string, prefixes ...string) bool {

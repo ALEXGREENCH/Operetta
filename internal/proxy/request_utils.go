@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 )
 
@@ -26,16 +27,29 @@ func parseNullKV(b []byte) map[string]string {
 }
 
 func normalizeObmlURL(u string) string {
+	normalized, _, _ := normalizeObmlURLWithPart(u)
+	return normalized
+}
+
+func normalizeObmlURLWithPart(u string) (string, int, bool) {
 	s := strings.TrimSpace(u)
 	if s == "" {
-		return s
+		return s, 0, false
 	}
 	s = urlDecode(s)
+	part := 0
+	hasPart := false
 	if strings.HasPrefix(s, "/obml/") {
 		s = s[len("/obml/"):]
 		i := 0
 		for i < len(s) && s[i] >= '0' && s[i] <= '9' {
 			i++
+		}
+		if i > 0 {
+			if n, err := strconv.Atoi(s[:i]); err == nil {
+				part = n
+				hasPart = true
+			}
 		}
 		if i < len(s) && s[i] == '/' {
 			s = s[i+1:]
@@ -50,7 +64,7 @@ func normalizeObmlURL(u string) string {
 	if !(strings.HasPrefix(lower, "http://") || strings.HasPrefix(lower, "https://")) {
 		s = "http://" + s
 	}
-	return s
+	return s, part, hasPart
 }
 
 func extractOMFragment(raw string) (string, map[string]string) {
@@ -58,27 +72,77 @@ func extractOMFragment(raw string) (string, map[string]string) {
 	if err != nil {
 		return raw, nil
 	}
+	var out map[string]string
+	addExtras := func(data string) {
+		data = strings.TrimSpace(data)
+		if data == "" {
+			return
+		}
+		vals, err := url.ParseQuery(data)
+		if err != nil {
+			return
+		}
+		if out == nil {
+			out = make(map[string]string, len(vals))
+		}
+		for k, vs := range vals {
+			if len(vs) > 0 {
+				out[k] = vs[0]
+			}
+		}
+	}
+
+	q := parsed.Query()
+	if data := q.Get("__om"); strings.TrimSpace(data) != "" {
+		addExtras(data)
+		q.Del("__om")
+	}
+	// Older encoded parts use __p solely as a cache/history discriminator.
+	// Accept it as an explicit page on reload, but never forward it upstream.
+	if part := strings.TrimSpace(q.Get("__p")); part != "" {
+		if _, exists := out["page"]; !exists {
+			if n, err := strconv.Atoi(part); err == nil && n > 0 {
+				if out == nil {
+					out = make(map[string]string)
+				}
+				out["page"] = strconv.Itoa(n)
+			}
+		}
+		q.Del("__p")
+	}
+	parsed.RawQuery = q.Encode()
+
 	frag := strings.TrimSpace(parsed.Fragment)
 	parsed.Fragment = ""
 	base := parsed.String()
 	if frag == "" {
-		return base, nil
+		return base, out
 	}
 	if !strings.HasPrefix(frag, "__om=") {
-		return base, nil
+		return base, out
 	}
 	data := strings.TrimPrefix(frag, "__om=")
-	vals, err := url.ParseQuery(data)
-	if err != nil {
-		return base, nil
-	}
-	out := make(map[string]string, len(vals))
-	for k, vs := range vals {
-		if len(vs) > 0 {
-			out[k] = vs[0]
+	addExtras(data)
+	return base, out
+}
+
+func mergeOMOptions(params map[string]string, extras map[string]string) {
+	for k, v := range extras {
+		switch k {
+		case "w":
+			params["om_w"] = v
+		case "h":
+			params["om_h"] = v
+		case "c":
+			params["om_c"] = v
+		case "m":
+			params["om_m"] = v
+		case "l":
+			params["om_l"] = v
+		default:
+			params[k] = v
 		}
 	}
-	return base, out
 }
 
 func firstNonEmpty(values ...string) string {

@@ -8,8 +8,6 @@ import (
 	"fmt"
 	"io"
 	"sort"
-	"strconv"
-	//"strings"
 )
 
 func decompressPayload(method CompressionMethod, payload []byte) ([]byte, error) {
@@ -152,6 +150,15 @@ func NormalizeOMSWithStag(b []byte, stag int) ([]byte, error) {
 
 // SelectOMSPartFromPacked returns a selected part from a packed OMS payload.
 func SelectOMSPartFromPacked(data []byte, page, maxTags int) ([]byte, int, int, error) {
+	return SelectOMSPartFromPackedWithBudget(data, page, maxTags, maxBytesBudget())
+}
+
+// SelectOMSPartFromPackedWithBudget keeps cache-hit pagination identical to
+// the original render, including the negotiated per-part byte budget.
+func SelectOMSPartFromPackedWithBudget(data []byte, page, maxTags, maxBytes int) ([]byte, int, int, error) {
+	if maxBytes <= 0 {
+		maxBytes = maxBytesBudget()
+	}
 	if page <= 0 {
 		page = 1
 	}
@@ -176,7 +183,7 @@ func SelectOMSPartFromPacked(data []byte, page, maxTags int) ([]byte, int, int, 
 		return data, 1, 1, io.ErrUnexpectedEOF
 	}
 	raw := decoded[headerLen:]
-	parts := splitByTags(raw, maxTags, version)
+	parts := splitByTagsWithBudget(raw, maxTags, version, maxBytes)
 	if len(parts) == 0 {
 		return data, 1, 1, nil
 	}
@@ -188,7 +195,7 @@ func SelectOMSPartFromPacked(data []byte, page, maxTags int) ([]byte, int, int, 
 	// Ensure legacy clients treat parts as distinct pages by rewriting the
 	// first OMS string to include a page discriminator.
 	if page > 1 {
-		selected = rewriteInitialURLRaw(selected, page)
+		selected = rewriteInitialURLRaw(selected, page, maxTags)
 	}
 	partPage := NewPage()
 	partPage.Data = selected
@@ -202,10 +209,10 @@ func SelectOMSPartFromPacked(data []byte, page, maxTags int) ([]byte, int, int, 
 	return partPage.Data, page, total, nil
 }
 
-// rewriteInitialURLRaw rewrites the very first OMS string ("1/<url>") inside a raw part
-// to include a page discriminator so legacy clients (OM 2.x) treat different parts
-// as different pages in history/cache. It appends "__p=<page>" as a query parameter.
-func rewriteInitialURLRaw(raw []byte, page int) []byte {
+// rewriteInitialURLRaw rewrites the first OMS string ("1/<url>") to carry
+// explicit pagination state. Including pp is essential: without it reload and
+// history can split the same document at different boundaries.
+func rewriteInitialURLRaw(raw []byte, page, maxTags int) []byte {
 	if page <= 1 || len(raw) < 2 {
 		return raw
 	}
@@ -218,15 +225,7 @@ func rewriteInitialURLRaw(raw []byte, page int) []byte {
 		return raw
 	}
 	base := s[2:]
-	sep := "?"
-	for i := 0; i < len(base); i++ {
-		if base[i] == '?' {
-			sep = "&"
-			break
-		}
-	}
-	// Build new string
-	nb := []byte("1/" + base + sep + "__p=" + strconv.Itoa(page))
+	nb := []byte("1/" + BuildPaginationLink(base, nil, page, maxTags))
 	out := make([]byte, 2+len(nb))
 	binary.BigEndian.PutUint16(out[0:2], uint16(len(nb)))
 	copy(out[2:], nb)
@@ -252,10 +251,8 @@ func SelectOMSPartFromPackedWithNav(data []byte, page, maxTags int, serverBase, 
 	headerWord := binary.LittleEndian.Uint16(data[:2])
 	version := clientVersionFromHeaderByte(byte(headerWord & 0xFF))
 	compression := compressionFromHeaderByte(byte(headerWord >> 8))
-	styleDataLen := 4
-	if version == ClientVersion3 {
-		styleDataLen = 6
-	}
+	styleDataLen := stylePayloadSize(version)
+	colorDataLen := colorPayloadSize(version)
 	decoded, err := decompressPayload(compression, data[6:])
 	if err != nil {
 		return data, 1, 1, err
@@ -268,7 +265,11 @@ func SelectOMSPartFromPackedWithNav(data []byte, page, maxTags int, serverBase, 
 		return data, 1, 1, io.ErrUnexpectedEOF
 	}
 	raw := decoded[headerLen:]
-	parts := splitByTags(raw, maxTags, version)
+	maxBytes := maxBytesBudget()
+	if opts != nil && opts.MaxBytesPerPage > 0 {
+		maxBytes = opts.MaxBytesPerPage
+	}
+	parts := splitByTagsWithBudget(raw, maxTags, version, maxBytes)
 	if len(parts) == 0 {
 		return data, 1, 1, nil
 	}
@@ -277,10 +278,16 @@ func SelectOMSPartFromPackedWithNav(data []byte, page, maxTags int, serverBase, 
 		page = total
 	}
 	selected := append([]byte(nil), parts[page-1]...)
+	// A packed full page is already finalized. The last selected part can
+	// therefore end in Q; navigation must be inserted before that marker.
+	// partPage.finalize() writes the single final Q after all injected records.
+	if len(selected) > 0 && selected[len(selected)-1] == 'Q' {
+		selected = selected[:len(selected)-1]
+	}
 
 	// Rewrite initial URL for unique client history/cache.
 	if page > 1 {
-		selected = rewriteInitialURLRaw(selected, page)
+		selected = rewriteInitialURLRaw(selected, page, maxTags)
 	}
 
 	// Build navigation controls
@@ -290,8 +297,13 @@ func SelectOMSPartFromPackedWithNav(data []byte, page, maxTags int, serverBase, 
 		rp.HighQuality = opts.HighQuality
 		rp.ImageMIME = opts.ImageMIME
 		rp.MaxInlineKB = opts.MaxInlineKB
+		rp.MaxBytesPerPage = opts.MaxBytesPerPage
+		rp.Compression = opts.Compression
 		rp.ScreenW = opts.ScreenW
 		rp.ScreenH = opts.ScreenH
+		rp.NumColors = opts.NumColors
+		rp.HeapBytes = opts.HeapBytes
+		rp.AlphaLevels = opts.AlphaLevels
 		rp.AuthCode = opts.AuthCode
 		rp.AuthPrefix = opts.AuthPrefix
 		rp.GatewayVersion = opts.GatewayVersion
@@ -299,6 +311,7 @@ func SelectOMSPartFromPackedWithNav(data []byte, page, maxTags int, serverBase, 
 	}
 	buildNav := func(cur, total int) []byte {
 		nav := NewPage()
+		nav.SetTransport(version, compression)
 		// Compact, finger-friendly: [<<] [<] 1 2 … N [>] [>>]
 		nav.AddHr("")
 		// Prev block
@@ -416,13 +429,13 @@ func SelectOMSPartFromPackedWithNav(data []byte, page, maxTags int, serverBase, 
 	topNav := buildNav(page, total)
 	bottomNav := buildNav(page, total)
 
-	// Respect page byte budget (~32KB): shrink content first
-	budget := maxBytesBudget()
+	// Use the same negotiated byte budget as the original render.
+	budget := maxBytes
 	allowed := budget - (len(topNav) + len(bottomNav))
 	if allowed < 1024 {
 		allowed = 1024
 	}
-	selected = shrinkPartToMaxBytes(selected, allowed, styleDataLen)
+	selected = shrinkPartToMaxBytes(selected, allowed, version)
 
 	// Insert top nav after initial string and prelude tags ('S','D','k')
 	// Compute splice position
@@ -441,11 +454,11 @@ func SelectOMSPartFromPackedWithNav(data []byte, page, maxTags int, serverBase, 
 				}
 				pos += styleDataLen
 			case 'D':
-				if pos+2 > len(selected) {
+				if pos+colorDataLen > len(selected) {
 					pos = len(selected)
 					break
 				}
-				pos += 2
+				pos += colorDataLen
 			case 'k':
 				if pos+1 > len(selected) {
 					pos = len(selected)
@@ -494,10 +507,8 @@ func parseTagCountFromDec(dec []byte, headerLen int, clientVersion ClientVersion
 	}
 	n := 0
 	limit := len(dec)
-	styleDataLen := 4
-	if clientVersion == ClientVersion3 {
-		styleDataLen = 6
-	}
+	styleDataLen := stylePayloadSize(clientVersion)
+	colorDataLen := colorPayloadSize(clientVersion)
 	for p < limit {
 		tag := dec[p]
 		n++
@@ -511,7 +522,7 @@ func parseTagCountFromDec(dec []byte, headerLen int, clientVersion ClientVersion
 			p += 2 + l
 		case 'E', 'B', '+', 'V', 'Q', 'l':
 		case 'D', 'R':
-			p += 2
+			p += colorDataLen
 		case 'S':
 			p += styleDataLen
 		case 'J':

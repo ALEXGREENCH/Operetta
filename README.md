@@ -8,7 +8,7 @@ but behaves like the historic proxy for most classic clients.
 
 Highlights
 ----------
-- Fully self-contained Go 1.24 codebase – no external C dependencies or JNI shims.
+- Fully self-contained Go 1.25 codebase (Go 1.26.5 toolchain) – no external C dependencies or JNI shims.
 - `internal/proxy` provides a modular `Server` with injectable configuration,
   request logging, per-client cookie jars, pagination cache and site overrides.
 - `oms` renders HTML → OMS/OBML: DOM traversal, inline CSS heuristics, image pipeline,
@@ -19,7 +19,7 @@ Highlights
 Quick start
 -----------
 ```bash
-go run ./cmd/operetta         # listens on :8081 by default
+go run ./cmd/operetta         # listens on 127.0.0.1:8081 by default
 
 # or with custom settings
 PORT=9000 OMS_BOOKMARKS_MODE=remote go run ./cmd/operetta -addr :9000
@@ -41,6 +41,7 @@ Operetta can be configured via environment variables or programmatically through
 | `OMS_SITES_DIR` | Directory with per-host JSON overrides (`mode`, custom headers). Defaults to `config/sites`. |
 | `OMS_IMG_CACHE_DIR` / `OMS_IMG_CACHE_MB` | On-disk image cache location and size. |
 | `OMS_TAGCOUNT_MODE` / `OMS_TAGCOUNT_DELTA` | Tweaks for legacy OMS tag-count compatibility. |
+| `OMS_ENABLE_DIAGNOSTICS` | `1` enables the network-capable `/validate` diagnostic endpoint; disabled by default. |
 
 Embedding example:
 
@@ -58,8 +59,11 @@ Repository layout
 -----------------
 - `cmd/operetta/` – CLI entry point wiring the proxy server into `net/http.Server`.
 - `internal/proxy/` – HTTP handlers, configuration, site overrides, caches, logging.
-- `oms/` – Rendering engine split into focused modules (`page.go`, `normalize.go`,
-  `cache_disk.go`, etc.).
+- `origin/`, `presentation/`, `gateway/` – protocol-neutral pipeline contracts.
+- `protocol/` – output encoders and full client-protocol adapter contracts.
+- `transform/htmlmini/` – HTML/CSS transformer adapter.
+- `oms/` – backwards-compatible Opera Mini facade and legacy renderer/codec code
+  being migrated behind the new boundaries.
 - `config/sites/` – Example host overrides (`example.com.json`).
 - `docs/` – English/Russian guides, protocol notes and OBML references.
 - `dist/`, `build.*`, `Makefile` – helper scripts and packaging templates.
@@ -70,6 +74,8 @@ Documentation
 - [Документация на русском](docs/operetta-server-doc-ru.md)
 - [OBML tag notes](docs/OBML.md)
 - [Legacy OMS protocol walkthrough](docs/oms_protocol.md)
+- [Architecture and extension points](docs/architecture.md)
+- [Technical review (2026-07)](docs/technical-review-2026-07.md)
 
 Contributing & testing
 ----------------------

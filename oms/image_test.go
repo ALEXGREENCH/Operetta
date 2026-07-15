@@ -117,3 +117,48 @@ func TestEncodeImageGifHonorsMime(t *testing.T) {
 		t.Fatalf("unexpected dimensions: %dx%d", w, h)
 	}
 }
+
+func TestEncodeImageRGB565UsesBigEndianAndFlattensAlpha(t *testing.T) {
+	src := image.NewNRGBA(image.Rect(0, 0, 3, 1))
+	src.SetNRGBA(0, 0, color.NRGBA{R: 255, A: 255})
+	src.SetNRGBA(1, 0, color.NRGBA{G: 255, A: 255})
+	src.SetNRGBA(2, 0, color.NRGBA{B: 255, A: 0})
+
+	opts := defaultRenderPrefs()
+	opts.ImageMIME = RGB565MIME
+	opts.MaxInlineKB = 16
+	data, w, h, mime, _, err := encodeImage(src, opts)
+	if err != nil {
+		t.Fatalf("encodeImage returned error: %v", err)
+	}
+	if mime != RGB565MIME || w != 3 || h != 1 {
+		t.Fatalf("unexpected result: mime=%q dimensions=%dx%d", mime, w, h)
+	}
+	want := []byte{0xf8, 0x00, 0x07, 0xe0, 0xff, 0xff}
+	if len(data) != len(want) {
+		t.Fatalf("payload length=%d want=%d", len(data), len(want))
+	}
+	for i := range want {
+		if data[i] != want[i] {
+			t.Fatalf("payload[%d]=%02x want=%02x", i, data[i], want[i])
+		}
+	}
+}
+
+func TestEncodeImageRGB565HonorsInlineBudget(t *testing.T) {
+	src := image.NewRGBA(image.Rect(0, 0, 240, 160))
+	opts := defaultRenderPrefs()
+	opts.ImageMIME = RGB565MIME
+	opts.ScreenW = 240
+	opts.MaxInlineKB = 8
+	data, w, h, _, _, err := encodeImage(src, opts)
+	if err != nil {
+		t.Fatalf("encodeImage returned error: %v", err)
+	}
+	if len(data) > 8*1024 || len(data) != w*h*2 {
+		t.Fatalf("payload=%d dimensions=%dx%d", len(data), w, h)
+	}
+	if w >= 240 || h >= 160 {
+		t.Fatalf("image was not downscaled: %dx%d", w, h)
+	}
+}

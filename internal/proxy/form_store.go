@@ -12,11 +12,18 @@ import (
 // to avoid leaking stale tokens across sessions.
 type formStore struct {
 	mu   sync.Mutex
-	data map[string]map[string]string
+	data map[formKey]map[string]string
 }
 
+type formKey struct {
+	client string
+	action string
+}
+
+const maxFormEntries = 2048
+
 func newFormStore() *formStore {
-	return &formStore{data: make(map[string]map[string]string)}
+	return &formStore{data: make(map[formKey]map[string]string)}
 }
 
 // Store snapshots the hidden fields for one or more form actions under the given client key.
@@ -26,22 +33,28 @@ func (s *formStore) Store(clientKey string, forms map[string]map[string]string) 
 		return
 	}
 	s.mu.Lock()
+	defer s.mu.Unlock()
 	if s.data == nil {
-		s.data = make(map[string]map[string]string)
+		s.data = make(map[formKey]map[string]string)
 	}
 	for action, fields := range forms {
 		actionKey := normalizeFormActionKey(action)
 		if actionKey == "" || len(fields) == 0 {
 			continue
 		}
-		key := clientKey + "|" + actionKey
+		key := formKey{client: clientKey, action: actionKey}
 		clone := make(map[string]string, len(fields))
 		for name, val := range fields {
 			clone[name] = val
 		}
 		s.data[key] = clone
+		for len(s.data) > maxFormEntries {
+			for candidate := range s.data {
+				delete(s.data, candidate)
+				break
+			}
+		}
 	}
-	s.mu.Unlock()
 }
 
 // Augment merges cached hidden fields into the outgoing form body if none of the
@@ -53,16 +66,20 @@ func (s *formStore) Augment(clientKey, action, formBody string) (string, bool) {
 	if clientKey == "" || actionKey == "" {
 		return formBody, false
 	}
-	s.mu.Lock()
-	fields, ok := s.data[clientKey+"|"+actionKey]
-	s.mu.Unlock()
-	if !ok || len(fields) == 0 {
-		return formBody, false
-	}
 	vals, err := url.ParseQuery(formBody)
 	if err != nil {
 		return formBody, false
 	}
+	key := formKey{client: clientKey, action: actionKey}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	fields, ok := s.data[key]
+	if !ok || len(fields) == 0 {
+		return formBody, false
+	}
+	// Take the entry atomically before returning so two concurrent submissions
+	// cannot reuse the same one-time CSRF fields.
+	delete(s.data, key)
 	applied := false
 	for name, val := range fields {
 		if _, exists := vals[name]; !exists {
@@ -70,13 +87,10 @@ func (s *formStore) Augment(clientKey, action, formBody string) (string, bool) {
 			applied = true
 		}
 	}
-	if !applied {
-		return formBody, false
+	if applied {
+		return vals.Encode(), true
 	}
-	s.mu.Lock()
-	delete(s.data, clientKey+"|"+actionKey)
-	s.mu.Unlock()
-	return vals.Encode(), true
+	return formBody, false
 }
 
 func normalizeFormActionKey(action string) string {

@@ -232,6 +232,50 @@ func contrastRatio(a, b string) float64 {
 	return (la + 0.05) / (lb + 0.05)
 }
 
+func omColorHex(hex string) string {
+	hex = cssToHex(hex)
+	if hex == "" {
+		return ""
+	}
+	c := calcColor(hex)
+	r5 := c & 0x1F
+	g6 := (c >> 5) & 0x3F
+	b5 := (c >> 11) & 0x1F
+	r8 := uint8((r5 << 3) | (r5 >> 2))
+	g8 := uint8((g6 << 2) | (g6 >> 4))
+	b8 := uint8((b5 << 3) | (b5 >> 2))
+	return rgbColor{R: r8, G: g8, B: b8}.hex()
+}
+
+func readableTextColorForOM(fg, bg string) string {
+	fgHex := cssToHex(fg)
+	if fgHex == "" {
+		fgHex = defaultTextColorHex
+	}
+	bgHex := cssToHex(bg)
+	if bgHex == "" {
+		bgHex = "#ffffff"
+	}
+	quantizedFG := omColorHex(fgHex)
+	quantizedBG := omColorHex(bgHex)
+	if quantizedFG == "" {
+		quantizedFG = fgHex
+	}
+	if quantizedBG == "" {
+		quantizedBG = bgHex
+	}
+	const minReadableContrast = 4.5
+	if contrastRatio(quantizedFG, quantizedBG) >= minReadableContrast {
+		return fgHex
+	}
+	blackContrast := contrastRatio(omColorHex("#000000"), quantizedBG)
+	whiteContrast := contrastRatio(omColorHex("#ffffff"), quantizedBG)
+	if whiteContrast > blackContrast {
+		return "#ffffff"
+	}
+	return "#000000"
+}
+
 func lightenHex(hex string, percent int) string {
 	col, ok := parseHexColor(hex)
 	if !ok {

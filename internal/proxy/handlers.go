@@ -1,8 +1,8 @@
 package proxy
 
 import (
-	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -12,20 +12,20 @@ import (
 	"net/url"
 	"os"
 	"path"
-	"regexp"
 	"sort"
 	"strconv"
 	"strings"
 	"time"
 
 	"operetta/oms"
+	"operetta/protocol/operamini"
 )
 
 // clientJarKey derives a stable per-client key for server-side cookie jars.
 // Priority:
 // 1) If request provides auth tokens (h/c), bind jar to AUTH|h|c.
 // 2) Else, if authStore has tokens for this client (by cookie or host|UA), use AUTH|prefix|code.
-// 3) Else, fall back to host|UA key (DeriveClientKey).
+// 3) Else, use the request's opaque gateway session id.
 func (s *Server) clientJarKey(r *http.Request, params map[string]string) string {
 	if params != nil {
 		h := strings.TrimSpace(params["h"])
@@ -34,12 +34,12 @@ func (s *Server) clientJarKey(r *http.Request, params map[string]string) string 
 			return "AUTH|" + h + "|" + c
 		}
 	}
-	if tok, ok := s.auth.get(clientAuthKeyFromRequest(r)); ok {
+	if tok, ok := s.auth.get(s.auth.keyForRequest(r)); ok {
 		if strings.TrimSpace(tok.Prefix) != "" || strings.TrimSpace(tok.Code) != "" {
 			return "AUTH|" + tok.Prefix + "|" + tok.Code
 		}
 	}
-	return DeriveClientKey(r)
+	return s.auth.keyForRequest(r)
 }
 
 func parseOperaBool(raw string) (bool, bool) {
@@ -84,49 +84,24 @@ func interpretImageMode(raw string) (bool, bool) {
 
 func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodPost {
-		body, _ := io.ReadAll(r.Body)
-		debugHTTP := os.Getenv("OMS_HTTP_DEBUG") != "1"
-
-		////if debugHTTP {
-		s.logger.Printf("===> Incoming %s %s from %s", r.Method, r.URL.Path, r.RemoteAddr)
-		s.logger.Printf("Headers:")
-		for k, v := range r.Header {
-			s.logger.Printf("  %s: %s", k, strings.Join(v, "; "))
+		const maxOperaRequestBytes = 256 << 10
+		r.Body = http.MaxBytesReader(w, r.Body, maxOperaRequestBytes)
+		body, err := io.ReadAll(r.Body)
+		_ = r.Body.Close()
+		if err != nil {
+			http.Error(w, "request body too large or unreadable", http.StatusRequestEntityTooLarge)
+			return
 		}
-		s.logger.Printf("Body length: %d", len(body))
-		if bytes.Contains(body, []byte("h=")) || bytes.Contains(body, []byte("c=")) {
-			reH := regexp.MustCompile(`h=([^\x00]+)`)
-			reC := regexp.MustCompile(`c=([^\x00]+)`)
-			mH := reH.FindSubmatch(body)
-			mC := reC.FindSubmatch(body)
-			s.logger.Printf("Auth fields detected in body: prefix=%q code=%q",
-				func() string {
-					if len(mH) > 1 {
-						return string(mH[1])
-					}
-					return ""
-				}(),
-				func() string {
-					if len(mC) > 1 {
-						return string(mC[1])
-					}
-					return ""
-				}(),
-			)
-		} else {
-			s.logger.Printf("No h=/c= fields found in POST body.")
+		debugHTTP := os.Getenv("OMS_HTTP_DEBUG") == "1"
+		if debugHTTP {
+			s.logger.Printf("incoming %s %s body_bytes=%d", r.Method, r.URL.Path, len(body))
 		}
-		////}
-
-		r.Body.Close()
 		params := parseNullKV(body)
 
 		if raw := params["u"]; raw != "" {
 			base, extras := extractOMFragment(raw)
 			if len(extras) > 0 {
-				for k, v := range extras {
-					params[k] = v
-				}
+				mergeOMOptions(params, extras)
 			}
 			params["u"] = base
 		}
@@ -158,7 +133,9 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 				v := params[k]
 				mask := strings.ToLower(k)
 				display := v
-				if strings.Contains(mask, "pass") || strings.Contains(mask, "pwd") {
+				if mask == "h" || mask == "c" || mask == "j" ||
+					strings.Contains(mask, "pass") || strings.Contains(mask, "pwd") ||
+					strings.Contains(mask, "token") || strings.Contains(mask, "cookie") || strings.Contains(mask, "auth") {
 					display = "***"
 				} else {
 					if _, full := fullKeys[strings.ToLower(k)]; !full && len(display) > 32 {
@@ -167,14 +144,14 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 				}
 				pairs = append(pairs, fmt.Sprintf("%s=%q", k, display))
 			}
-			s.logger.Printf("Parsed params: c=%q, h=%q, u=%q keys=%v", params["c"], params["h"], params["u"], keys)
+			s.logger.Printf("parsed params: url=%q keys=%v", params["u"], keys)
 			if len(pairs) > 0 {
 				s.logger.Printf("Param snapshot: %s", strings.Join(pairs, ", "))
 			}
 		}
 
 		// Ensure per-client auth tokens are present or create them.
-		clientKey := clientAuthKeyFromRequest(r)
+		clientKey := s.auth.keyForRequest(r)
 		hadCookie := false
 		if _, err := r.Cookie(authCookieName); err == nil {
 			hadCookie = true
@@ -185,19 +162,14 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 
 		if params["h"] != "" && params["c"] != "" {
 			tok, ok = s.auth.ensureByCode(params["h"], params["c"])
-			if ok {
-				s.logger.Printf("AuthStore: restored existing session for h=%q c=%q", params["h"], params["c"])
-			} else {
+			if !ok {
 				// создаём или обновляем токен для clientKey
 				tok.Prefix = params["h"]
 				tok.Code = params["c"]
 				s.auth.updateToken(clientKey, tok)
-				s.logger.Printf("AuthStore: registered new session for h=%q c=%q (clientKey=%q)",
-					params["h"], params["c"], clientKey)
 			}
 		} else {
 			tok = s.auth.ensure(clientKey)
-			s.logger.Printf("AuthStore: created new session for %q", clientKey)
 
 			h := strings.TrimSpace(params["h"])
 			c := strings.TrimSpace(params["c"])
@@ -209,15 +181,11 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 					tok.Code = c
 				}
 				s.auth.updateToken(clientKey, tok)
-				s.logger.Printf("AuthStore: updated token for %q with prefix=%q code=%q", clientKey, tok.Prefix, tok.Code)
-			} else {
-				s.logger.Printf("AuthStore: kept generated token for %q (no prefix/code provided)", clientKey)
 			}
 		}
 
 		if debugHTTP {
-			s.logger.Printf("AuthStore.ensure for clientKey=%q => prefix=%q code=%q",
-				clientKey, tok.Prefix, tok.Code)
+			s.logger.Printf("auth session ready key_hash=%x", sha256.Sum256([]byte(clientKey)))
 		}
 
 		if strings.TrimSpace(params["c"]) == "" {
@@ -233,7 +201,7 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 				http.SetCookie(w, s.auth.cookieFor(clientKey))
 
 				if debugHTTP {
-					s.logger.Printf("Set auth cookie for %q: %+v", clientKey, s.auth.cookieFor(clientKey))
+					s.logger.Printf("set gateway association cookie")
 				}
 			}
 			page := s.renderBootstrapPage(tok.Code, tok.Prefix)
@@ -241,7 +209,11 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if raw := params["u"]; raw != "" {
-			target := normalizeObmlURL(raw)
+			// The numeric /obml/N/ prefix is not a zero-based pagination index.
+			// OMPD uses N=1 merely to mark a navigation with a referer. Treating
+			// it as page N+1 made every followed URL open on part two. Operetta's
+			// pagination links carry an explicit __om=page=N option instead.
+			target, _, _ := normalizeObmlURLWithPart(raw)
 			effectiveTarget := target
 			jarKey := s.clientJarKey(r, params)
 			hdr := s.headersFromParams(r, params)
@@ -259,7 +231,7 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 					if debugHTTP {
 						s.logger.Printf("Form augment: applied stored hidden fields for %q", effectiveTarget)
 					}
-				} else if s.prefetchFormHidden(r, params, effectiveTarget, hdr, jarKey, debugHTTP) {
+				} else if allowPrefetch := shouldPrefetchFormHidden(form); allowPrefetch && s.prefetchFormHidden(r, params, effectiveTarget, hdr, jarKey, debugHTTP) {
 					if augmented, changed := s.forms.Augment(jarKey, effectiveTarget, form); changed {
 						params["j"] = augmented
 						logOperaMiniForm(s.logger, "Augmented", augmented)
@@ -267,12 +239,13 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 							s.logger.Printf("Form augment: applied prefetched hidden fields for %q", effectiveTarget)
 						}
 					}
+				} else if debugHTTP && !allowPrefetch {
+					s.logger.Printf("Form prefetch: skipped for explicit form action %q", effectiveTarget)
 				}
 			}
 			opt := s.renderOptionsFromParams(r, params, hdr, jarKey)
 			if debugHTTP {
-				s.logger.Printf("FETCH target(raw=%q norm=%q effective=%q) jarKey=%q formLen=%d hdrCookieLen=%d",
-					raw, target, effectiveTarget, jarKey, len(opt.FormBody), len(hdr.Get("Cookie")))
+				s.logger.Printf("fetch target=%q form_bytes=%d", effectiveTarget, len(opt.FormBody))
 			}
 			if s.isInternalAboutRequest(raw, effectiveTarget) {
 				page := s.renderAboutPage(params)
@@ -286,7 +259,7 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 						http.SetCookie(w, s.auth.cookieFor(clientKey))
 
 						if debugHTTP {
-							s.logger.Printf("Set auth cookie for %q: %+v", clientKey, s.auth.cookieFor(clientKey))
+							s.logger.Printf("set gateway association cookie")
 						}
 					}
 					s.writeOMS(w, page.Data, page.SetCookies, &page.Stats)
@@ -306,19 +279,16 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 			if len(page.FormHidden) > 0 && jarKey != "" {
 				s.forms.Store(jarKey, page.FormHidden)
 			}
-			for i, sc := range page.SetCookies {
-				w.Header().Add("Set-Cookie", sc)
-				if debugHTTP && i < 3 {
-					s.logger.Printf("FORWARD Set-Cookie[%d]=%s", i, sc)
-				}
-			}
+			// Origin cookies stay in the per-session upstream jar. Re-emitting
+			// them on the gateway origin would allow a website to overwrite the
+			// Operetta association cookie.
 			page.Normalize()
 			s.cache.Store(target, opt, hdr, page)
 			if !hadCookie {
 				http.SetCookie(w, s.auth.cookieFor(clientKey))
 
 				if debugHTTP {
-					s.logger.Printf("Set auth cookie for %q: %+v", clientKey, s.auth.cookieFor(clientKey))
+					s.logger.Printf("set gateway association cookie")
 				}
 			}
 			s.writeOMS(w, page.Data, page.SetCookies, &page.Stats)
@@ -369,9 +339,6 @@ func (s *Server) handleFetch(w http.ResponseWriter, r *http.Request) {
 			s.forms.Store(jarKey, page.FormHidden)
 		}
 	}
-	for _, sc := range page.SetCookies {
-		w.Header().Add("Set-Cookie", sc)
-	}
 	page.Normalize()
 	s.cache.Store(finalURL, opt, hdr, page)
 	s.writeOMS(w, page.Data, page.SetCookies, &page.Stats)
@@ -421,13 +388,15 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ct := strings.TrimSpace(r.URL.Query().Get("ct"))
+	ct := strings.TrimSpace(resp.Header.Get("Content-Type"))
 	if ct == "" {
-		ct = strings.TrimSpace(resp.Header.Get("Content-Type"))
+		ct = strings.TrimSpace(r.URL.Query().Get("ct"))
 	}
 	if ct != "" {
 		w.Header().Set("Content-Type", ct)
 	}
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.Header().Set("Content-Security-Policy", "sandbox; default-src 'none'")
 
 	filename := strings.TrimSpace(r.URL.Query().Get("name"))
 	if filename == "" {
@@ -435,17 +404,17 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	mode := strings.TrimSpace(r.URL.Query().Get("mode"))
-	if strings.EqualFold(mode, "stream") {
+	if strings.EqualFold(mode, "stream") && safeInlineMediaType(ct) {
 		if filename != "" {
 			w.Header().Set("Content-Disposition", fmt.Sprintf("inline; filename=\"%s\"", encodeDispositionFilename(filename)))
-		} else if disp := resp.Header.Get("Content-Disposition"); disp != "" {
-			w.Header().Set("Content-Disposition", disp)
+		} else {
+			w.Header().Set("Content-Disposition", "inline")
 		}
 	} else {
 		if filename != "" {
 			w.Header().Set("Content-Disposition", fmt.Sprintf("attachment; filename=\"%s\"", encodeDispositionFilename(filename)))
-		} else if disp := resp.Header.Get("Content-Disposition"); disp != "" {
-			w.Header().Set("Content-Disposition", disp)
+		} else {
+			w.Header().Set("Content-Disposition", "attachment")
 		}
 	}
 
@@ -460,6 +429,19 @@ func (s *Server) handleDownload(w http.ResponseWriter, r *http.Request) {
 	if _, err := io.Copy(w, resp.Body); err != nil {
 		s.logger.Printf("download stream error for %s: %v", target, err)
 	}
+}
+
+func safeInlineMediaType(contentType string) bool {
+	mediaType := strings.ToLower(strings.TrimSpace(contentType))
+	if parsed, _, err := mime.ParseMediaType(contentType); err == nil {
+		mediaType = strings.ToLower(parsed)
+	}
+	if mediaType == "image/svg+xml" {
+		return false
+	}
+	return strings.HasPrefix(mediaType, "audio/") ||
+		strings.HasPrefix(mediaType, "video/") ||
+		strings.HasPrefix(mediaType, "image/")
 }
 
 func (s *Server) handleValidate(w http.ResponseWriter, r *http.Request) {
@@ -536,14 +518,9 @@ func (s *Server) headersFromParams(r *http.Request, params map[string]string) ht
 	if lang := firstNonEmpty(firstNonEmpty(params["q"], params["y"]), params["D"]); lang != "" {
 		hdr.Set("Accept-Language", lang)
 	}
-	if ck := r.Header.Get("Cookie"); ck != "" {
-		hdr.Set("Cookie", ck)
-	}
 	if ref := params["f"]; ref != "" {
 		hdr.Set("Referer", ref)
 	}
-	// Pass stable client key downstream so oms can pick the right jar
-	hdr.Set("X-Operetta-Client-Key", s.clientJarKey(r, params))
 	if acc := r.Header.Get("Accept"); acc != "" {
 		hdr.Set("Accept", acc)
 	} else {
@@ -560,15 +537,6 @@ func (s *Server) headersFromQuery(r *http.Request) http.Header {
 	if lang := r.URL.Query().Get("lang"); lang != "" {
 		hdr.Set("Accept-Language", lang)
 	}
-	if ck := r.Header.Get("Cookie"); ck != "" {
-		hdr.Set("Cookie", ck)
-	}
-	// Include client key derived from query auth if present
-	params := map[string]string{
-		"h": strings.TrimSpace(r.URL.Query().Get("h")),
-		"c": strings.TrimSpace(r.URL.Query().Get("c")),
-	}
-	hdr.Set("X-Operetta-Client-Key", s.clientJarKey(r, params))
 	if acc := r.Header.Get("Accept"); acc != "" {
 		hdr.Set("Accept", acc)
 	}
@@ -651,20 +619,15 @@ func (s *Server) renderOptionsFromParams(r *http.Request, params map[string]stri
 		}
 	}
 	opt.ClientVersion = oms.ClientVersionFromGateway(opt.GatewayVersion)
-	if v := strings.TrimSpace(params["version"]); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			switch n {
-			case 1:
-				opt.ClientVersion = oms.ClientVersion1
-			case 3:
-				opt.ClientVersion = oms.ClientVersion3
-			case 2:
-				opt.ClientVersion = oms.ClientVersion2
-			}
-		}
+	if dialect, err := operamini.Negotiate(strings.TrimSpace(params["v"])); err == nil {
+		opt.ClientVersion = dialect.Family
+		opt.DialectID = dialect.Version.String()
 	}
-	if strings.TrimSpace(params["version"]) == "" && opt.ClientVersion == oms.ClientVersion3 {
-		opt.ClientVersion = oms.ClientVersion2
+	if rawVersion := strings.TrimSpace(params["version"]); rawVersion != "" {
+		if dialect, err := operamini.Negotiate(rawVersion); err == nil {
+			opt.ClientVersion = dialect.Family
+			opt.DialectID = dialect.Version.String()
+		}
 	}
 	if wv := strings.TrimSpace(params["w"]); wv != "" {
 		seg := strings.SplitN(wv, ";", 2)
@@ -684,12 +647,48 @@ func (s *Server) renderOptionsFromParams(r *http.Request, params map[string]stri
 			opt.MaxTagsPerPage = n
 		}
 	}
+	if v := strings.TrimSpace(params["maxkb"]); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			opt.MaxInlineKB = n
+		}
+	}
+	if v := strings.TrimSpace(params["maxpagekb"]); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 32 && n <= 192 {
+			opt.MaxBytesPerPage = n * 1024
+		}
+	}
+	if v := strings.TrimSpace(params["om_w"]); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			opt.ScreenW = n
+		}
+	}
+	if v := strings.TrimSpace(params["om_h"]); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			opt.ScreenH = n
+		}
+	}
+	if v := strings.TrimSpace(params["om_c"]); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			opt.NumColors = n
+		}
+	}
+	if v := strings.TrimSpace(params["om_m"]); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			opt.HeapBytes = n
+		}
+	}
+	if v := strings.TrimSpace(params["om_l"]); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			opt.AlphaLevels = n
+		}
+	}
 	opt.ServerBase = serverBase(r)
 	opt.ReqHeaders = hdr
 	opt.Referrer = params["u"]
 	if strings.TrimSpace(jarKey) == "" {
 		jarKey = s.clientJarKey(r, params)
 	}
+	opt.CachePartition = jarKey
 	opt.Jar = s.cookieJars.Get(jarKey)
 	opt.WantFullCache = true
 	applyAcceptImagePreference(opt, hdr)
@@ -719,6 +718,11 @@ func (s *Server) renderOptionsFromQuery(r *http.Request, hdr http.Header) *oms.R
 	if v := strings.TrimSpace(q.Get("maxkb")); v != "" {
 		if n, err := strconv.Atoi(v); err == nil && n > 0 {
 			opt.MaxInlineKB = n
+		}
+	}
+	if v := strings.TrimSpace(q.Get("maxpagekb")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 32 && n <= 192 {
+			opt.MaxBytesPerPage = n * 1024
 		}
 	}
 	// Preserve device characteristics when passed on query to keep cache keys stable
@@ -758,20 +762,15 @@ func (s *Server) renderOptionsFromQuery(r *http.Request, hdr http.Header) *oms.R
 		}
 	}
 	opt.ClientVersion = oms.ClientVersionFromGateway(opt.GatewayVersion)
-	if v := strings.TrimSpace(q.Get("version")); v != "" {
-		if n, err := strconv.Atoi(v); err == nil {
-			switch n {
-			case 1:
-				opt.ClientVersion = oms.ClientVersion1
-			case 3:
-				opt.ClientVersion = oms.ClientVersion3
-			case 2:
-				opt.ClientVersion = oms.ClientVersion2
-			}
-		}
+	if dialect, err := operamini.Negotiate(strings.TrimSpace(q.Get("v"))); err == nil {
+		opt.ClientVersion = dialect.Family
+		opt.DialectID = dialect.Version.String()
 	}
-	if strings.TrimSpace(q.Get("version")) == "" && opt.ClientVersion == oms.ClientVersion3 {
-		opt.ClientVersion = oms.ClientVersion2
+	if rawVersion := strings.TrimSpace(q.Get("version")); rawVersion != "" {
+		if dialect, err := operamini.Negotiate(rawVersion); err == nil {
+			opt.ClientVersion = dialect.Family
+			opt.DialectID = dialect.Version.String()
+		}
 	}
 	if v := strings.TrimSpace(q.Get("c")); v != "" {
 		opt.AuthCode = v
@@ -783,7 +782,9 @@ func (s *Server) renderOptionsFromQuery(r *http.Request, hdr http.Header) *oms.R
 	opt.ReqHeaders = hdr
 	opt.Referrer = q.Get("ref")
 	params := map[string]string{"h": strings.TrimSpace(q.Get("h")), "c": strings.TrimSpace(q.Get("c"))}
-	opt.Jar = s.cookieJars.Get(s.clientJarKey(r, params))
+	jarKey := s.clientJarKey(r, params)
+	opt.CachePartition = jarKey
+	opt.Jar = s.cookieJars.Get(jarKey)
 	opt.WantFullCache = true
 	key := s.renderPrefKeyWithOptions(r, q.Get("url"), opt)
 	s.renderPrefs.Apply(key, opt, q)
@@ -990,16 +991,13 @@ func defaultRenderOptions() *oms.RenderOptions {
 }
 
 func (s *Server) serveFromCache(w http.ResponseWriter, target string, opt *oms.RenderOptions) bool {
-	if raw, cookies, cur, cnt, stats, ok := s.cache.Select(target, opt); ok {
+	if raw, _, cur, cnt, stats, ok := s.cache.Select(target, opt); ok {
 		if cur > 0 || cnt > 0 {
 			w.Header().Set("X-Operetta-Page", strconv.Itoa(cur))
 			w.Header().Set("X-Operetta-Pages", strconv.Itoa(cnt))
 		}
-		for _, sc := range cookies {
-			w.Header().Add("Set-Cookie", sc)
-		}
 		statsCopy := stats
-		s.writeOMS(w, raw, cookies, &statsCopy)
+		s.writeOMS(w, raw, nil, &statsCopy)
 		return true
 	}
 	return false
@@ -1119,6 +1117,49 @@ func deriveOperaMiniFormTarget(baseTarget, formBody string) string {
 	return override
 }
 
+func shouldPrefetchFormHidden(formBody string) bool {
+	formBody = strings.TrimSpace(formBody)
+	if formBody == "" || formBody == "0" {
+		return false
+	}
+	if vals, err := url.ParseQuery(formBody); err == nil {
+		for key, vs := range vals {
+			k := strings.TrimSpace(key)
+			lk := strings.ToLower(k)
+			switch lk {
+			case "opa", "action", "opf":
+				return false
+			}
+			if isOperaMiniActionKey(k) {
+				return false
+			}
+			for _, v := range vs {
+				if strings.TrimSpace(v) == "" {
+					continue
+				}
+				if lk == "opa" || lk == "action" {
+					return false
+				}
+			}
+		}
+		return true
+	}
+	for _, part := range strings.Split(formBody, "&") {
+		if part == "" {
+			continue
+		}
+		key := strings.TrimSpace(strings.SplitN(part, "=", 2)[0])
+		if decoded, err := url.QueryUnescape(key); err == nil {
+			key = strings.TrimSpace(decoded)
+		}
+		lk := strings.ToLower(key)
+		if lk == "opa" || lk == "action" || lk == "opf" || isOperaMiniActionKey(key) {
+			return false
+		}
+	}
+	return true
+}
+
 func isOperaMiniActionKey(key string) bool {
 	if key == "" {
 		return false
@@ -1133,7 +1174,7 @@ func isOperaMiniActionKey(key string) bool {
 }
 
 func logOperaMiniForm(logger *log.Logger, prefix, body string) {
-	if logger == nil {
+	if logger == nil || os.Getenv("OMS_HTTP_DEBUG") != "1" {
 		return
 	}
 	body = strings.TrimSpace(body)
@@ -1147,12 +1188,7 @@ func logOperaMiniForm(logger *log.Logger, prefix, body string) {
 			if len(vs) > 0 {
 				val = vs[0]
 			}
-			display := val
-			lk := strings.ToLower(k)
-			if strings.Contains(lk, "pass") || strings.Contains(lk, "pwd") || strings.Contains(lk, "token") {
-				display = "***"
-			}
-			items = append(items, fmt.Sprintf("%s(len=%d)=%s", k, len(val), display))
+			items = append(items, fmt.Sprintf("%s(len=%d)", k, len(val)))
 		}
 		sort.Strings(items)
 		logger.Printf("%s form: %s", prefix, strings.Join(items, ", "))

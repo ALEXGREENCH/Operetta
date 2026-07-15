@@ -43,7 +43,7 @@ j=opf=1&q=Yukaba&btnG=Search+in+Google
 | --- | --- |
 | `k` | Preferred image MIME type (`image/jpeg`, etc.). |
 | `o` | Gateway/version discriminator (OM 2.x uses 280; OM 3.x uses 285). |
-| `u` | Requested resource path (usually `/obml/<scheme>/<URL>`); Operetta normalises it to an absolute URL. |
+| `u` | Requested resource path (usually `/obml/<hint>/<URL>`). Legacy hints `0/1` describe navigation-chain state and are not page indexes. |
 | `q` | UI locale code used for language-specific tweaks. |
 | `v` | Opera Mini client version string reported by the handset. |
 | `i` | Desktop-equivalent user agent string for compatibility heuristics. |
@@ -62,7 +62,7 @@ j=opf=1&q=Yukaba&btnG=Search+in+Google
 | `b` | Client modification tag (for example `mod2.06`). |
 | `y` | Secondary language code (content preference). |
 | `t` | Phone-number auto-detection toggle (`0` disables linking). |
-| `w` | Multipart indicator `partCurrent;isLast` for paginated pages. |
+| `w` | Legacy navigation state. Operetta's explicit pagination uses `__om=page=N&pp=M`. |
 | `e` | Compression hint: `def` (deflate) or `none`. |
 ### Two-Phase POST on First Launch
 
@@ -81,7 +81,7 @@ Operationally this explains why the first request you see is small (~hundreds of
 ## HTTP Endpoints
 - `POST /` вЂ” Primary Opera Mini ingress: handles the handshake, internal `server:` pages, local bookmark fallbacks, and OBML generation.
 - `GET /fetch` вЂ” Diagnostic/manual entry point that mirrors proxy behaviour for a given URL; accepts `url`, `action`, `get`, `ua`, `lang`, `img`, `hq`, `mime`, `maxkb`, `pp`, and `page` parameters.
-- `GET /validate` вЂ” Fetches the target twice (full and compact), normalises both, and returns JSON with `analyzeOMS` metrics.
+- `GET /validate` вЂ” Fetches the target twice (full and compact), normalises both, and returns JSON with `analyzeOMS` metrics plus a semantic summary (initial URL, sampled text/links, parsed forms, parser status).
 - `GET /ping` вЂ” Lightweight liveness probe that returns `pong`.
 
 ## Rendering Pipeline
@@ -141,7 +141,7 @@ Operationally this explains why the first request you see is small (~hundreds of
 
 | Variable | Description |
 | --- | --- |
-| `PORT` | Overrides the listen port (otherwise the `-addr` flag, default `:8080`). |
+| `PORT` | Overrides the localhost listen port (otherwise `-addr`, default `127.0.0.1:8081`; use `-addr :8081` explicitly for public bind). |
 | `OMS_BOOKMARKS_MODE` | Controls `/obml/` bookmark fallback: `remote/pass` proxies opera-mini.ru; anything else serves the local list. |
 | `OMS_BOOKMARKS` | Comma-separated `name|url` pairs for the local bookmark page. |
 | `OMS_SITES_DIR` | Custom directory with per-host JSON configs. |
@@ -150,15 +150,17 @@ Operationally this explains why the first request you see is small (~hundreds of
 | `OMS_IMG_DEBUG` | When `1`, logs image download/conversion failures. |
 | `OMS_TAGCOUNT_MODE` | Tag-count strategy (`exact`, `exclude_q`, `plus1`, `plus2`). |
 | `OMS_TAGCOUNT_DELTA` | Numeric delta added to the computed tag count. |
+| `OMS_ENABLE_DIAGNOSTICS` | `1` enables the network-capable `/validate` endpoint; disabled by default. |
 
 In code, `proxy.DefaultConfig()` exposes the same defaults while letting you override bookmarks, logging, the clock source and site-config directory before calling `proxy.New(cfg)`.
 `/fetch` also honours `img`, `hq`, `mime`, `maxkb`, `pp`, `page`, `ua`, and `lang`, which map directly onto `RenderOptions`. Per-site JSON files accept `{"mode":"full|compact","headers":{...}}`.
 
 ## Debugging and Tooling
-- **Log dumps.** `dumpOMS` prints the OMS magic, size, and head/tail bytes for every response, aiding inspection.
-- **Validator.** `/validate?url=...` renders full and compact variants, runs `analyzeOMS`, and reports tag counts, string counts, and pagination data in JSON.
+- **Log dumps.** `OMS_DEBUG_DUMP=1` enables binary OMS head dumps; they are disabled by default.
+- **Validator.** With `OMS_ENABLE_DIAGNOSTICS=1`, `/validate?url=...` renders full and compact variants, runs `analyzeOMS`, and reports parser status, tag counts, pagination data, sampled text/links, and parsed form metadata in JSON.
 - **Index helper.** The `GET /` HTML form (`indexHTML`) lets you test the server manually without Opera Mini.
 - **Image tracing.** Set `OMS_IMG_DEBUG=1` to log cache hits/misses and conversion issues while fetching images.
+- **OMPD smoke.** `docs/ompd-smoke-checklist.md` defines the manual acceptance loop for the browser extension viewer at the target `240x320` profile.
 
 ## Compatibility Notes and Limitations
 - **CSS scope.** Only a conservative subset of CSS is honoured (display, colour, background, simple inline styles); complex layouts, floats, and media queries are ignored.
@@ -170,4 +172,5 @@ In code, `proxy.DefaultConfig()` exposes the same defaults while letting you ove
 ## Further Reading
 - **`docs/OBML.md`** вЂ” Deep dive into tag layout, pagination, and transport header nuances used by Operetta.
 - **`docs/oms_protocol.md`** вЂ” Legacy C/Java protocol reference that informed the Go port.
+- **`docs/ompd-smoke-checklist.md`** вЂ” Manual smoke workflow for validating Operetta through the OMPD browser extension.
 - **Community OBML spec** вЂ” [grawity/obml-parser вЂ“ obml-format.md](https://github.com/grawity/obml-parser/blob/master/obml-format.md) documents later OBML versions for comparison.

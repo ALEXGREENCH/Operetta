@@ -22,13 +22,6 @@ var (
 )
 
 func initDiskCache() {
-	diskCacheDir = os.Getenv("OMS_IMG_CACHE_DIR")
-	if diskCacheDir == "" {
-		diskCacheDir = filepath.Join("cache", "img")
-	}
-	if err := os.MkdirAll(diskCacheDir, 0o755); err != nil {
-		return
-	}
 	mb := 100
 	if s := os.Getenv("OMS_IMG_CACHE_MB"); s != "" {
 		if v, err := strconv.Atoi(strings.TrimSpace(s)); err == nil && v >= 0 {
@@ -36,6 +29,22 @@ func initDiskCache() {
 		}
 	}
 	diskCacheMax = int64(mb) * 1024 * 1024
+	if diskCacheMax <= 0 {
+		return
+	}
+	diskCacheDir = strings.TrimSpace(os.Getenv("OMS_IMG_CACHE_DIR"))
+	if diskCacheDir == "" {
+		base, err := os.UserCacheDir()
+		if err != nil || base == "" {
+			diskCacheMax = 0
+			return
+		}
+		diskCacheDir = filepath.Join(base, "operetta", "img")
+	}
+	if err := os.MkdirAll(diskCacheDir, 0o700); err != nil {
+		diskCacheMax = 0
+		diskCacheDir = ""
+	}
 }
 
 func diskKey(format string, quality int, url string) (string, string) {
@@ -51,8 +60,14 @@ func diskKey(format string, quality int, url string) (string, string) {
 }
 
 func diskCacheGet(format string, quality int, url string) ([]byte, int, int, bool) {
+	if url == "" {
+		return nil, 0, 0, false
+	}
 	diskCacheOnce.Do(initDiskCache)
-	dir, path := diskKey(format, quality, url)
+	if diskCacheMax <= 0 || diskCacheDir == "" {
+		return nil, 0, 0, false
+	}
+	_, path := diskKey(format, quality, url)
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, 0, 0, false
@@ -69,34 +84,52 @@ func diskCacheGet(format string, quality int, url string) ([]byte, int, int, boo
 		return nil, 0, 0, false
 	}
 	_ = os.Chtimes(path, time.Now(), time.Now())
-	_ = os.MkdirAll(dir, 0o755)
 	return b, w, h, true
 }
 
 func diskCachePut(format string, quality int, url string, data []byte, w, h int) {
-	diskCacheOnce.Do(initDiskCache)
-	dir, path := diskKey(format, quality, url)
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if url == "" {
 		return
 	}
-	tmp := path + ".tmp"
-	f, err := os.Create(tmp)
+	diskCacheOnce.Do(initDiskCache)
+	if diskCacheMax <= 0 || diskCacheDir == "" || len(data) == 0 || int64(len(data)) > diskCacheMax {
+		return
+	}
+	dir, path := diskKey(format, quality, url)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return
+	}
+	f, err := os.CreateTemp(dir, ".img-*.tmp")
 	if err != nil {
 		return
 	}
+	tmp := f.Name()
+	defer os.Remove(tmp)
+	_ = f.Chmod(0o600)
 	var hdr [4]byte
 	binary.BigEndian.PutUint16(hdr[0:2], uint16(w))
 	binary.BigEndian.PutUint16(hdr[2:4], uint16(h))
-	_, _ = f.Write(hdr[:])
-	_, _ = f.Write(data)
-	_ = f.Close()
-	_ = os.Rename(tmp, path)
-	go pruneDiskCache()
+	if _, err = f.Write(hdr[:]); err == nil {
+		_, err = f.Write(data)
+	}
+	if err == nil {
+		err = f.Sync()
+	}
+	if closeErr := f.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil || os.Rename(tmp, path) != nil {
+		return
+	}
+	pruneDiskCache()
 }
 
 func pruneDiskCache() {
 	diskCacheMu.Lock()
 	defer diskCacheMu.Unlock()
+	if diskCacheMax <= 0 || diskCacheDir == "" {
+		return
+	}
 	var files []struct {
 		p  string
 		sz int64

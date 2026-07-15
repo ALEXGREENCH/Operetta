@@ -11,7 +11,7 @@ import (
 type elementContext struct {
 	node    *html.Node
 	base    string
-	page    *Page
+	page    renderTarget
 	visited map[*html.Node]bool
 	state   *walkState
 	prefs   RenderOptions
@@ -136,13 +136,13 @@ func handleFont(ctx *elementContext) bool {
 
 func handleBaseFont(ctx *elementContext) bool {
 	if col := cssToHex(getAttr(ctx.node, "color")); col != "" {
-		ctx.page.AddTextcolor(col)
 		ctx.state.curColor = col
+		ctx.state.emitCurrentStyle(ctx.page)
 	}
 	if size := strings.TrimSpace(getAttr(ctx.node, "size")); size != "" {
 		if v, err := strconv.Atoi(strings.TrimLeft(size, "+")); err == nil && v >= 5 {
 			ctx.state.curStyle |= styleBoldBit
-			ctx.page.AddStyle(ctx.state.curStyle)
+			ctx.state.emitCurrentStyle(ctx.page)
 		}
 	}
 	return true

@@ -18,11 +18,13 @@ func dumpOMS(logger *log.Logger, b []byte) {
 	if logger == nil || len(b) == 0 {
 		return
 	}
-	size := len(b)
-	if size > 256 {
-		size = 256
+	if os.Getenv("OMS_DEBUG_DUMP") == "1" {
+		size := len(b)
+		if size > 256 {
+			size = 256
+		}
+		logger.Printf("OMS %d bytes (first %d shown): %s", len(b), size, hexBlock(b, 0, size))
 	}
-	logger.Printf("OMS %d bytes (first %d shown): %s", len(b), size, hexBlock(b, 0, size))
 
 	if os.Getenv("OMS_DEBUG_SCAN") == "1" {
 		if msg := scanOMSForSuspicious(b); msg != "" {

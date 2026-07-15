@@ -680,6 +680,14 @@ func mediaRuleActive(prelude string, opts *RenderOptions) bool {
 		if query == "" {
 			continue
 		}
+		negated := false
+		if strings.HasPrefix(query, "only ") {
+			query = strings.TrimSpace(strings.TrimPrefix(query, "only "))
+		}
+		if strings.HasPrefix(query, "not ") {
+			negated = true
+			query = strings.TrimSpace(strings.TrimPrefix(query, "not "))
+		}
 
 		mediaType := ""
 		rest := query
@@ -689,15 +697,25 @@ func mediaRuleActive(prelude string, opts *RenderOptions) bool {
 			rest = strings.TrimSpace(strings.TrimPrefix(query, mediaType))
 		}
 
+		typeMatches := false
 		switch mediaType {
 		case "", "all", "screen", "handheld", "projection":
-			// ok
+			typeMatches = true
 		case "print", "speech", "aural", "braille", "embossed", "tty", "tv":
-			continue
+			typeMatches = false
 		default:
-			if evaluateMediaFeatures(rest, opts) {
-				return true
-			}
+			typeMatches = false
+		}
+		if strings.HasPrefix(rest, "and") {
+			rest = strings.TrimSpace(strings.TrimPrefix(rest, "and"))
+		}
+		featuresMatch := rest == "" || evaluateMediaFeatures(rest, opts)
+		active := typeMatches && featuresMatch
+		if negated {
+			active = !active
+		}
+		if active {
+			return true
 		}
 	}
 	return false
@@ -760,9 +778,6 @@ func evaluateMediaFeatures(expr string, opts *RenderOptions) bool {
 			}
 		case "prefers-color-scheme":
 			scheme := "light"
-			if opts != nil && opts.NumColors >= 256 {
-				scheme = "dark"
-			}
 			if value != "" && value != scheme {
 				return false
 			}

@@ -110,3 +110,14 @@ func TestNormalizeObmlURL(t *testing.T) {
 		})
 	}
 }
+
+func TestNormalizeObmlURLWithPart(t *testing.T) {
+	t.Parallel()
+	got, part, ok := normalizeObmlURLWithPart("/obml/1/https%3A%2F%2Fexample.com%2Fpath")
+	if got != "https://example.com/path" {
+		t.Fatalf("normalized URL=%q", got)
+	}
+	if !ok || part != 1 {
+		t.Fatalf("part ok=%v part=%d", ok, part)
+	}
+}
