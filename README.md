@@ -161,8 +161,6 @@ Documentation
 - [Документация на русском](docs/operetta-server-doc-ru.md)
 - [OBML tag notes](docs/OBML.md)
 - [Legacy OMS protocol walkthrough](docs/oms_protocol.md)
-- [Architecture and extension points](docs/architecture.md)
-- [Technical review (2026-07)](docs/technical-review-2026-07.md)
 
 Contributing & testing
 ----------------------
