@@ -419,6 +419,15 @@ func sanitizeSelectorForCascadia(s string) string {
 	if s == "" {
 		return s
 	}
+	lower := strings.ToLower(s)
+	// A server-side snapshot represents the unvisited, inactive state. Merely
+	// stripping these pseudo-classes would turn e.g. A:hover into A and let a
+	// later hover rule override the normal A:link rule.
+	for _, dynamic := range []string{":hover", ":active", ":visited", ":focus", ":focus-visible", ":focus-within"} {
+		if strings.Contains(lower, dynamic) {
+			return ""
+		}
+	}
 	b := strings.Builder{}
 	// Copy while stripping any ':' pseudo segment and its optional (..)
 	i := 0

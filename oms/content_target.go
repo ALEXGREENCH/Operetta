@@ -90,10 +90,21 @@ func styleWordFromTextStyle(style presentation.TextStyle) uint32 {
 }
 
 func (t *contentTarget) AddStyle(style uint32) { t.builder.AddStyle(textStyleFromWord(style)) }
-func (t *contentTarget) AddText(text string)   { t.builder.AddText(text) }
-func (t *contentTarget) AddBreak()             { t.builder.AddBreak() }
-func (t *contentTarget) BeginLink(url string)  { t.builder.BeginLink(url) }
-func (t *contentTarget) EndLink()              { t.builder.EndLink() }
+
+// AddExactStyle preserves the CSS color for protocol encoders that are not
+// constrained to the legacy RGB565 palette. Flags still come from the shared
+// style word so the old Page renderer keeps identical behavior.
+func (t *contentTarget) AddExactStyle(style uint32, color string) {
+	textStyle := textStyleFromWord(style)
+	if normalized := cssToHex(color); normalized != "" {
+		textStyle.Foreground = normalized
+	}
+	t.builder.AddStyle(textStyle)
+}
+func (t *contentTarget) AddText(text string)  { t.builder.AddText(text) }
+func (t *contentTarget) AddBreak()            { t.builder.AddBreak() }
+func (t *contentTarget) BeginLink(url string) { t.builder.BeginLink(url) }
+func (t *contentTarget) EndLink()             { t.builder.EndLink() }
 func (t *contentTarget) AddLink(url, text string) {
 	t.builder.AddLink(url, text)
 }

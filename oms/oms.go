@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"encoding/binary"
 	"image"
+	"image/color"
 	"image/gif"
 	"image/jpeg"
 	"image/png"
@@ -34,6 +35,7 @@ import (
 
 	"golang.org/x/image/draw"
 	"golang.org/x/net/html"
+	"golang.org/x/net/html/atom"
 
 	"operetta/origin"
 	"operetta/presentation"
@@ -54,6 +56,12 @@ const DefaultUpstreamUA = defaultUpstreamUA
 const defaultPaginationBytes = 32000
 const maxInlineBackgroundSize = 128
 const RGB565MIME = "image/x-rgb565"
+const RGB565AlphaMIME = "image/x-rgb565a"
+
+func isRGB565PayloadMIME(value string) bool {
+	return strings.EqualFold(value, RGB565MIME) ||
+		strings.EqualFold(value, RGB565AlphaMIME)
+}
 
 func effectiveTextColor(n *html.Node, st *walkState) string {
 	a := n
@@ -1217,6 +1225,7 @@ type walkState struct {
 	css        *Stylesheet
 	colorStack []string
 	curColor   string
+	linkColor  string
 	bgStack    []string
 	curBg      string
 	formStack  []string
@@ -1689,7 +1698,12 @@ func (s *walkState) styleWithTextColor(style uint32, color string) uint32 {
 }
 
 func (s *walkState) emitCurrentStyle(p renderTarget) {
-	p.AddStyle(s.styleWithTextColor(s.curStyle, s.curColor))
+	style := s.styleWithTextColor(s.curStyle, s.curColor)
+	if exact, ok := p.(interface{ AddExactStyle(uint32, string) }); ok {
+		exact.AddExactStyle(style, readableTextColorForOM(s.curColor, s.curBg))
+		return
+	}
+	p.AddStyle(style)
 }
 
 func (s *walkState) pushStyle(p renderTarget, style uint32) {
@@ -2053,7 +2067,11 @@ func renderBackgroundImage(n *html.Node, props map[string]string, base string, p
 		}
 		// If cropping fails, fall back to full image rendering.
 	}
-	if strings.EqualFold(prefs.ImageMIME, RGB565MIME) && len(data) != widthHint*heightHint*2 {
+	stride := 2
+	if strings.EqualFold(prefs.ImageMIME, RGB565AlphaMIME) {
+		stride = 3
+	}
+	if isRGB565PayloadMIME(prefs.ImageMIME) && len(data) != widthHint*heightHint*stride {
 		p.AddImageInline(w, h, data)
 	} else {
 		p.AddImageInline(widthHint, heightHint, data)
@@ -2356,7 +2374,7 @@ func fetchAndEncodeImageRegion(absURL string, prefs RenderOptions, x, y, w, h in
 	// Attempt to reuse cached full image first
 	var srcBytes []byte
 	var have bool
-	if !strings.EqualFold(prefs.ImageMIME, RGB565MIME) {
+	if !isRGB565PayloadMIME(prefs.ImageMIME) {
 		for _, cand := range candidates {
 			if data, _, _, ok := imgCacheGet(cand.format, cand.quality, fullKey); ok {
 				srcBytes = data
@@ -2606,7 +2624,10 @@ func walkRich(cur *html.Node, base string, p renderTarget, visited map[*html.Nod
 					st.pushStyle(p, styleOverride)
 					stylePushed = true
 				}
-				if col := strings.TrimSpace(cssEffectiveProp(c, st.css, props, "color")); col != "" {
+				// Color inheritance is already represented by walkState while the
+				// ancestor subtree is active. Applying an ancestor CSS value again on
+				// every child would override the browser's legacy link color.
+				if col := strings.TrimSpace(props["color"]); col != "" {
 					st.pushColor(p, col)
 					colorPushed = true
 				}
@@ -2988,6 +3009,9 @@ func walkRich(cur *html.Node, base string, p renderTarget, visited map[*html.Nod
 			if hasClass(c, "opis") {
 				st.pushColor(p, "#151515")
 				colorPushed = true
+			} else if !colorPushed && st.linkColor != "" {
+				st.pushColor(p, st.linkColor)
+				colorPushed = true
 			}
 			buttonWrap := hasAnyClass(c, "but", "hud", "tut", "ba", "bmx", "ib-search", "butt")
 			blockWrap := hasAnyClass(c, "opis", "str-up", "str-dw")
@@ -3007,9 +3031,15 @@ func walkRich(cur *html.Node, base string, p renderTarget, visited map[*html.Nod
 				}
 			}
 			if name == "" {
+				name = condenseSpaces(getAttr(c, "aria-label"))
+			}
+			if name == "" {
 				if alt := findFirstImgAlt(c); alt != "" {
 					name = alt
 				}
+			}
+			if name == "" {
+				name = condenseSpaces(getAttr(c, "title"))
 			}
 			if !linkOK {
 				resetComputedStyles(st, p, &colorPushed, &stylePushed, &alignedPushed)
@@ -3187,6 +3217,38 @@ func walkRich(cur *html.Node, base string, p renderTarget, visited map[*html.Nod
 				walkRich(c.FirstChild, base, p, visited, &child, prefs)
 			}
 			recurse = false
+		case "noscript":
+			// x/net/html may expose noscript markup as one raw text node. Parse
+			// that fallback as HTML, but never surface head-only stylesheet/meta
+			// declarations as literal angle-bracket text.
+			if hasAncestorTag(c, "head") {
+				markTextNodes(c, visited)
+				recurse = false
+				break
+			}
+			var raw strings.Builder
+			rawOnly := true
+			for child := c.FirstChild; child != nil; child = child.NextSibling {
+				if child.Type != html.TextNode {
+					rawOnly = false
+					break
+				}
+				raw.WriteString(child.Data)
+			}
+			if source := strings.TrimSpace(raw.String()); rawOnly && strings.Contains(source, "<") {
+				markTextNodes(c, visited)
+				contextNode := &html.Node{Type: html.ElementNode, Data: "div", DataAtom: atom.Div}
+				if fragments, err := html.ParseFragment(strings.NewReader(source), contextNode); err == nil {
+					wrapper := &html.Node{Type: html.ElementNode, Data: "div", DataAtom: atom.Div}
+					for _, fragment := range fragments {
+						wrapper.AppendChild(fragment)
+					}
+					if wrapper.FirstChild != nil {
+						walkRich(wrapper.FirstChild, base, p, visited, st, prefs)
+					}
+				}
+				recurse = false
+			}
 		case "blockquote":
 			txt := strings.TrimSpace(collectText(c))
 			p.AddParagraph()
@@ -3204,6 +3266,12 @@ func walkRich(cur *html.Node, base string, p renderTarget, visited map[*html.Nod
 				if txt := condenseSpaces(t.Data); txt != "" {
 					p.AddText(txt + ": ")
 				}
+			}
+			// A label commonly wraps its control.  Walking the children after
+			// marking the label text preserves that input instead of silently
+			// dropping it.
+			if c.FirstChild != nil {
+				walkRich(c.FirstChild, base, p, visited, st, prefs)
 			}
 			recurse = false
 		case "fieldset":
@@ -3410,6 +3478,12 @@ func walkRich(cur *html.Node, base string, p renderTarget, visited map[*html.Nod
 					name = "dname"
 				}
 				value := getAttr(c, "value")
+				if value == "" {
+					value = strings.TrimSpace(collectText(c))
+				}
+				if prompt := inputAccessiblePrompt(c); prompt != "" {
+					p.AddText(prompt + ": ")
+				}
 				p.AddTextInput(name, value)
 			}
 		case "input":
@@ -3423,9 +3497,15 @@ func walkRich(cur *html.Node, base string, p renderTarget, visited map[*html.Nod
 			}
 			value := getAttr(c, "value")
 			switch typ {
-			case "text":
+			case "text", "search", "email", "tel", "url", "number", "date", "datetime-local", "time", "month", "week":
+				if prompt := inputAccessiblePrompt(c); prompt != "" {
+					p.AddText(prompt + ": ")
+				}
 				p.AddTextInput(name, value)
 			case "password":
+				if prompt := inputAccessiblePrompt(c); prompt != "" {
+					p.AddText(prompt + ": ")
+				}
 				p.AddPassInput(name, value)
 			case "submit":
 				p.AddSubmit(name, value)
@@ -3502,11 +3582,12 @@ func walkRich(cur *html.Node, base string, p renderTarget, visited map[*html.Nod
 
 		if c.Type == html.TextNode {
 			if !visited[c] {
-				// Skip any stray text nodes under head/style/script/meta/link/noscript
+				// Skip metadata and executable/style content. Noscript is useful
+				// fallback content for this deliberately non-JavaScript renderer.
 				skip := false
 				if par := c.Parent; par != nil && par.Type == html.ElementNode {
 					t := strings.ToLower(par.Data)
-					if t == "style" || t == "script" || t == "noscript" || t == "link" || t == "meta" || t == "head" {
+					if t == "style" || t == "script" || t == "link" || t == "meta" || t == "head" {
 						skip = true
 					}
 				}
@@ -3551,7 +3632,7 @@ func collectText(n *html.Node) string {
 			}
 			if c.Type == html.ElementNode {
 				t := strings.ToLower(c.Data)
-				if t == "style" || t == "script" || t == "noscript" || t == "link" || t == "meta" {
+				if t == "style" || t == "script" || t == "link" || t == "meta" {
 					continue
 				}
 				if t == "a" {
@@ -3565,6 +3646,59 @@ func collectText(n *html.Node) string {
 	}
 	rec(n)
 	return strings.TrimSpace(b.String())
+}
+
+// inputAccessiblePrompt exposes labels that modern, visually styled forms
+// keep only in accessibility attributes or placeholders. An HTML label is
+// already emitted by walkRich, so it suppresses the synthetic prompt.
+func inputAccessiblePrompt(n *html.Node) string {
+	if n == nil || hasHTMLLabel(n) {
+		return ""
+	}
+	for _, attr := range []string{"aria-label", "placeholder", "title"} {
+		if value := strings.TrimSpace(condenseSpaces(getAttr(n, attr))); value != "" {
+			return strings.TrimRight(value, " :")
+		}
+	}
+	return ""
+}
+
+func hasHTMLLabel(n *html.Node) bool {
+	for parent := n.Parent; parent != nil; parent = parent.Parent {
+		if parent.Type == html.ElementNode && strings.EqualFold(parent.Data, "label") {
+			return true
+		}
+	}
+	id := strings.TrimSpace(getAttr(n, "id"))
+	if id == "" {
+		return false
+	}
+	root := n
+	for root.Parent != nil {
+		root = root.Parent
+	}
+	var find func(*html.Node) bool
+	find = func(cur *html.Node) bool {
+		if cur.Type == html.ElementNode && strings.EqualFold(cur.Data, "label") && strings.TrimSpace(getAttr(cur, "for")) == id {
+			return true
+		}
+		for child := cur.FirstChild; child != nil; child = child.NextSibling {
+			if find(child) {
+				return true
+			}
+		}
+		return false
+	}
+	return find(root)
+}
+
+func hasAncestorTag(n *html.Node, tag string) bool {
+	for parent := n.Parent; parent != nil; parent = parent.Parent {
+		if parent.Type == html.ElementNode && strings.EqualFold(parent.Data, tag) {
+			return true
+		}
+	}
+	return false
 }
 
 func markTextNodes(n *html.Node, visited map[*html.Node]bool) {
@@ -3909,6 +4043,8 @@ func cacheCandidatesFor(prefs RenderOptions) []cacheCandidate {
 	switch want {
 	case RGB565MIME:
 		return []cacheCandidate{{format: RGB565MIME, quality: 0}}
+	case RGB565AlphaMIME:
+		return []cacheCandidate{{format: RGB565AlphaMIME, quality: 0}}
 	case "image/png":
 		return []cacheCandidate{{format: "image/png", quality: 0}}
 	case "image/gif":
@@ -4081,9 +4217,9 @@ func clampImageToScreenWidth(img image.Image, maxWidth int) (image.Image, int, i
 	return dst, maxWidth, scaledH
 }
 
-// clampImageToRGB565Budget keeps the uncompressed handset payload within both
+// clampImageToPixelBudget keeps an uncompressed handset payload within both
 // the OM3 uint16 tag limit and the client-advertised per-image memory budget.
-func clampImageToRGB565Budget(img image.Image, maxBytes int) (image.Image, int, int) {
+func clampImageToPixelBudget(img image.Image, maxBytes, bytesPerPixel int) (image.Image, int, int) {
 	b := img.Bounds()
 	w, h := b.Dx(), b.Dy()
 	if w <= 0 || h <= 0 {
@@ -4092,7 +4228,10 @@ func clampImageToRGB565Budget(img image.Image, maxBytes int) (image.Image, int, 
 	if maxBytes <= 0 || maxBytes > 0xfffe {
 		maxBytes = 0xfffe
 	}
-	maxPixels := maxBytes / 2
+	if bytesPerPixel < 1 {
+		bytesPerPixel = 1
+	}
+	maxPixels := maxBytes / bytesPerPixel
 	if maxPixels < 1 {
 		maxPixels = 1
 	}
@@ -4122,6 +4261,10 @@ func clampImageToRGB565Budget(img image.Image, maxBytes int) (image.Image, int, 
 	return dst, newW, newH
 }
 
+func clampImageToRGB565Budget(img image.Image, maxBytes int) (image.Image, int, int) {
+	return clampImageToPixelBudget(img, maxBytes, 2)
+}
+
 func encodeRGB565BE(img image.Image, maxBytes int) ([]byte, int, int) {
 	img, w, h := clampImageToRGB565Budget(img, maxBytes)
 	if w <= 0 || h <= 0 {
@@ -4148,6 +4291,49 @@ func encodeRGB565BE(img image.Image, maxBytes int) ([]byte, int, int) {
 	return out, w, h
 }
 
+func encodeRGB565AlphaBE(img image.Image, maxBytes int) ([]byte, int, int) {
+	img, w, h := clampImageToPixelBudget(img, maxBytes, 3)
+	if w <= 0 || h <= 0 {
+		return nil, w, h
+	}
+	out := make([]byte, w*h*3)
+	b := img.Bounds()
+	position := 0
+	for y := 0; y < h; y++ {
+		for x := 0; x < w; x++ {
+			pixelColor := color.NRGBAModel.Convert(
+				img.At(b.Min.X+x, b.Min.Y+y)).(color.NRGBA)
+			pixel := uint16((uint32(pixelColor.R)*31/255)<<11 |
+				(uint32(pixelColor.G)*63/255)<<5 |
+				uint32(pixelColor.B)*31/255)
+			out[position] = byte(pixel >> 8)
+			out[position+1] = byte(pixel)
+			out[position+2] = pixelColor.A
+			position += 3
+		}
+	}
+	return out, w, h
+}
+
+// EncodeRGB565AlphaResource converts a decoded web image to the lightweight
+// RGB565+straight-alpha payload used by Sky Operetta's OM3 and OM4 bridges.
+// Requested dimensions describe the OM4 drawing box; the byte budget may
+// reduce them proportionally for bounded handset memory.
+func EncodeRGB565AlphaResource(raw []byte, width, height, maxBytes int) ([]byte, int, int, error) {
+	img, _, err := image.Decode(bytes.NewReader(raw))
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	if width > 0 && height > 0 &&
+		(img.Bounds().Dx() != width || img.Bounds().Dy() != height) {
+		dst := image.NewRGBA(image.Rect(0, 0, width, height))
+		draw.CatmullRom.Scale(dst, dst.Bounds(), img, img.Bounds(), draw.Over, nil)
+		img = dst
+	}
+	data, encodedWidth, encodedHeight := encodeRGB565AlphaBE(img, maxBytes)
+	return data, encodedWidth, encodedHeight, nil
+}
+
 func encodeImage(img image.Image, prefs RenderOptions) ([]byte, int, int, string, int, error) {
 	img, w, h := clampImageToScreenWidth(img, prefs.ScreenW)
 
@@ -4166,6 +4352,10 @@ func encodeImage(img image.Image, prefs RenderOptions) ([]byte, int, int, string
 	case RGB565MIME:
 		maxBytes := prefs.MaxInlineKB * 1024
 		data, rgbW, rgbH := encodeRGB565BE(img, maxBytes)
+		return data, rgbW, rgbH, want, quality, nil
+	case RGB565AlphaMIME:
+		maxBytes := prefs.MaxInlineKB * 1024
+		data, rgbW, rgbH := encodeRGB565AlphaBE(img, maxBytes)
 		return data, rgbW, rgbH, want, quality, nil
 	case "image/png":
 		enc := png.Encoder{CompressionLevel: png.DefaultCompression}
@@ -4346,6 +4536,7 @@ func TransformDocument(doc *UpstreamDocument, hdr http.Header, opts *RenderOptio
 	rp.Styles = buildStylesheet(parsed, base, hdr, jar, &rp)
 	chosenCol := ""
 	chosenBg := ""
+	chosenLink := "#0000ad"
 	if bodyNode := findFirstByTag(parsed, "body"); bodyNode != nil {
 		var bgHex, fgHex string
 		if rp.Styles != nil {
@@ -4367,6 +4558,9 @@ func TransformDocument(doc *UpstreamDocument, hdr http.Header, opts *RenderOptio
 			if v := getAttr(bodyNode, "bgcolor"); v != "" {
 				bgHex = v
 			}
+		}
+		if value := cssToHex(getAttr(bodyNode, "link")); value != "" {
+			chosenLink = value
 		}
 		if bgHex == "" {
 			if v := getAttr(bodyNode, "bgcolor"); v != "" {
@@ -4402,6 +4596,7 @@ func TransformDocument(doc *UpstreamDocument, hdr http.Header, opts *RenderOptio
 	if chosenBg != "" {
 		st.curBg = chosenBg
 	}
+	st.linkColor = chosenLink
 	st.css = rp.Styles
 	target.AddStyle(styleDefault)
 	walkRich(parsed, base, target, visited, &st, rp)

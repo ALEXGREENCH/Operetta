@@ -19,6 +19,7 @@ import (
 
 	"operetta/oms"
 	"operetta/protocol/operamini"
+	"operetta/protocol/operamini4"
 )
 
 // clientJarKey derives a stable per-client key for server-side cookie jars.
@@ -93,8 +94,136 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		debugHTTP := os.Getenv("OMS_HTTP_DEBUG") == "1"
+		if os.Getenv("OMS_WIRE_DEBUG") == "1" {
+			s.logger.Printf("WIRE HTTP IN bytes=%d hex=%s", len(body), boundedHex(body, 512))
+		}
 		if debugHTTP {
 			s.logger.Printf("incoming %s %s body_bytes=%d", r.Method, r.URL.Path, len(body))
+		}
+		if operamini4.IsBootstrapHello(body) {
+			response := operamini4.BootstrapResponse(s.clock(), body[3:])
+			s.logger.Printf("OM4 bootstrap hello from %s nonce=%x response_bytes=%d", r.RemoteAddr, body[3:], len(response))
+			w.Header().Set("Content-Type", "application/octet-stream")
+			w.Header().Set("Content-Length", strconv.Itoa(len(response)))
+			w.Header().Set("Connection", "close")
+			if os.Getenv("OMS_WIRE_DEBUG") == "1" {
+				s.logger.Printf("WIRE OM4 OUT bytes=%d hex=%s", len(response), boundedHex(response, 512))
+			}
+			_, _ = w.Write(response)
+			return
+		}
+		if operamini4.IsSessionRequest(body) {
+			request, parseErr := operamini4.ParseSessionRequest(body)
+			if parseErr != nil {
+				s.logger.Printf("OM4 session parse error from %s: %v", r.RemoteAddr, parseErr)
+				http.Error(w, "invalid OM4 session packet", http.StatusBadRequest)
+				return
+			}
+			s.logger.Printf("OM4 session accepted from %s sequence=%d header=%q frames=%d", r.RemoteAddr, request.Sequence, request.Header, len(request.Frames))
+			if os.Getenv("OMS_WIRE_DEBUG") == "1" {
+				s.logger.Printf("WIRE OM4 PLAIN bytes=%d hex=%s", len(request.Plaintext), boundedHex(request.Plaintext, 1024))
+				for i, frame := range request.Frames {
+					s.logger.Printf("OM4 frame[%d] type=%d channel=%d payload_bytes=%d hex=%s", i, frame.Type, frame.Channel, len(frame.Payload), boundedHex(frame.Payload, 256))
+				}
+			}
+			if s.om4Reference == nil {
+				if len(s.om4OnboardingRecords) == 0 {
+					s.logger.Printf("OM4 session rejected: native onboarding is unavailable")
+					http.Error(w, "OM4 native onboarding unavailable", http.StatusServiceUnavailable)
+					return
+				}
+				nativeCtx, cancelNative := context.WithTimeout(r.Context(), 60*time.Second)
+				jarKey := om4CookieJarKey(r, request)
+				responseFrames, nativeErr := s.nativeOM4Frames(nativeCtx, request, s.cookieJars.Get(jarKey))
+				cancelNative()
+				if nativeErr != nil {
+					s.logger.Printf("OM4 native response error sequence=%d: %v", request.Sequence, nativeErr)
+					http.Error(w, "OM4 native response failed", http.StatusInternalServerError)
+					return
+				}
+				s.logger.Printf("OM4 native response sequence=%d frames=%d first_time=%t", request.Sequence, len(responseFrames), strings.TrimSpace(request.Header) == "")
+				s.saveOM4Corpus(request, responseFrames)
+				response, responseErr := request.BuildResponseFrames(responseFrames)
+				if responseErr != nil {
+					s.logger.Printf("OM4 response build error: %v", responseErr)
+					http.Error(w, "cannot build OM4 response", http.StatusInternalServerError)
+					return
+				}
+				w.Header().Set("Content-Type", "application/octet-stream")
+				w.Header().Set("Content-Length", strconv.Itoa(len(response)))
+				if r.Close {
+					w.Header().Set("Connection", "close")
+				} else {
+					w.Header().Set("Connection", "keep-alive")
+				}
+				if os.Getenv("OMS_WIRE_DEBUG") == "1" {
+					s.logger.Printf("WIRE OM4 NATIVE RESPONSE bytes=%d frames=%d hex=%s", len(response), len(responseFrames), boundedHex(response, 512))
+				}
+				_, _ = w.Write(response)
+				if r.Close {
+					return
+				}
+				if flusher, ok := w.(http.Flusher); ok {
+					flusher.Flush()
+				}
+				s.logger.Printf("OM4 native HTTP tunnel open for %s sequence=%d", r.RemoteAddr, request.Sequence)
+				timer := time.NewTimer(5 * time.Minute)
+				defer timer.Stop()
+				select {
+				case <-r.Context().Done():
+					s.logger.Printf("OM4 native HTTP tunnel closed by client %s", r.RemoteAddr)
+				case <-timer.C:
+					s.logger.Printf("OM4 native HTTP tunnel lifetime expired for %s", r.RemoteAddr)
+				}
+				return
+			}
+			referenceCtx, cancelReference := context.WithTimeout(r.Context(), 90*time.Second)
+			responseFrames, referenceErr := s.om4Reference.Exchange(referenceCtx, request)
+			cancelReference()
+			if referenceErr != nil {
+				s.logger.Printf("OM4 reference error sequence=%d: %v", request.Sequence, referenceErr)
+				http.Error(w, "OM4 reference request failed", http.StatusBadGateway)
+				return
+			}
+			s.logger.Printf("OM4 reference response sequence=%d frames=%d", request.Sequence, len(responseFrames))
+			s.saveOM4Corpus(request, responseFrames)
+			response, responseErr := request.BuildResponseFrames(responseFrames)
+			if responseErr != nil {
+				s.logger.Printf("OM4 response build error: %v", responseErr)
+				http.Error(w, "cannot build OM4 response", http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "application/octet-stream")
+			w.Header().Set("Content-Length", strconv.Itoa(len(response)))
+			if r.Close {
+				w.Header().Set("Connection", "close")
+			} else {
+				w.Header().Set("Connection", "keep-alive")
+			}
+			if os.Getenv("OMS_WIRE_DEBUG") == "1" {
+				s.logger.Printf("WIRE OM4 RESPONSE bytes=%d frames=%d hex=%s", len(response), len(responseFrames), boundedHex(response, 512))
+			}
+			_, _ = w.Write(response)
+			if r.Close {
+				return
+			}
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+			// OM4 treats an HTTP response as a server-to-client tunnel. Returning
+			// from the handler here produces EOF (client diagnostic d13), even
+			// after a valid close-channel record. Keep the carrier alive until the
+			// MIDlet closes it or the bounded tunnel lifetime expires.
+			s.logger.Printf("OM4 HTTP tunnel open for %s sequence=%d", r.RemoteAddr, request.Sequence)
+			timer := time.NewTimer(5 * time.Minute)
+			defer timer.Stop()
+			select {
+			case <-r.Context().Done():
+				s.logger.Printf("OM4 HTTP tunnel closed by client %s", r.RemoteAddr)
+			case <-timer.C:
+				s.logger.Printf("OM4 HTTP tunnel lifetime expired for %s", r.RemoteAddr)
+			}
+			return
 		}
 		params := parseNullKV(body)
 
@@ -104,6 +233,10 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 				mergeOMOptions(params, extras)
 			}
 			params["u"] = base
+		}
+		if params["engine"] == "4" {
+			s.handlePlainOM4(w, r, params)
+			return
 		}
 
 		if strings.Contains(params["h"], ".") && params["c"] == "" {
@@ -547,6 +680,10 @@ func (s *Server) renderOptionsFromParams(r *http.Request, params map[string]stri
 	opt := defaultRenderOptions()
 	if km := params["k"]; strings.HasPrefix(strings.ToLower(km), "image/") {
 		opt.ImageMIME = km
+	}
+	if alpha, ok := parseOperaBool(params["skya"]); ok && alpha &&
+		strings.EqualFold(opt.ImageMIME, oms.RGB565MIME) {
+		opt.ImageMIME = oms.RGB565AlphaMIME
 	}
 	if v := params["i"]; v != "" {
 		if b, ok := interpretImageMode(v); ok {
@@ -1268,6 +1405,9 @@ func (s *Server) writeOMS(w http.ResponseWriter, data []byte, _ []string, stats 
 	w.Header().Set("Content-Length", strconv.Itoa(len(data)))
 	w.Header().Set("Connection", "close")
 	dumpOMS(s.logger, data)
+	if os.Getenv("OMS_WIRE_DEBUG") == "1" {
+		s.logger.Printf("WIRE OMS OUT bytes=%d hex=%s", len(data), boundedHex(data, 512))
+	}
 	s.logTrafficSavings(stats, len(data))
 	_, _ = w.Write(data)
 }

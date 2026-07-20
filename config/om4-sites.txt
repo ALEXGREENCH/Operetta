@@ -1,0 +1,28 @@
+# Required regression sites.
+https://world82.spcs.bio/
+https://world82.spcs.bio/sz/
+https://world82.spcs.bio/registration/loginform/
+https://sefan.ru/
+https://www.opennet.ru/
+
+# Twenty high-traffic global and Russian sites (anonymous landing pages).
+https://www.google.com/
+https://www.youtube.com/
+https://www.facebook.com/
+https://www.instagram.com/
+https://chatgpt.com/
+https://www.reddit.com/
+https://www.wikipedia.org/
+https://x.com/
+https://www.whatsapp.com/
+https://www.bing.com/
+https://www.yahoo.com/
+https://www.tiktok.com/
+https://www.amazon.com/
+https://www.linkedin.com/
+https://www.netflix.com/
+https://yandex.ru/
+https://vk.com/
+https://mail.ru/
+https://dzen.ru/
+https://ria.ru/

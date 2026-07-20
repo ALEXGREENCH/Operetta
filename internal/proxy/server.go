@@ -7,6 +7,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"operetta/protocol/operamini4"
 )
 
 const defaultIndexHTML = `<!DOCTYPE html>
@@ -40,22 +42,28 @@ const (
 
 // Config describes server wiring and runtime behaviour.
 type Config struct {
-	IndexHTML         string
-	Bookmarks         []Bookmark
-	BookmarkMode      BookmarkMode
-	SitesDir          string
-	Logger            *log.Logger
-	Clock             func() time.Time
-	EnableDiagnostics bool
+	IndexHTML          string
+	Bookmarks          []Bookmark
+	BookmarkMode       BookmarkMode
+	SitesDir           string
+	Logger             *log.Logger
+	Clock              func() time.Time
+	EnableDiagnostics  bool
+	OM4ReferenceURL    string
+	OM4CorpusDir       string
+	OM4WelcomeTemplate string
 }
 
 // DefaultConfig populates configuration from environment variables.
 func DefaultConfig() Config {
 	cfg := Config{
-		IndexHTML: defaultIndexHTML,
-		Logger:    log.Default(),
-		Clock:     time.Now,
-		SitesDir:  strings.TrimSpace(os.Getenv("OMS_SITES_DIR")),
+		IndexHTML:          defaultIndexHTML,
+		Logger:             log.Default(),
+		Clock:              time.Now,
+		SitesDir:           strings.TrimSpace(os.Getenv("OMS_SITES_DIR")),
+		OM4ReferenceURL:    strings.TrimSpace(os.Getenv("OMS_OM4_REFERENCE_URL")),
+		OM4CorpusDir:       strings.TrimSpace(os.Getenv("OMS_OM4_CORPUS_DIR")),
+		OM4WelcomeTemplate: strings.TrimSpace(os.Getenv("OMS_OM4_WELCOME_TEMPLATE")),
 	}
 	if cfg.SitesDir == "" {
 		cfg.SitesDir = defaultSitesDir
@@ -104,20 +112,22 @@ func parseBookmarks(raw string) []Bookmark {
 
 // Server exposes the HTTP handlers implementing the proxy behaviour.
 type Server struct {
-	cfg         Config
-	mux         *http.ServeMux
-	handler     http.Handler
-	logger      *log.Logger
-	renderPrefs *renderPrefStore
-	cookieJars  *CookieJarStore
-	auth        *authStore
-	cache       *pageCache
-	sites       *siteConfigStore
-	clock       func() time.Time
-	forms       *formStore
-	jsBakerOnce sync.Once
-	jsBaker     *jsBaker
-	jsBakerErr  error
+	cfg                  Config
+	mux                  *http.ServeMux
+	handler              http.Handler
+	logger               *log.Logger
+	renderPrefs          *renderPrefStore
+	cookieJars           *CookieJarStore
+	auth                 *authStore
+	cache                *pageCache
+	sites                *siteConfigStore
+	clock                func() time.Time
+	forms                *formStore
+	jsBakerOnce          sync.Once
+	jsBaker              *jsBaker
+	jsBakerErr           error
+	om4Reference         *operamini4.ReferenceClient
+	om4OnboardingRecords []operamini4.DocumentRecord
 }
 
 // New wires a new proxy server with the provided configuration.
@@ -145,6 +155,21 @@ func New(cfg Config) *Server {
 		sites:       newSiteConfigStore(cfg.SitesDir),
 		clock:       cfg.Clock,
 		forms:       newFormStore(),
+	}
+	if cfg.OM4ReferenceURL != "" {
+		reference, err := operamini4.NewReferenceClient(cfg.OM4ReferenceURL)
+		if err != nil {
+			cfg.Logger.Printf("OM4 reference disabled: %v", err)
+		} else {
+			s.om4Reference = reference
+			cfg.Logger.Printf("OM4 reference bridge enabled: %s", cfg.OM4ReferenceURL)
+		}
+	}
+	if records, template, err := loadOM4OnboardingRecords(cfg.OM4WelcomeTemplate); err != nil {
+		cfg.Logger.Printf("OM4 native onboarding records unavailable: %v", err)
+	} else {
+		s.om4OnboardingRecords = records
+		cfg.Logger.Printf("OM4 native onboarding ready: %s records=%d", template, len(records))
 	}
 	s.registerRoutes()
 	s.handler = withLogging(s.logger, s.mux)
@@ -187,6 +212,9 @@ func (s *Server) getJSBaker() (*jsBaker, error) {
 func (s *Server) Close() error {
 	if s != nil && s.jsBaker != nil {
 		s.jsBaker.Close()
+	}
+	if s != nil && s.om4Reference != nil {
+		s.om4Reference.CloseIdleConnections()
 	}
 	return nil
 }

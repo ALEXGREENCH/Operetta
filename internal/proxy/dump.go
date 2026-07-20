@@ -49,6 +49,17 @@ func hexBlock(b []byte, start, end int) string {
 	return string(dst)
 }
 
+func boundedHex(b []byte, limit int) string {
+	if limit <= 0 || limit > len(b) {
+		limit = len(b)
+	}
+	out := hexBlock(b, 0, limit)
+	if limit < len(b) {
+		return fmt.Sprintf("%s...(+%d bytes)", out, len(b)-limit)
+	}
+	return out
+}
+
 func scanOMSForSuspicious(b []byte) string {
 	if len(b) < 6 {
 		return "OMS scan: payload shorter than header"

@@ -1028,11 +1028,11 @@ func TestRenderDocumentSyntheticSites(t *testing.T) {
 			},
 		},
 		{
-			name: "noscript_exclusion",
-			html: `<noscript>Visible fallback</noscript><p>Main body</p><script>document.write('should not appear')</script>`,
+			name: "noscript_fallback",
+			html: `<html><body><noscript>Visible fallback</noscript><p>Main body</p><script>document.write('should not appear')</script></body></html>`,
 			assert: func(t *testing.T, res *fixtureResult) {
 				res.mustContainText(t, "Main body")
-				res.mustNotContainText(t, "Visible fallback")
+				res.mustContainText(t, "Visible fallback")
 				res.mustNotContainText(t, "should not appear")
 			},
 		},

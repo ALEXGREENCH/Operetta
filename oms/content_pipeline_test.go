@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"net/http"
+	"strings"
 	"testing"
 
 	"operetta/presentation"
@@ -121,5 +122,99 @@ func TestTransformAndEncodeRemainSeparate(t *testing.T) {
 		if got, want := byte(word), versionHeaderByte(version); got != want {
 			t.Fatalf("version=%d header=0x%02x, want 0x%02x", version, got, want)
 		}
+	}
+}
+
+func TestTransformPreservesLegacyBodyLinkColor(t *testing.T) {
+	body := []byte(`<html><body text="#404040" link="#006600"><a href="/next"><b>Next</b></a></body></html>`)
+	model, err := TransformDocument(&UpstreamDocument{
+		URL: "https://fixture.test/", Body: body, RawBody: body,
+		Header: http.Header{"Content-Type": {"text/html; charset=utf-8"}},
+	}, http.Header{}, &RenderOptions{})
+	if err != nil {
+		t.Fatalf("TransformDocument: %v", err)
+	}
+	wantColor := false
+	wantBold := false
+	for _, operation := range model.Operations {
+		if operation.Kind != presentation.Style {
+			continue
+		}
+		wantColor = wantColor || operation.Style.Foreground == "#006600"
+		wantBold = wantBold || (operation.Style.Foreground == "#006600" && operation.Style.Bold)
+	}
+	if !wantColor || !wantBold {
+		t.Fatalf("legacy link style not preserved: color=%v bold=%v operations=%+v", wantColor, wantBold, model.Operations)
+	}
+}
+
+func TestTransformUsesOM4CompatibleDefaultLinkColor(t *testing.T) {
+	body := []byte(`<html><body text="#404040"><a href="/next">Next</a></body></html>`)
+	model, err := TransformDocument(&UpstreamDocument{
+		URL: "https://fixture.test/", Body: body, RawBody: body,
+		Header: http.Header{"Content-Type": {"text/html; charset=utf-8"}},
+	}, http.Header{}, &RenderOptions{})
+	if err != nil {
+		t.Fatalf("TransformDocument: %v", err)
+	}
+	for _, operation := range model.Operations {
+		if operation.Kind == presentation.Style && operation.Style.Foreground == "#0000ad" {
+			return
+		}
+	}
+	t.Fatalf("default link color not preserved: %+v", model.Operations)
+}
+
+func TestTransformDocumentPreservesModernFormSemantics(t *testing.T) {
+	body := []byte(`<html><body>
+		<a href="/account" aria-label="Account"></a>
+		<form><input type="search" name="q" placeholder="Search the web">
+		<input type="password" name="password" aria-label="Password">
+		<label>Phone<input type="tel" name="phone"></label>
+		<textarea name="message" placeholder="Message">draft</textarea></form>
+		<noscript>JavaScript-free fallback</noscript><script>secret()</script>
+	</body></html>`)
+	source := &UpstreamDocument{
+		URL:           "https://fixture.test/start",
+		Body:          body,
+		RawBody:       body,
+		Header:        http.Header{"Content-Type": {"text/html; charset=utf-8"}},
+		TransferBytes: len(body),
+	}
+	model, err := TransformDocument(source, http.Header{}, &RenderOptions{ImagesOn: true})
+	if err != nil {
+		t.Fatalf("TransformDocument: %v", err)
+	}
+
+	var texts []string
+	inputs := map[string]presentation.Operation{}
+	for _, op := range model.Operations {
+		switch op.Kind {
+		case presentation.Text:
+			texts = append(texts, op.Text)
+		case presentation.TextInput, presentation.PasswordInput:
+			inputs[op.Name] = op
+		}
+	}
+	joined := strings.Join(texts, " ")
+	for _, want := range []string{"Account", "Search the web", "Password", "Phone", "Message", "JavaScript-free fallback"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("presentation text %q does not contain %q", joined, want)
+		}
+	}
+	if strings.Contains(joined, "secret") {
+		t.Fatalf("script content leaked into presentation text: %q", joined)
+	}
+	if op, ok := inputs["q"]; !ok || op.Kind != presentation.TextInput {
+		t.Fatalf("search input missing or has wrong kind: %+v", op)
+	}
+	if op, ok := inputs["password"]; !ok || op.Kind != presentation.PasswordInput {
+		t.Fatalf("password input missing or has wrong kind: %+v", op)
+	}
+	if op, ok := inputs["phone"]; !ok || op.Kind != presentation.TextInput {
+		t.Fatalf("wrapped tel input missing or has wrong kind: %+v", op)
+	}
+	if op, ok := inputs["message"]; !ok || op.Value != "draft" {
+		t.Fatalf("textarea value was not preserved: %+v", op)
 	}
 }

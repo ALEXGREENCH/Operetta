@@ -18,7 +18,27 @@ import (
 
 func main() {
 	addrFlag := flag.String("addr", "127.0.0.1:8081", "listen address; use :8081 only for an intentionally public deployment")
+	debugFlag := flag.Bool("debug", false, "enable parsed Opera request diagnostics")
+	wireDebugFlag := flag.Bool("wire-debug", false, "enable bounded hexadecimal protocol dumps")
+	om4ReferenceFlag := flag.String("om4-reference-url", "", "forward OM4 requests to a compatible reference endpoint")
+	om4CorpusFlag := flag.String("om4-corpus-dir", "", "save decrypted OM4 request/response pairs for renderer research")
+	om4WelcomeTemplateFlag := flag.String("om4-welcome-template", "", "local OM4 first-time response frame template")
 	flag.Parse()
+	if *debugFlag {
+		_ = os.Setenv("OMS_HTTP_DEBUG", "1")
+	}
+	if *wireDebugFlag {
+		_ = os.Setenv("OMS_WIRE_DEBUG", "1")
+	}
+	if *om4ReferenceFlag != "" {
+		_ = os.Setenv("OMS_OM4_REFERENCE_URL", *om4ReferenceFlag)
+	}
+	if *om4CorpusFlag != "" {
+		_ = os.Setenv("OMS_OM4_CORPUS_DIR", *om4CorpusFlag)
+	}
+	if *om4WelcomeTemplateFlag != "" {
+		_ = os.Setenv("OMS_OM4_WELCOME_TEMPLATE", *om4WelcomeTemplateFlag)
+	}
 
 	oms.ProxyCookieJarStore = proxy.CookieJarStoreInstance
 	oms.ProxyDeriveClientKey = proxy.DeriveUpstreamClientKey
@@ -30,6 +50,9 @@ func main() {
 
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
 	log.SetOutput(os.Stdout)
+	if *debugFlag || *wireDebugFlag {
+		log.Printf("Debug enabled: parsed=%t wire=%t", *debugFlag, *wireDebugFlag)
+	}
 
 	handler := proxy.New(proxy.DefaultConfig())
 	defer handler.Close()

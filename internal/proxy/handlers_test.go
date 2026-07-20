@@ -23,6 +23,30 @@ func TestRootRejectsOversizedOperaRequest(t *testing.T) {
 	}
 }
 
+func TestRootHandlesOperaMini4Bootstrap(t *testing.T) {
+	server := New(Config{
+		SitesDir: t.TempDir(),
+		Logger:   log.New(io.Discard, "", 0),
+		Clock:    func() time.Time { return time.Unix(1_750_000_000, 0) },
+	})
+	body := []byte{1, 1, 0, 1, 2, 3, 4, 5, 6, 7, 8}
+	req := httptest.NewRequest(http.MethodPost, "http://operetta/", bytes.NewReader(body))
+	response := httptest.NewRecorder()
+	server.ServeHTTP(response, req)
+	if response.Code != http.StatusOK {
+		t.Fatalf("status=%d, want %d", response.Code, http.StatusOK)
+	}
+	if response.Body.Len() != 307 {
+		t.Fatalf("response bytes=%d, want 307", response.Body.Len())
+	}
+	if prefix := response.Body.Bytes()[:3]; !bytes.Equal(prefix, []byte{2, 0, 8}) {
+		t.Fatalf("response prefix=%x, want 020008", prefix)
+	}
+	if token := response.Body.Bytes()[3:11]; !bytes.Equal(token, body[3:]) {
+		t.Fatalf("response token=%x, want %x", token, body[3:])
+	}
+}
+
 func TestParseOperaBool(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
@@ -176,6 +200,12 @@ func TestRenderOptionsFromParamsQuality(t *testing.T) {
 	}, hdr, "")
 	if rgb565.ImageMIME != oms.RGB565MIME || rgb565.MaxInlineKB != 16 || rgb565.MaxBytesPerPage != 128*1024 || !rgb565.ImagesOn {
 		t.Fatalf("unexpected RGB565 options: %+v", rgb565)
+	}
+	rgb565Alpha := s.renderOptionsFromParams(r, map[string]string{
+		"k": "image/x-rgb565", "skya": "1", "d": "i:1",
+	}, hdr, "")
+	if rgb565Alpha.ImageMIME != oms.RGB565AlphaMIME || !rgb565Alpha.ImagesOn {
+		t.Fatalf("unexpected RGB565 alpha options: %+v", rgb565Alpha)
 	}
 }
 
