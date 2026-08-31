@@ -12,6 +12,17 @@ func TestExtractOMFragment(t *testing.T) {
 	}
 }
 
+func TestExtractLegacyBasicEncodedPaginationQuery(t *testing.T) {
+	raw := "/obml/0/http%3A%2F%2Fexample.com%2Fpath%3Fskip%3D5%26__om%3Dpage%253D2%2526pp%253D1600%2526w%253D240"
+	base, extras := extractClientTargetAndOMOptions(raw, true)
+	if base != "http://example.com/path?skip=5" {
+		t.Fatalf("expected decoded Basic target, got %q", base)
+	}
+	if extras["page"] != "2" || extras["pp"] != "1600" || extras["w"] != "240" {
+		t.Fatalf("encoded Basic pagination options lost: %#v", extras)
+	}
+}
+
 func TestExtractOMQuery(t *testing.T) {
 	base, extras := extractOMFragment("https://example.com/path?skip=5&__om=c%3D65536%26h%3D320%26img%3D1%26l%3D256%26m%3D16777216%26page%3D3%26pp%3D1600%26w%3D240")
 	if base != "https://example.com/path?skip=5" {

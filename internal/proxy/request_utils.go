@@ -67,6 +67,13 @@ func normalizeObmlURLWithPart(u string) (string, int, bool) {
 	return s, part, hasPart
 }
 
+func extractClientTargetAndOMOptions(raw string, legacyBasicOM2 bool) (string, map[string]string) {
+	if legacyBasicOM2 {
+		raw, _, _ = normalizeObmlURLWithPart(raw)
+	}
+	return extractOMFragment(raw)
+}
+
 func extractOMFragment(raw string) (string, map[string]string) {
 	parsed, err := url.Parse(raw)
 	if err != nil {

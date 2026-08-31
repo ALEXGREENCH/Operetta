@@ -2508,6 +2508,7 @@ func walkRich(cur *html.Node, base string, p renderTarget, visited map[*html.Nod
 		var stylePushed bool
 		var alignedPushed bool
 		var bgColorPushed bool
+		var bgBoundaryOnFinish bool
 		var bgRendered bool
 		var props map[string]string
 		finishCurrent := func() {
@@ -2834,6 +2835,13 @@ func walkRich(cur *html.Node, base string, p renderTarget, visited map[*html.Nod
 				p.AddBreak()
 				finishCurrent()
 				continue
+			}
+			if bgColorPushed {
+				// OM2 applies D(background) to the current visual segment. Restoring
+				// the parent background on the same line lets the following block
+				// repaint the tail of this one. Finish coloured generic containers on
+				// a line boundary before popBgcolor() restores the parent colour.
+				bgBoundaryOnFinish = true
 			}
 			p.AddParagraph()
 		case "b", "strong":
@@ -3605,6 +3613,9 @@ func walkRich(cur *html.Node, base string, p renderTarget, visited map[*html.Nod
 		if recurse && c.FirstChild != nil {
 			walkRich(c.FirstChild, base, p, visited, st, prefs)
 		}
+		if bgBoundaryOnFinish {
+			p.AddBreak()
+		}
 		finishCurrent()
 		if c.Type == html.ElementNode && strings.EqualFold(c.Data, "form") {
 			if len(st.formStack) > 0 {
@@ -4194,9 +4205,9 @@ func imageCacheVariantKey(absURL string, prefs RenderOptions) string {
 	if strings.TrimSpace(prefs.CachePartition) == "" {
 		return ""
 	}
-	return fmt.Sprintf("%s|session=%s|viewport=%dx%d|mime=%s|quality=%t|inline=%d|v=2",
+	return fmt.Sprintf("%s|session=%s|viewport=%dx%d|mime=%s|quality=%t|inline=%d|dialect=%s|v=3",
 		absURL, prefs.CachePartition, prefs.ScreenW, prefs.ScreenH, prefs.ImageMIME,
-		prefs.HighQuality, prefs.MaxInlineKB)
+		prefs.HighQuality, prefs.MaxInlineKB, prefs.DialectID)
 }
 
 func clampImageToScreenWidth(img image.Image, maxWidth int) (image.Image, int, int) {
@@ -4334,6 +4345,116 @@ func EncodeRGB565AlphaResource(raw []byte, width, height, maxBytes int) ([]byte,
 	return data, encodedWidth, encodedHeight, nil
 }
 
+func flattenImageOnWhite(img image.Image) image.Image {
+	if img == nil {
+		return img
+	}
+	b := img.Bounds()
+	dst := image.NewRGBA(image.Rect(0, 0, b.Dx(), b.Dy()))
+	draw.Draw(dst, dst.Bounds(), image.NewUniform(color.White), image.Point{}, draw.Src)
+	draw.Draw(dst, dst.Bounds(), img, b.Min, draw.Over)
+	return dst
+}
+
+func encodePNGToBudget(img image.Image, maxBytes int) ([]byte, int, int, error) {
+	current := img
+	var last []byte
+	for attempt := 0; attempt < 14; attempt++ {
+		var out bytes.Buffer
+		enc := png.Encoder{CompressionLevel: png.BestCompression}
+		if err := enc.Encode(&out, current); err != nil {
+			return nil, 0, 0, err
+		}
+		last = append(last[:0], out.Bytes()...)
+		b := current.Bounds()
+		w, h := b.Dx(), b.Dy()
+		if maxBytes <= 0 || len(last) <= maxBytes || (w <= 2 && h <= 2) {
+			return append([]byte(nil), last...), w, h, nil
+		}
+
+		ratio := math.Sqrt(float64(maxBytes)/float64(len(last))) * 0.88
+		if ratio > 0.84 {
+			ratio = 0.84
+		}
+		if ratio < 0.35 {
+			ratio = 0.35
+		}
+		newW := int(math.Floor(float64(w) * ratio))
+		newH := int(math.Floor(float64(h) * ratio))
+		if newW < 1 {
+			newW = 1
+		}
+		if newH < 1 {
+			newH = 1
+		}
+		if newW == w && w > 1 {
+			newW--
+		}
+		if newH == h && h > 1 {
+			newH--
+		}
+		dst := image.NewNRGBA(image.Rect(0, 0, newW, newH))
+		draw.CatmullRom.Scale(dst, dst.Bounds(), current, b, draw.Over, nil)
+		current = dst
+	}
+	b := current.Bounds()
+	return append([]byte(nil), last...), b.Dx(), b.Dy(), nil
+}
+
+func encodeJPEGToBudget(img image.Image, quality, maxBytes int) ([]byte, int, int, int, error) {
+	if quality <= 0 {
+		quality = 40
+	}
+	current := img
+	currentQuality := quality
+	var last []byte
+	for attempt := 0; attempt < 12; attempt++ {
+		var out bytes.Buffer
+		if err := jpeg.Encode(&out, current, &jpeg.Options{Quality: currentQuality}); err != nil {
+			return nil, 0, 0, currentQuality, err
+		}
+		last = append(last[:0], out.Bytes()...)
+		b := current.Bounds()
+		w, h := b.Dx(), b.Dy()
+		if maxBytes <= 0 || len(last) <= maxBytes || (w <= 8 && h <= 8) {
+			return append([]byte(nil), last...), w, h, currentQuality, nil
+		}
+
+		// JPEG size roughly follows pixel count. Scale by the square root of the
+		// byte ratio, leaving headroom for entropy/headers, and lower quality a
+		// little on every retry. This converges quickly for CLDC-sized budgets.
+		ratio := math.Sqrt(float64(maxBytes)/float64(len(last))) * 0.90
+		if ratio > 0.88 {
+			ratio = 0.88
+		}
+		if ratio < 0.45 {
+			ratio = 0.45
+		}
+		newW := int(math.Floor(float64(w) * ratio))
+		newH := int(math.Floor(float64(h) * ratio))
+		if newW < 1 {
+			newW = 1
+		}
+		if newH < 1 {
+			newH = 1
+		}
+		if newW == w && w > 1 {
+			newW--
+		}
+		if newH == h && h > 1 {
+			newH--
+		}
+		dst := image.NewRGBA(image.Rect(0, 0, newW, newH))
+		draw.CatmullRom.Scale(dst, dst.Bounds(), current, b, draw.Over, nil)
+		current = dst
+		if currentQuality > 25 {
+			currentQuality -= 3
+		}
+	}
+	b := current.Bounds()
+	return append([]byte(nil), last...), b.Dx(), b.Dy(), currentQuality, nil
+}
+
 func encodeImage(img image.Image, prefs RenderOptions) ([]byte, int, int, string, int, error) {
 	img, w, h := clampImageToScreenWidth(img, prefs.ScreenW)
 
@@ -4342,7 +4463,12 @@ func encodeImage(img image.Image, prefs RenderOptions) ([]byte, int, int, string
 		want = "image/jpeg"
 	}
 	if want == "image/jpeg" && imageHasAlpha(img) {
-		want = "image/png"
+		if prefs.DialectID == "om2-basic" {
+			img = flattenImageOnWhite(img)
+			w, h = img.Bounds().Dx(), img.Bounds().Dy()
+		} else {
+			want = "image/png"
+		}
 	}
 
 	var out bytes.Buffer
@@ -4358,6 +4484,10 @@ func encodeImage(img image.Image, prefs RenderOptions) ([]byte, int, int, string
 		data, rgbW, rgbH := encodeRGB565AlphaBE(img, maxBytes)
 		return data, rgbW, rgbH, want, quality, nil
 	case "image/png":
+		if prefs.DialectID == "om2-basic" && prefs.MaxInlineKB > 0 {
+			data, fitW, fitH, err := encodePNGToBudget(img, prefs.MaxInlineKB*1024)
+			return data, fitW, fitH, want, quality, err
+		}
 		enc := png.Encoder{CompressionLevel: png.DefaultCompression}
 		if prefs.HighQuality {
 			enc.CompressionLevel = png.BestCompression
@@ -4378,6 +4508,10 @@ func encodeImage(img image.Image, prefs RenderOptions) ([]byte, int, int, string
 	default:
 		want = "image/jpeg"
 		quality = jpegQualityFor(prefs)
+		if prefs.DialectID == "om2-basic" && prefs.MaxInlineKB > 0 {
+			data, fitW, fitH, fitQuality, err := encodeJPEGToBudget(img, quality, prefs.MaxInlineKB*1024)
+			return data, fitW, fitH, want, fitQuality, err
+		}
 		if err := jpeg.Encode(&out, img, &jpeg.Options{Quality: quality}); err != nil {
 			return nil, 0, 0, want, quality, err
 		}

@@ -4,6 +4,7 @@ import (
 	"image"
 	"image/color"
 	"math"
+	"strings"
 	"testing"
 )
 
@@ -191,5 +192,119 @@ func TestEncodeImageRGB565HonorsInlineBudget(t *testing.T) {
 	}
 	if w >= 240 || h >= 160 {
 		t.Fatalf("image was not downscaled: %dx%d", w, h)
+	}
+}
+
+func TestEncodeImageOM2BasicFitsPNGToInlineBudget(t *testing.T) {
+	src := image.NewNRGBA(image.Rect(0, 0, 240, 320))
+	for y := 0; y < 320; y++ {
+		for x := 0; x < 240; x++ {
+			src.SetNRGBA(x, y, color.NRGBA{
+				R: uint8((x*11 + y*19) & 0xff),
+				G: uint8((x*23 + y*3) & 0xff),
+				B: uint8((x*y + x*7 + y) & 0xff),
+				A: uint8(128 + ((x + y) & 0x7f)),
+			})
+		}
+	}
+	opts := defaultRenderPrefs()
+	opts.DialectID = "om2-basic"
+	opts.ImageMIME = "image/png"
+	opts.ScreenW = 240
+	opts.MaxInlineKB = 8
+	data, w, h, mime, _, err := encodeImage(src, opts)
+	if err != nil {
+		t.Fatalf("encodeImage returned error: %v", err)
+	}
+	if mime != "image/png" {
+		t.Fatalf("mime=%q", mime)
+	}
+	if len(data) == 0 || len(data) > 8*1024 {
+		t.Fatalf("PNG payload=%d exceeds legacy budget", len(data))
+	}
+	if len(data) < 4 || data[0] != 0x89 || string(data[1:4]) != "PNG" {
+		t.Fatalf("not a PNG payload: %x", data)
+	}
+	if w <= 0 || h <= 0 || w > 240 || h > 320 {
+		t.Fatalf("dimensions=%dx%d", w, h)
+	}
+}
+
+func TestEncodeImageOM2BasicFitsJPEGToInlineBudget(t *testing.T) {
+	src := image.NewRGBA(image.Rect(0, 0, 240, 320))
+	for y := 0; y < 320; y++ {
+		for x := 0; x < 240; x++ {
+			src.Set(x, y, color.RGBA{
+				R: uint8((x*13 + y*7) & 0xff),
+				G: uint8((x*5 + y*17) & 0xff),
+				B: uint8((x*y + x + y) & 0xff),
+				A: 0xff,
+			})
+		}
+	}
+	opts := defaultRenderPrefs()
+	opts.DialectID = "om2-basic"
+	opts.ImageMIME = "image/jpeg"
+	opts.ScreenW = 240
+	opts.MaxInlineKB = 8
+	data, w, h, mime, quality, err := encodeImage(src, opts)
+	if err != nil {
+		t.Fatalf("encodeImage returned error: %v", err)
+	}
+	if mime != "image/jpeg" {
+		t.Fatalf("mime=%q", mime)
+	}
+	if len(data) == 0 || len(data) > 8*1024 {
+		t.Fatalf("payload=%d exceeds legacy budget", len(data))
+	}
+	if w <= 0 || h <= 0 || w > 240 || h > 320 {
+		t.Fatalf("dimensions=%dx%d", w, h)
+	}
+	if quality > 40 || quality < 25 {
+		t.Fatalf("quality=%d", quality)
+	}
+}
+
+func TestImageCacheVariantKeySeparatesDialectsAndCodecGeneration(t *testing.T) {
+	opts := defaultRenderPrefs()
+	opts.CachePartition = "test-session"
+	opts.ScreenW = 240
+	opts.ScreenH = 320
+	opts.ImageMIME = "image/jpeg"
+	opts.MaxInlineKB = 8
+	base := imageCacheVariantKey("https://example.test/a.jpg", opts)
+	if base == "" {
+		t.Fatal("expected cache key")
+	}
+	opts.DialectID = "om2-basic"
+	legacy := imageCacheVariantKey("https://example.test/a.jpg", opts)
+	if legacy == base {
+		t.Fatalf("dialect must partition image cache: %q", legacy)
+	}
+	if !strings.Contains(legacy, "|dialect=om2-basic|v=3") {
+		t.Fatalf("legacy cache key missing dialect/generation: %q", legacy)
+	}
+}
+
+func TestEncodeImageOM2BasicFlattensAlphaToJPEG(t *testing.T) {
+	src := image.NewNRGBA(image.Rect(0, 0, 80, 80))
+	for y := 0; y < 80; y++ {
+		for x := 0; x < 80; x++ {
+			src.SetNRGBA(x, y, color.NRGBA{R: 220, G: uint8(x * 3), B: uint8(y * 3), A: uint8((x + y) & 0xff)})
+		}
+	}
+	opts := defaultRenderPrefs()
+	opts.DialectID = "om2-basic"
+	opts.ImageMIME = "image/jpeg"
+	opts.MaxInlineKB = 8
+	data, _, _, mime, _, err := encodeImage(src, opts)
+	if err != nil {
+		t.Fatalf("encodeImage returned error: %v", err)
+	}
+	if mime != "image/jpeg" {
+		t.Fatalf("expected flattened JPEG, got %q", mime)
+	}
+	if len(data) == 0 || len(data) > 8*1024 {
+		t.Fatalf("payload=%d", len(data))
 	}
 }

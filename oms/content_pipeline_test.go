@@ -148,6 +148,48 @@ func TestTransformPreservesLegacyBodyLinkColor(t *testing.T) {
 	}
 }
 
+func TestTransformBlockBackgroundEndsOnLineBoundaryBeforeRestore(t *testing.T) {
+	body := []byte(`<html><head><style>.top{background-color:#ffff00}.next{background-color:#ffffff}</style></head><body><div class="top">Top block</div><div class="next">Next block</div></body></html>`)
+	model, err := TransformDocument(&UpstreamDocument{
+		URL: "https://fixture.test/", Body: body, RawBody: body,
+		Header: http.Header{"Content-Type": {"text/html; charset=utf-8"}},
+	}, http.Header{}, &RenderOptions{})
+	if err != nil {
+		t.Fatalf("TransformDocument: %v", err)
+	}
+
+	top := -1
+	haveYellow := false
+	for i, op := range model.Operations {
+		if op.Kind == presentation.Background && strings.HasPrefix(strings.ToLower(op.Color), "#ffff") {
+			haveYellow = true
+		}
+		if op.Kind == presentation.Text && strings.Contains(op.Text, "Top block") {
+			top = i
+			break
+		}
+	}
+	if top < 0 || !haveYellow {
+		t.Fatalf("missing coloured top block: %+v", model.Operations)
+	}
+
+	haveBreak := false
+	for i := top + 1; i < len(model.Operations); i++ {
+		op := model.Operations[i]
+		if op.Kind == presentation.Break {
+			haveBreak = true
+			continue
+		}
+		if op.Kind == presentation.Background {
+			if !haveBreak {
+				t.Fatalf("background restored before line boundary after top block: %+v", model.Operations)
+			}
+			return
+		}
+	}
+	t.Fatal("expected parent/next background restore after top block")
+}
+
 func TestTransformUsesOM4CompatibleDefaultLinkColor(t *testing.T) {
 	body := []byte(`<html><body text="#404040"><a href="/next">Next</a></body></html>`)
 	model, err := TransformDocument(&UpstreamDocument{

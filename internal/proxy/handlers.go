@@ -226,9 +226,14 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		params := parseNullKV(body)
+		legacyBasicOM2 := isLegacyBasicOM2(params)
 
 		if raw := params["u"]; raw != "" {
-			base, extras := extractOMFragment(raw)
+			// OM2 Basic percent-encodes the complete /obml/N/<url> value before
+			// putting it into u=. Decode/remove that legacy wrapper first; otherwise
+			// an encoded ?__om=page=N query is invisible and every pagination
+			// navigation silently falls back to page 1.
+			base, extras := extractClientTargetAndOMOptions(raw, legacyBasicOM2)
 			if len(extras) > 0 {
 				mergeOMOptions(params, extras)
 			}
@@ -338,7 +343,7 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			page := s.renderBootstrapPage(tok.Code, tok.Prefix)
-			s.writeOMS(w, page.Data, page.SetCookies, &page.Stats)
+			s.writeOMSForClient(w, page.Data, page.SetCookies, &page.Stats, legacyBasicOM2)
 			return
 		}
 		if raw := params["u"]; raw != "" {
@@ -346,7 +351,10 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 			// OMPD uses N=1 merely to mark a navigation with a referer. Treating
 			// it as page N+1 made every followed URL open on part two. Operetta's
 			// pagination links carry an explicit __om=page=N option instead.
-			target, _, _ := normalizeObmlURLWithPart(raw)
+			target := raw
+			if !legacyBasicOM2 {
+				target, _, _ = normalizeObmlURLWithPart(raw)
+			}
 			effectiveTarget := target
 			jarKey := s.clientJarKey(r, params)
 			hdr := s.headersFromParams(r, params)
@@ -377,12 +385,38 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			opt := s.renderOptionsFromParams(r, params, hdr, jarKey)
+			if legacyBasicOM2 {
+				// The original ~64 KB OM2 Basic client accepts inline 'I' images too.
+				// Its wire parser reads width/height/dataLen followed by readUTF() and
+				// then dataLen raw bytes. Operetta's existing zero reserved u16 is an
+				// empty UTF string, so the bytes are wire-compatible. Keep the image
+				// budget deliberately small for CLDC-1.0 era heaps.
+				opt.ImagesOn = true
+				opt.HighQuality = false
+				opt.ImageMIME = legacyBasicImageMIME(params)
+				opt.MaxInlineKB = 8
+				opt.DialectID = "om2-basic"
+				opt.Compression = oms.CompressionNone
+				if s.logger != nil {
+					s.logger.Printf("legacy OM2 Basic image profile: requested_k=%q mime=%s screen=%dx%d heap=%d inline=%dKB", params["k"], opt.ImageMIME, opt.ScreenW, opt.ScreenH, opt.HeapBytes, opt.MaxInlineKB)
+				}
+				// Do not echo synthetic Operetta auth records into the original
+				// Basic client. The server-side jar/auth association was resolved
+				// above already; these k-records are only needed by later clients.
+				opt.AuthCode = ""
+				opt.AuthPrefix = ""
+				if os.Getenv("OMS_LEGACY_BASIC_SMOKE") == "1" {
+					page := renderLegacyBasicSmokePage()
+					s.writeOMSForClient(w, page.Data, page.SetCookies, &page.Stats, true)
+					return
+				}
+			}
 			if debugHTTP {
 				s.logger.Printf("fetch target=%q form_bytes=%d", effectiveTarget, len(opt.FormBody))
 			}
 			if s.isInternalAboutRequest(raw, effectiveTarget) {
 				page := s.renderAboutPage(params)
-				s.writeOMS(w, page.Data, page.SetCookies, &page.Stats)
+				s.writeOMSForClient(w, page.Data, page.SetCookies, &page.Stats, legacyBasicOM2)
 				return
 			}
 			if s.shouldServeLocalBookmarks() && looksLikeBookmarksPortal(effectiveTarget) {
@@ -395,12 +429,12 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 							s.logger.Printf("set gateway association cookie")
 						}
 					}
-					s.writeOMS(w, page.Data, page.SetCookies, &page.Stats)
+					s.writeOMSForClient(w, page.Data, page.SetCookies, &page.Stats, legacyBasicOM2)
 					return
 				}
 			}
 			s.renderPrefs.Remember(s.renderPrefKeyWithOptions(r, params["u"], opt), opt)
-			cacheHit := s.serveFromCache(w, effectiveTarget, opt)
+			cacheHit := s.serveFromCache(w, effectiveTarget, opt, legacyBasicOM2)
 			if cacheHit {
 				return
 			}
@@ -409,12 +443,19 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 				http.Error(w, err.Error(), http.StatusBadGateway)
 				return
 			}
+			if legacyBasicOM2 && s.logger != nil {
+				cur, total := page.PartInfo()
+				s.logger.Printf("legacy OM2 Basic page: part=%d/%d wire=%d cache_full=%d origin=%d decoded=%d", cur, total, len(page.Data), len(page.CachePacked), page.Stats.OriginTransferBytes, page.Stats.OriginDecodedBytes)
+			}
 			if len(page.FormHidden) > 0 && jarKey != "" {
 				s.forms.Store(jarKey, page.FormHidden)
 			}
 			// Origin cookies stay in the per-session upstream jar. Re-emitting
 			// them on the gateway origin would allow a website to overwrite the
 			// Operetta association cookie.
+			// Keep the same normalized OMS record/count contract as the working
+			// Opera Mini Mod 2.06 path. Basic differs only in transport/image
+			// capability handling; document-flow/header semantics stay identical.
 			page.Normalize()
 			s.cache.Store(target, opt, hdr, page)
 			if !hadCookie {
@@ -424,7 +465,7 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 					s.logger.Printf("set gateway association cookie")
 				}
 			}
-			s.writeOMS(w, page.Data, page.SetCookies, &page.Stats)
+			s.writeOMSForClient(w, page.Data, page.SetCookies, &page.Stats, legacyBasicOM2)
 			return
 		}
 		w.Header().Set("Content-Type", "application/xml; charset=utf-8")
@@ -457,7 +498,7 @@ func (s *Server) handleFetch(w http.ResponseWriter, r *http.Request) {
 	hdr := s.headersFromQuery(r)
 	opt := s.renderOptionsFromQuery(r, hdr)
 	s.renderPrefs.Remember(s.renderPrefKeyWithOptions(r, finalURL, opt), opt)
-	if s.serveFromCache(w, finalURL, opt) {
+	if s.serveFromCache(w, finalURL, opt, false) {
 		return
 	}
 	page, err := s.loadPage(r.Context(), finalURL, hdr, opt)
@@ -1127,14 +1168,14 @@ func defaultRenderOptions() *oms.RenderOptions {
 	}
 }
 
-func (s *Server) serveFromCache(w http.ResponseWriter, target string, opt *oms.RenderOptions) bool {
+func (s *Server) serveFromCache(w http.ResponseWriter, target string, opt *oms.RenderOptions, legacyBasicOM2 bool) bool {
 	if raw, _, cur, cnt, stats, ok := s.cache.Select(target, opt); ok {
 		if cur > 0 || cnt > 0 {
 			w.Header().Set("X-Operetta-Page", strconv.Itoa(cur))
 			w.Header().Set("X-Operetta-Pages", strconv.Itoa(cnt))
 		}
 		statsCopy := stats
-		s.writeOMS(w, raw, nil, &statsCopy)
+		s.writeOMSForClient(w, raw, nil, &statsCopy, legacyBasicOM2)
 		return true
 	}
 	return false
