@@ -137,10 +137,10 @@ func TestLegacyBasicImageStripScalesEachImageBelowInlineLimit(t *testing.T) {
 func TestSectionTitleKeepsHeadingAndActionOnOneLine(t *testing.T) {
 	res := renderFixture(t, obmlFixture{
 		name: "section_title_action",
-		html: `<style>.right{float:right}.title{font-weight:bold}</style>` +
+		html: `<style>.right{float:right}.title{font-weight:bold;text-transform:uppercase}</style>` +
 			`<div class="title"><a class="right" href="/all">Все</a><h6>Популярные фото</h6></div>`,
 	})
-	if got := res.visibleText(); !strings.Contains(got, "Популярные фото · Все\n") {
+	if got := res.visibleText(); !strings.Contains(got, "ПОПУЛЯРНЫЕ ФОТО · ВСЕ\n") {
 		t.Fatalf("unexpected section title flow %q; tokens=%v", got, res.tokens)
 	}
 	res.mustHaveLink(t, "0/http://fixture.test/all")

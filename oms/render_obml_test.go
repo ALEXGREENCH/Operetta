@@ -931,6 +931,32 @@ func TestRenderDocumentSyntheticSites(t *testing.T) {
 			},
 		},
 		{
+			name: "css_heading_inherits_normal_weight",
+			html: `<style>h1{font-weight:inherit;text-transform:uppercase}.header{text-align:center}.grey{color:#617989}</style>` +
+				`<h1 class="header grey">Official Spaces</h1>`,
+			assert: func(t *testing.T, res *fixtureResult) {
+				res.mustContainText(t, "OFFICIAL SPACES")
+				style, ok := res.styleByteBeforeText("OFFICIAL SPACES")
+				if !ok || style&byte(styleBoldBit) != 0 || style&byte(styleCenterBit) == 0 {
+					t.Fatalf("heading style=0x%02x ok=%v, want centered non-bold; tokens=%v", style, ok, res.tokens)
+				}
+			},
+		},
+		{
+			name: "compact_search_aria_label_is_not_visible_caption",
+			html: `<form action="/search"><table class="search-wrap"><tr><td>` +
+				`<input class="input-txt" type="text" name="q" aria-label="Search this site"></td>` +
+				`<td><input type="submit" name="go" value="Find"></td></tr></table></form>`,
+			assert: func(t *testing.T, res *fixtureResult) {
+				if strings.Contains(res.visibleText(), "Search this site") {
+					t.Fatalf("compact search exposed aria-label as caption: %q", res.visibleText())
+				}
+				if res.countTag('x') != 1 || res.countTag('u') != 1 {
+					t.Fatalf("search controls x=%d u=%d", res.countTag('x'), res.countTag('u'))
+				}
+			},
+		},
+		{
 			name: "form_hidden_inputs",
 			html: `<form action="/submit"><input type="hidden" name="token" value="abc123"><input type="submit" value="Send"></form>`,
 			assert: func(t *testing.T, res *fixtureResult) {

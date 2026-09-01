@@ -2268,7 +2268,7 @@ func cssEffectiveProp(n *html.Node, ss *Stylesheet, self map[string]string, prop
 		}
 	}
 	switch strings.ToLower(prop) {
-	case "color", "text-align", "font-weight", "font-style", "text-decoration", "list-style-type":
+	case "color", "text-align", "font-weight", "font-style", "text-decoration", "list-style-type", "text-transform":
 		depth := 0
 		for p := n.Parent; p != nil && depth < 12; p = p.Parent {
 			if p.Type != html.ElementNode {
@@ -2420,7 +2420,37 @@ func textNodeContent(n *html.Node, st *walkState) string {
 	if strings.HasSuffix(collapsed, " ") && isInlineContentBoundary(nextSignificantSibling(n)) {
 		trimmed += " "
 	}
-	return trimmed
+	return applyNodeTextTransform(n.Parent, st, trimmed)
+}
+
+func applyNodeTextTransform(n *html.Node, st *walkState, text string) string {
+	if n == nil || st == nil || st.css == nil || text == "" {
+		return text
+	}
+	props := computeStyleFor(n, st.css)
+	switch strings.ToLower(strings.TrimSpace(cssEffectiveProp(n, st.css, props, "text-transform"))) {
+	case "uppercase":
+		return strings.ToUpper(text)
+	case "lowercase":
+		return strings.ToLower(text)
+	case "capitalize":
+		var out strings.Builder
+		newWord := true
+		for _, r := range text {
+			if unicode.IsLetter(r) || unicode.IsDigit(r) {
+				if newWord {
+					r = unicode.ToUpper(r)
+				}
+				newWord = false
+			} else {
+				newWord = true
+			}
+			out.WriteRune(r)
+		}
+		return out.String()
+	default:
+		return text
+	}
 }
 
 // parseBackgroundPosition parses simple background-position values like "-24px 0" or "0 0".
@@ -2812,13 +2842,19 @@ func walkRich(cur *html.Node, base string, p renderTarget, visited map[*html.Nod
 				}
 			}
 			if txt != "" {
+				txt = applyNodeTextTransform(c, st, txt)
 				if st.curBg == "" {
 					p.AddPlus()
 				}
-				// Emphasize headings
-				st.pushStyle(p, st.curStyle|styleBoldBit)
-				p.AddText(txt)
-				st.popStyle(p)
+				// Keep the HTML heading default, but do not override an author CSS
+				// font-weight (including inherit/normal) with synthetic bold.
+				if strings.TrimSpace(props["font-weight"]) == "" {
+					st.pushStyle(p, st.curStyle|styleBoldBit)
+					p.AddText(txt)
+					st.popStyle(p)
+				} else {
+					p.AddText(txt)
+				}
 				p.AddBreak()
 			}
 			// Do not recurse into heading children to avoid duplicate text
@@ -3827,12 +3863,41 @@ func inputAccessiblePrompt(n *html.Node) string {
 	if n == nil || hasHTMLLabel(n) {
 		return ""
 	}
+	if isCompactSearchInput(n) && strings.TrimSpace(getAttr(n, "placeholder")) == "" {
+		// Search tables commonly expose aria-label only because their adjacent
+		// submit button is a background icon. The OMS submit remains visible, so
+		// repeating aria-label as a full line is noisy and breaks compact layout.
+		return ""
+	}
 	for _, attr := range []string{"aria-label", "placeholder", "title"} {
 		if value := strings.TrimSpace(condenseSpaces(getAttr(n, attr))); value != "" {
 			return strings.TrimRight(value, " :")
 		}
 	}
 	return ""
+}
+
+func isCompactSearchInput(n *html.Node) bool {
+	if n == nil || !strings.EqualFold(n.Data, "input") {
+		return false
+	}
+	if strings.EqualFold(strings.TrimSpace(getAttr(n, "type")), "search") ||
+		hasAnyClass(n, "search", "search-input", "input-txt_search") {
+		return true
+	}
+	for parent := n.Parent; parent != nil; parent = parent.Parent {
+		if parent.Type != html.ElementNode {
+			continue
+		}
+		if hasAnyClass(parent, "search", "search-form", "search-wrap", "input-txt_grid", "input-txt_wrapper_search") {
+			return true
+		}
+		if strings.EqualFold(parent.Data, "form") {
+			action := strings.ToLower(strings.TrimSpace(getAttr(parent, "action")))
+			return strings.Contains(action, "search") || strings.Contains(action, "поиск")
+		}
+	}
+	return false
 }
 
 func hasHTMLLabel(n *html.Node) bool {

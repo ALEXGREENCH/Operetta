@@ -388,6 +388,8 @@ func renderSectionTitle(container *html.Node, base string, p renderTarget, st *w
 	if title == "" || actionText == "" {
 		return false
 	}
+	title = applyNodeTextTransform(container, st, title)
+	actionText = applyNodeTextTransform(container, st, actionText)
 	st.pushStyle(p, st.curStyle|styleBoldBit)
 	p.AddText(title)
 	st.popStyle(p)
