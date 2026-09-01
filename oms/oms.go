@@ -54,6 +54,7 @@ const defaultUpstreamUA = "Mozilla/5.0 (Linux; Android 9; OMS Test) AppleWebKit/
 const DefaultUpstreamUA = defaultUpstreamUA
 
 const defaultPaginationBytes = 32000
+const maxHeapAwareTagsPerPage = 60000
 const maxInlineBackgroundSize = 128
 const RGB565MIME = "image/x-rgb565"
 const RGB565AlphaMIME = "image/x-rgb565a"
@@ -148,6 +149,64 @@ func maxBytesBudget() int {
 		maxBytes = 1024
 	}
 	return maxBytes
+}
+
+// PageHeapBudget reserves half of the client-reported heap for the MIDlet,
+// parser, display tree and transient allocations. The remaining half is the
+// maximum estimated retained cost of one rendered page. A zero heap means the
+// client did not report a usable value and keeps the historical byte limits.
+func PageHeapBudget(heapBytes int) int {
+	if heapBytes <= 0 {
+		return 0
+	}
+	budget := heapBytes / 2
+	if budget < 8*1024 {
+		budget = 8 * 1024
+	}
+	if budget > heapBytes {
+		budget = heapBytes
+	}
+	return budget
+}
+
+// EffectivePaginationLimits converts negotiated client capabilities into the
+// three independent page limits used by the splitter. When a heap is known,
+// the conservative fixed 32KB wire cap is replaced by a retained-memory cap;
+// this lets OMPD's large virtual heap receive normal pages without pagination
+// while still protecting small Java ME heaps. Explicit pp/maxpagekb and server
+// environment overrides continue to win.
+func EffectivePaginationLimits(opts *RenderOptions) (maxTags, maxWireBytes, maxHeapBytes int) {
+	version := ClientVersion2
+	if opts != nil {
+		version = normalizeClientVersion(opts.ClientVersion)
+		maxTags = opts.MaxTagsPerPage
+		maxWireBytes = opts.MaxBytesPerPage
+		maxHeapBytes = PageHeapBudget(opts.HeapBytes)
+	}
+
+	if maxTags <= 0 {
+		if raw := strings.TrimSpace(os.Getenv("OMS_PAGINATE_TAGS")); raw != "" {
+			if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
+				maxTags = parsed
+			}
+		}
+		if maxTags <= 0 {
+			if maxHeapBytes > 0 {
+				maxTags = maxHeapAwareTagsPerPage
+			} else if version == ClientVersion1 {
+				maxTags = 2400
+			} else {
+				maxTags = 1600
+			}
+		}
+	}
+
+	if maxWireBytes <= 0 {
+		if strings.TrimSpace(os.Getenv("OMS_PAGINATE_BYTES")) != "" || maxHeapBytes == 0 {
+			maxWireBytes = maxBytesBudget()
+		}
+	}
+	return maxTags, maxWireBytes, maxHeapBytes
 }
 
 // shrinkPartToMaxBytes trims a single part (prefix + tagged body) so that its
@@ -318,7 +377,15 @@ func splitByTags(b []byte, maxTags int, clientVersion ClientVersion) [][]byte {
 }
 
 func splitByTagsWithBudget(b []byte, maxTags int, clientVersion ClientVersion, maxBytes int) [][]byte {
-	if maxTags <= 0 || len(b) < 2 {
+	return splitByTagsWithBudgets(b, maxTags, clientVersion, maxBytes, 0)
+}
+
+// splitByTagsWithBudgets limits both wire bytes and estimated retained heap.
+// Encoded image bytes alone are not a useful heap estimate on Java ME: after
+// decoding, a highly-compressible image can occupy width*height*4 bytes while
+// its JPEG/PNG payload is only a few kilobytes.
+func splitByTagsWithBudgets(b []byte, maxTags int, clientVersion ClientVersion, maxBytes, maxHeapBytes int) [][]byte {
+	if (maxTags <= 0 && maxBytes <= 0 && maxHeapBytes <= 0) || len(b) < 2 {
 		return [][]byte{b}
 	}
 	styleDataLen := stylePayloadSize(clientVersion)
@@ -459,9 +526,20 @@ PreludeDone:
 	limit := len(b)
 	parts := make([][]byte, 0, 2)
 	partIdx := 0
+	partBaseHeap := 2048 + len(prefix)*2 + len(prelude)*2
+	chunkHeap := partBaseHeap
+	atomStart := start
+	atomTagsBefore := 0
+	atomHeapBefore := chunkHeap
 	for p < limit {
+		if linkDepth == 0 {
+			atomStart = p
+			atomTagsBefore = tags
+			atomHeapBefore = chunkHeap
+		}
 		tag := b[p]
 		p++
+		tagHeap := 64 // display-list node/object bookkeeping
 		switch tag {
 		case 'T', 'L':
 			if p+2 > limit {
@@ -470,6 +548,7 @@ PreludeDone:
 			}
 			l := int(binary.BigEndian.Uint16(b[p : p+2]))
 			p += 2 + l
+			tagHeap += l * 2 // Java strings are retained as UTF-16
 		case 'E', 'B', '+', 'V', 'Q', 'l':
 			// no payload
 		case 'D', 'R':
@@ -491,8 +570,20 @@ PreludeDone:
 				p = limit
 				break
 			}
+			width := int(binary.BigEndian.Uint16(b[p : p+2]))
+			height := int(binary.BigEndian.Uint16(b[p+2 : p+4]))
 			dl := int(binary.BigEndian.Uint16(b[p+4 : p+6]))
 			p += 8 + dl
+			// Count both the encoded byte[] and a conservative ARGB decode.
+			// Some 16-bit phones use RGB565 internally, but Java ME
+			// implementations are allowed to retain a 32-bit surface.
+			tagHeap += dl
+			pixels := int64(width) * int64(height) * 4
+			if pixels > int64(^uint(0)>>1)-int64(tagHeap) {
+				tagHeap = int(^uint(0) >> 1)
+			} else {
+				tagHeap += int(pixels)
+			}
 		case 'k':
 			p += 1
 			if p+2 > limit {
@@ -501,6 +592,7 @@ PreludeDone:
 			}
 			l := int(binary.BigEndian.Uint16(b[p : p+2]))
 			p += 2 + l
+			tagHeap += l * 2
 		case 'h':
 			for i := 0; i < 2; i++ {
 				if p+2 > limit {
@@ -509,6 +601,7 @@ PreludeDone:
 				}
 				l := int(binary.BigEndian.Uint16(b[p : p+2]))
 				p += 2 + l
+				tagHeap += l * 2
 			}
 		case 'x':
 			p += 1
@@ -519,6 +612,7 @@ PreludeDone:
 				}
 				l := int(binary.BigEndian.Uint16(b[p : p+2]))
 				p += 2 + l
+				tagHeap += l * 2
 			}
 		case 'p', 'u', 'i', 'b', 'e':
 			for i := 0; i < 2; i++ {
@@ -528,6 +622,7 @@ PreludeDone:
 				}
 				l := int(binary.BigEndian.Uint16(b[p : p+2]))
 				p += 2 + l
+				tagHeap += l * 2
 			}
 		case 'c', 'r':
 			for i := 0; i < 2; i++ {
@@ -537,6 +632,7 @@ PreludeDone:
 				}
 				l := int(binary.BigEndian.Uint16(b[p : p+2]))
 				p += 2 + l
+				tagHeap += l * 2
 			}
 			p += 1
 		case 's':
@@ -546,6 +642,7 @@ PreludeDone:
 			}
 			l := int(binary.BigEndian.Uint16(b[p : p+2]))
 			p += 2 + l
+			tagHeap += l * 2
 			if p+1 > limit {
 				p = limit
 				break
@@ -564,6 +661,7 @@ PreludeDone:
 				}
 				l := int(binary.BigEndian.Uint16(b[p : p+2]))
 				p += 2 + l
+				tagHeap += l * 2
 			}
 			p += 1
 		default:
@@ -571,6 +669,11 @@ PreludeDone:
 			p = limit
 		}
 		tags++
+		if chunkHeap > int(^uint(0)>>1)-tagHeap {
+			chunkHeap = int(^uint(0) >> 1)
+		} else {
+			chunkHeap += tagHeap
+		}
 		switch tag {
 		case 'L':
 			linkDepth++
@@ -580,17 +683,31 @@ PreludeDone:
 			}
 		}
 		chunkBytes := p - start
-		if linkDepth == 0 && (tags >= maxTags || (maxBytes > 0 && chunkBytes >= maxBytes)) {
-			// Cut part [start:p)
-			chunk := append([]byte(nil), b[start:p]...)
+		heapExceeded := maxHeapBytes > 0 && chunkHeap >= maxHeapBytes
+		if linkDepth == 0 && ((maxTags > 0 && tags >= maxTags) ||
+			(maxBytes > 0 && chunkBytes >= maxBytes) || heapExceeded) {
+			cutAt := p
+			remainingTags := 0
+			remainingHeap := partBaseHeap
+			// A decoded image can be much larger than its wire tag. When the
+			// newest atomic item (a tag or complete link) crosses the heap cap,
+			// place it on the next part instead of letting one extra image make
+			// the previous part exceed the negotiated heap substantially.
+			if heapExceeded && atomStart > start && atomTagsBefore > 0 {
+				cutAt = atomStart
+				remainingTags = tags - atomTagsBefore
+				remainingHeap = partBaseHeap + (chunkHeap - atomHeapBefore)
+			}
+			chunk := append([]byte(nil), b[start:cutAt]...)
 			part := append([]byte(nil), prefix...)
 			if partIdx > 0 && len(prelude) > 0 {
 				part = append(part, prelude...)
 			}
 			part = append(part, chunk...)
 			parts = append(parts, part)
-			start = p
-			tags = 0
+			start = cutAt
+			tags = remainingTags
+			chunkHeap = remainingHeap
 			partIdx++
 		}
 	}
@@ -2703,6 +2820,11 @@ func walkRich(cur *html.Node, base string, p renderTarget, visited map[*html.Nod
 			// Do not recurse into heading children to avoid duplicate text
 			recurse = false
 		case "div", "section", "article", "header", "footer", "main", "nav", "aside":
+			if renderFloatIconGrid(c, base, p, st, prefs) {
+				recurse = false
+				finishCurrent()
+				continue
+			}
 			if hasClass(c, "p") {
 				resetComputedStyles(st, p, &colorPushed, &stylePushed, &alignedPushed)
 				st.pushColor(p, "#007700")
@@ -4793,33 +4915,12 @@ func EncodeDocument(model *presentation.Document, opts *RenderOptions) (*Page, e
 	}
 	encodeContentOperations(p, model)
 	pageIdx := 1
-	maxTags := 0
-	maxPageBytes := maxBytesBudget()
 	if opts != nil {
 		if opts.Page > 0 {
 			pageIdx = opts.Page
 		}
-		if opts.MaxTagsPerPage > 0 {
-			maxTags = opts.MaxTagsPerPage
-		}
-		if opts.MaxBytesPerPage > 0 {
-			maxPageBytes = opts.MaxBytesPerPage
-		}
 	}
-	if maxTags == 0 {
-		if s := os.Getenv("OMS_PAGINATE_TAGS"); s != "" {
-			if v, err := strconv.Atoi(strings.TrimSpace(s)); err == nil && v > 0 {
-				maxTags = v
-			}
-		}
-		if maxTags == 0 {
-			if rp.ClientVersion == ClientVersion1 {
-				maxTags = 2400
-			} else {
-				maxTags = 1600
-			}
-		}
-	}
+	maxTags, maxPageBytes, maxPageHeap := EffectivePaginationLimits(&rp)
 	if pageIdx < 1 {
 		pageIdx = 1
 	}
@@ -4831,7 +4932,7 @@ func EncodeDocument(model *presentation.Document, opts *RenderOptions) (*Page, e
 		packed.finalize()
 		p.CachePacked = append([]byte(nil), packed.Data...)
 	}
-	parts := splitByTagsWithBudget(p.Data, maxTags, rp.ClientVersion, maxPageBytes)
+	parts := splitByTagsWithBudgets(p.Data, maxTags, rp.ClientVersion, maxPageBytes, maxPageHeap)
 	if len(parts) == 0 {
 		p.finalize()
 		return p, nil

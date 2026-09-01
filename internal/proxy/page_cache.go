@@ -48,11 +48,12 @@ func cacheKey(target string, opt *oms.RenderOptions) string {
 		js = fmt.Sprintf("%d/%d/%d/%s/%d/%q", opt.JS.Mode, opt.JS.WaitAfterLoadMS,
 			opt.JS.WaitNetworkIdleMS, opt.JS.WaitSelector, opt.JS.TimeoutMS, opt.JS.Scripts)
 	}
+	effectiveTags, effectiveWireBytes, effectiveHeapBytes := oms.EffectivePaginationLimits(opt)
 	variant := fmt.Sprintf(
-		"target=%q|partition=%q|mime=%q|images=%t|hq=%t|maxkb=%d|maxpage=%d|screen=%dx%d|colors=%d|heap=%d|alpha=%d|version=%d|dialect=%q|compression=%d|tags=%d|lang=%q|ua=%q|js=%s",
+		"target=%q|partition=%q|mime=%q|images=%t|hq=%t|maxkb=%d|maxpage=%d|pageheap=%d|screen=%dx%d|colors=%d|heap=%d|alpha=%d|version=%d|dialect=%q|compression=%d|tags=%d|lang=%q|ua=%q|js=%s",
 		target, opt.CachePartition, opt.ImageMIME, opt.ImagesOn, opt.HighQuality,
-		opt.MaxInlineKB, opt.MaxBytesPerPage, opt.ScreenW, opt.ScreenH, opt.NumColors, opt.HeapBytes,
-		opt.AlphaLevels, opt.ClientVersion, opt.DialectID, opt.Compression, opt.MaxTagsPerPage,
+		opt.MaxInlineKB, effectiveWireBytes, effectiveHeapBytes, opt.ScreenW, opt.ScreenH, opt.NumColors, opt.HeapBytes,
+		opt.AlphaLevels, opt.ClientVersion, opt.DialectID, opt.Compression, effectiveTags,
 		opt.ReqHeaders.Get("Accept-Language"), opt.ReqHeaders.Get("User-Agent"), js,
 	)
 	sum := sha256.Sum256([]byte(variant))
@@ -91,7 +92,11 @@ func (c *pageCache) Store(target string, opt *oms.RenderOptions, hdr http.Header
 }
 
 func (c *pageCache) Select(target string, opt *oms.RenderOptions) ([]byte, []string, int, int, oms.TrafficStats, bool) {
-	if opt == nil || opt.Page <= 1 || opt.MaxTagsPerPage <= 0 {
+	if opt == nil || opt.Page <= 1 {
+		return nil, nil, 0, 0, oms.TrafficStats{}, false
+	}
+	maxTags, maxWireBytes, maxHeapBytes := oms.EffectivePaginationLimits(opt)
+	if maxTags <= 0 {
 		return nil, nil, 0, 0, oms.TrafficStats{}, false
 	}
 	key := cacheKey(target, opt)
@@ -113,9 +118,9 @@ func (c *pageCache) Select(target string, opt *oms.RenderOptions) ([]byte, []str
 	var cur, cnt int
 	var err error
 	if opt.ServerBase != "" {
-		raw, cur, cnt, err = oms.SelectOMSPartFromPackedWithNav(entry.data, opt.Page, opt.MaxTagsPerPage, opt.ServerBase, target, opt)
+		raw, cur, cnt, err = oms.SelectOMSPartFromPackedWithNav(entry.data, opt.Page, maxTags, opt.ServerBase, target, opt)
 	} else {
-		raw, cur, cnt, err = oms.SelectOMSPartFromPackedWithBudget(entry.data, opt.Page, opt.MaxTagsPerPage, opt.MaxBytesPerPage)
+		raw, cur, cnt, err = oms.SelectOMSPartFromPackedWithBudgets(entry.data, opt.Page, maxTags, maxWireBytes, maxHeapBytes)
 	}
 	if err != nil {
 		return nil, nil, 0, 0, oms.TrafficStats{}, false

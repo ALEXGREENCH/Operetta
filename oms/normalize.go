@@ -156,8 +156,16 @@ func SelectOMSPartFromPacked(data []byte, page, maxTags int) ([]byte, int, int, 
 // SelectOMSPartFromPackedWithBudget keeps cache-hit pagination identical to
 // the original render, including the negotiated per-part byte budget.
 func SelectOMSPartFromPackedWithBudget(data []byte, page, maxTags, maxBytes int) ([]byte, int, int, error) {
+	return SelectOMSPartFromPackedWithBudgets(data, page, maxTags, maxBytes, 0)
+}
+
+// SelectOMSPartFromPackedWithBudgets also reapplies the negotiated retained
+// heap budget so cached pages split exactly like the original render.
+func SelectOMSPartFromPackedWithBudgets(data []byte, page, maxTags, maxBytes, maxHeapBytes int) ([]byte, int, int, error) {
 	if maxBytes <= 0 {
-		maxBytes = maxBytesBudget()
+		if maxHeapBytes <= 0 {
+			maxBytes = maxBytesBudget()
+		}
 	}
 	if page <= 0 {
 		page = 1
@@ -183,7 +191,7 @@ func SelectOMSPartFromPackedWithBudget(data []byte, page, maxTags, maxBytes int)
 		return data, 1, 1, io.ErrUnexpectedEOF
 	}
 	raw := decoded[headerLen:]
-	parts := splitByTagsWithBudget(raw, maxTags, version, maxBytes)
+	parts := splitByTagsWithBudgets(raw, maxTags, version, maxBytes, maxHeapBytes)
 	if len(parts) == 0 {
 		return data, 1, 1, nil
 	}
@@ -265,11 +273,8 @@ func SelectOMSPartFromPackedWithNav(data []byte, page, maxTags int, serverBase, 
 		return data, 1, 1, io.ErrUnexpectedEOF
 	}
 	raw := decoded[headerLen:]
-	maxBytes := maxBytesBudget()
-	if opts != nil && opts.MaxBytesPerPage > 0 {
-		maxBytes = opts.MaxBytesPerPage
-	}
-	parts := splitByTagsWithBudget(raw, maxTags, version, maxBytes)
+	_, maxBytes, maxHeapBytes := EffectivePaginationLimits(opts)
+	parts := splitByTagsWithBudgets(raw, maxTags, version, maxBytes, maxHeapBytes)
 	if len(parts) == 0 {
 		return data, 1, 1, nil
 	}
