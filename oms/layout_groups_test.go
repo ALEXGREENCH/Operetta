@@ -146,6 +146,70 @@ func TestSectionTitleKeepsHeadingAndActionOnOneLine(t *testing.T) {
 	res.mustHaveLink(t, "0/http://fixture.test/all")
 }
 
+func TestLegacyBasicSectionTitlePadsNativeActionToRight(t *testing.T) {
+	opts := defaultRenderPrefs()
+	opts.ScreenW = 240
+	opts.LegacyBasicOM2 = true
+	res := renderFixture(t, obmlFixture{
+		name: "legacy_basic_section_title_action",
+		html: `<style>.right{float:right}.title{font-weight:bold;text-transform:uppercase}</style>` +
+			`<div class="title"><a class="right" href="/all">Все</a><h6>AI-видео</h6></div>`,
+		opts: &opts,
+	})
+	visible := res.visibleText()
+	gapStart := strings.Index(visible, "AI-ВИДЕО") + len("AI-ВИДЕО")
+	gapEnd := strings.Index(visible, "ВСЕ")
+	if strings.Contains(visible, " · ") || gapStart < len("AI-ВИДЕО") || gapEnd-gapStart < 10 {
+		t.Fatalf("legacy action did not receive a native inline gap: %q; tokens=%v", visible, res.tokens)
+	}
+	res.mustHaveLink(t, "0/http://fixture.test/all")
+}
+
+func TestLegacyBasicAuthHeaderUsesCenteredNativeRows(t *testing.T) {
+	opts := defaultRenderPrefs()
+	opts.LegacyBasicOM2 = true
+	res := renderFixture(t, obmlFixture{
+		name: "legacy_basic_auth_header",
+		html: `<div class="site-head"><a href="/"><img src="` + tinyPNGDataURI + `" alt="Spaces"></a>` +
+			`<span class="right"><a href="/login">Вход</a> | <a href="/register">Регистрация</a></span></div>`,
+		opts: &opts,
+	})
+	if got := res.visibleText(); !strings.Contains(got, "Вход | Регистрация\n") {
+		t.Fatalf("unexpected auth header flow %q; tokens=%v", got, res.tokens)
+	}
+	style, ok := res.styleByteBeforeText("Вход")
+	if !ok || style&byte(styleCenterBit) == 0 || style&byte(styleRightBit) != 0 {
+		t.Fatalf("auth row style=0x%02x ok=%v, want centered; tokens=%v", style, ok, res.tokens)
+	}
+	res.mustHaveLink(t, "0/http://fixture.test/login")
+	res.mustHaveLink(t, "0/http://fixture.test/register")
+}
+
+func TestLegacyBasicPreviewDoesNotForceCenteredParagraph(t *testing.T) {
+	opts := defaultRenderPrefs()
+	opts.LegacyBasicOM2 = true
+	res := renderFixture(t, obmlFixture{
+		name: "legacy_basic_left_preview",
+		html: `<div class="pr"><img src="` + tinyPNGDataURI + `" alt="Preview"></div>`,
+		opts: &opts,
+	})
+	style := byte(0)
+	for _, token := range res.tokens {
+		switch token.tag {
+		case 'S':
+			if len(token.data) > 0 {
+				style = token.data[0]
+			}
+		case 'I':
+			if style&byte(styleCenterBit) != 0 {
+				t.Fatalf("legacy preview inherited centered paragraph style=0x%02x; tokens=%v", style, res.tokens)
+			}
+			return
+		}
+	}
+	t.Fatalf("preview image missing; tokens=%v", res.tokens)
+}
+
 func TestFloatedThumbnailMediaObjectStartsInline(t *testing.T) {
 	res := renderFixture(t, obmlFixture{
 		name: "media_object",

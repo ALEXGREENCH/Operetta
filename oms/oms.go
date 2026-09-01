@@ -2860,7 +2860,12 @@ func walkRich(cur *html.Node, base string, p renderTarget, visited map[*html.Nod
 			// Do not recurse into heading children to avoid duplicate text
 			recurse = false
 		case "div", "section", "article", "header", "footer", "main", "nav", "aside":
-			if renderSectionTitle(c, base, p, st) {
+			if renderLegacyBasicAuthHeader(c, base, p, visited, st, prefs) {
+				recurse = false
+				finishCurrent()
+				continue
+			}
+			if renderSectionTitle(c, base, p, st, prefs) {
 				recurse = false
 				finishCurrent()
 				continue
@@ -2973,7 +2978,11 @@ func walkRich(cur *html.Node, base string, p renderTarget, visited map[*html.Nod
 			}
 			if hasClass(c, "pr") {
 				resetComputedStyles(st, p, &colorPushed, &stylePushed, &alignedPushed)
-				st.pushStyle(p, st.curStyle|styleBoldBit|styleCenterBit)
+				previewStyle := st.curStyle | styleBoldBit
+				if !prefs.LegacyBasicOM2 {
+					previewStyle |= styleCenterBit
+				}
+				st.pushStyle(p, previewStyle)
 				st.pushColor(p, "#ffffff")
 				if !bgColorPushed {
 					p.AddPlus()

@@ -7,6 +7,7 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"unicode/utf8"
 
 	xdraw "golang.org/x/image/draw"
 	"golang.org/x/net/html"
@@ -362,7 +363,31 @@ func directSectionHeading(container *html.Node) *html.Node {
 
 // renderSectionTitle orders the semantic heading before a floated action link
 // and keeps both on one compact line ("Popular photos · All").
-func renderSectionTitle(container *html.Node, base string, p renderTarget, st *walkState) bool {
+func legacyBasicSectionGap(screenW int, title, action string) string {
+	if screenW <= 0 {
+		screenW = 240
+	}
+	// The original OM2 renderer has no inline float primitive: alignment bits
+	// apply to the complete paragraph. Its default small MIDP font is roughly
+	// seven pixels per printable glyph and four pixels per space. Leave a small
+	// safety margin so a slightly wider vendor font does not wrap the action.
+	const (
+		glyphWidth = 7
+		spaceWidth = 4
+		margin     = 12
+	)
+	used := (utf8.RuneCountInString(title) + utf8.RuneCountInString(action)) * glyphWidth
+	spaces := (screenW - margin - used) / spaceWidth
+	if spaces < 2 {
+		spaces = 2
+	}
+	if spaces > 40 {
+		spaces = 40
+	}
+	return strings.Repeat(" ", spaces)
+}
+
+func renderSectionTitle(container *html.Node, base string, p renderTarget, st *walkState, prefs RenderOptions) bool {
 	if !hasAnyClass(container, "title", "section_title") {
 		return false
 	}
@@ -393,7 +418,11 @@ func renderSectionTitle(container *html.Node, base string, p renderTarget, st *w
 	st.pushStyle(p, st.curStyle|styleBoldBit)
 	p.AddText(title)
 	st.popStyle(p)
-	p.AddText(" · ")
+	if prefs.LegacyBasicOM2 {
+		p.AddText(legacyBasicSectionGap(prefs.ScreenW, title, actionText))
+	} else {
+		p.AddText(" · ")
+	}
 	link, ok := resolveNavigableLink(base, getAttr(action, "href"))
 	if ok {
 		p.BeginLink(link)
@@ -409,6 +438,90 @@ func renderSectionTitle(container *html.Node, base string, p renderTarget, st *w
 		p.EndLink()
 	}
 	p.AddBreak()
+	return true
+}
+
+func normalizedAuthLabel(n *html.Node) string {
+	return strings.ToLower(strings.TrimSpace(condenseSpaces(collectText(n))))
+}
+
+func isLoginLabel(label string) bool {
+	switch label {
+	case "вход", "войти", "login", "log in", "sign in":
+		return true
+	default:
+		return false
+	}
+}
+
+func isRegisterLabel(label string) bool {
+	switch label {
+	case "регистрация", "зарегистрироваться", "register", "registration", "sign up":
+		return true
+	default:
+		return false
+	}
+}
+
+// renderLegacyBasicAuthHeader turns the common logo + floated auth controls
+// into two balanced rows. OM2 Basic cannot place a large logo and a right
+// float on the same line, but centring both rows avoids the broken-looking
+// left spill while preserving every link as a native focus target.
+func renderLegacyBasicAuthHeader(container *html.Node, base string, p renderTarget, visited map[*html.Node]bool, st *walkState, prefs RenderOptions) bool {
+	if !prefs.LegacyBasicOM2 || container == nil || findFirstByTag(container, "form") != nil {
+		return false
+	}
+	var links []*html.Node
+	var collectLinks func(*html.Node)
+	collectLinks = func(n *html.Node) {
+		for child := n.FirstChild; child != nil; child = child.NextSibling {
+			if child.Type == html.ElementNode && strings.EqualFold(child.Data, "a") {
+				links = append(links, child)
+				continue
+			}
+			collectLinks(child)
+		}
+	}
+	collectLinks(container)
+	if len(links) != 3 {
+		return false
+	}
+	var logo, login, register *html.Node
+	for _, link := range links {
+		if findFirstByTag(link, "img") != nil {
+			if logo != nil {
+				return false
+			}
+			logo = link
+			continue
+		}
+		label := normalizedAuthLabel(link)
+		switch {
+		case isLoginLabel(label):
+			login = link
+		case isRegisterLabel(label):
+			register = link
+		default:
+			return false
+		}
+	}
+	if logo == nil || login == nil || register == nil {
+		return false
+	}
+	// Reject broad ancestors which merely happen to contain the header.
+	text := strings.ToLower(condenseSpaces(collectText(container)))
+	if !strings.Contains(text, normalizedAuthLabel(login)) || !strings.Contains(text, normalizedAuthLabel(register)) || utf8.RuneCountInString(text) > 48 {
+		return false
+	}
+
+	st.pushStyle(p, (st.curStyle|styleCenterBit)&^styleRightBit)
+	walkNodeOnly(logo, base, p, visited, st, prefs)
+	p.AddBreak()
+	walkNodeOnly(login, base, p, visited, st, prefs)
+	p.AddText(" | ")
+	walkNodeOnly(register, base, p, visited, st, prefs)
+	p.AddBreak()
+	st.popStyle(p)
 	return true
 }
 
