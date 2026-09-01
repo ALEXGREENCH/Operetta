@@ -159,27 +159,26 @@ func TestLegacyBasicSectionTitlePadsNativeActionToRight(t *testing.T) {
 	visible := res.visibleText()
 	gapStart := strings.Index(visible, "AI-ВИДЕО") + len("AI-ВИДЕО")
 	gapEnd := strings.Index(visible, "ВСЕ")
-	if strings.Contains(visible, " · ") || gapStart < len("AI-ВИДЕО") || gapEnd-gapStart < 10 {
+	if strings.Contains(visible, " · ") || gapStart < len("AI-ВИДЕО") || gapEnd-gapStart < 45 {
 		t.Fatalf("legacy action did not receive a native inline gap: %q; tokens=%v", visible, res.tokens)
 	}
 	res.mustHaveLink(t, "0/http://fixture.test/all")
 }
 
-func TestLegacyBasicAuthHeaderUsesCenteredNativeRows(t *testing.T) {
+func TestLegacyBasicAuthHeaderKeepsGenericContent(t *testing.T) {
 	opts := defaultRenderPrefs()
 	opts.LegacyBasicOM2 = true
 	res := renderFixture(t, obmlFixture{
-		name: "legacy_basic_auth_header",
+		name: "legacy_basic_generic_auth_header",
 		html: `<div class="site-head"><a href="/"><img src="` + tinyPNGDataURI + `" alt="Spaces"></a>` +
 			`<span class="right"><a href="/login">Вход</a> | <a href="/register">Регистрация</a></span></div>`,
 		opts: &opts,
 	})
-	if got := res.visibleText(); !strings.Contains(got, "Вход | Регистрация\n") {
-		t.Fatalf("unexpected auth header flow %q; tokens=%v", got, res.tokens)
+	if got := res.visibleText(); !strings.Contains(got, "Вход") || !strings.Contains(got, "Регистрация") {
+		t.Fatalf("auth header content disappeared: %q; tokens=%v", got, res.tokens)
 	}
-	style, ok := res.styleByteBeforeText("Вход")
-	if !ok || style&byte(styleCenterBit) == 0 || style&byte(styleRightBit) != 0 {
-		t.Fatalf("auth row style=0x%02x ok=%v, want centered; tokens=%v", style, ok, res.tokens)
+	if res.countTag('I') != 1 {
+		t.Fatalf("auth logo disappeared; tokens=%v", res.tokens)
 	}
 	res.mustHaveLink(t, "0/http://fixture.test/login")
 	res.mustHaveLink(t, "0/http://fixture.test/register")

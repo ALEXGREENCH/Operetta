@@ -2860,11 +2860,6 @@ func walkRich(cur *html.Node, base string, p renderTarget, visited map[*html.Nod
 			// Do not recurse into heading children to avoid duplicate text
 			recurse = false
 		case "div", "section", "article", "header", "footer", "main", "nav", "aside":
-			if renderLegacyBasicAuthHeader(c, base, p, visited, st, prefs) {
-				recurse = false
-				finishCurrent()
-				continue
-			}
 			if renderSectionTitle(c, base, p, st, prefs) {
 				recurse = false
 				finishCurrent()
