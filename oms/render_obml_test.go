@@ -957,6 +957,22 @@ func TestRenderDocumentSyntheticSites(t *testing.T) {
 			},
 		},
 		{
+			name: "legacy_basic_sanitizes_emoji_shaping_without_losing_link_text",
+			html: `<div class="info"><a href="/promo">😀⚔️ Мини игры: шашки и шахматы</a></div>`,
+			opts: func() *RenderOptions {
+				o := defaultRenderPrefs()
+				o.LegacyBasicOM2 = true
+				return &o
+			}(),
+			assert: func(t *testing.T, res *fixtureResult) {
+				visible := res.visibleText()
+				if strings.ContainsRune(visible, '\ufe0f') || !strings.Contains(visible, "*⚔ Мини игры: шашки и шахматы") {
+					t.Fatalf("unsafe emoji shaping or missing promo text: %q; tokens=%v", visible, res.tokens)
+				}
+				res.mustHaveLink(t, "0/http://fixture.test/promo")
+			},
+		},
+		{
 			name: "form_hidden_inputs",
 			html: `<form action="/submit"><input type="hidden" name="token" value="abc123"><input type="submit" value="Send"></form>`,
 			assert: func(t *testing.T, res *fixtureResult) {

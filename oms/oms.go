@@ -2453,6 +2453,35 @@ func applyNodeTextTransform(n *html.Node, st *walkState, text string) string {
 	}
 }
 
+// legacyBasicSafeText removes Unicode shaping records which the original
+// CLDC/MIDP Opera Mini 2 text decoder cannot represent. In particular, an
+// emoji followed by VS16 can make that client discard the complete OMS T
+// record, hiding otherwise ordinary text after it. Later clients keep the
+// original Unicode untouched.
+func legacyBasicSafeText(text string) string {
+	var out strings.Builder
+	out.Grow(len(text))
+	lastReplacement := false
+	for _, r := range text {
+		switch {
+		case r == '\u200d', // zero-width joiner
+			r == '\ufe0e' || r == '\ufe0f', // text/emoji variation selectors
+			r >= 0x1f3fb && r <= 0x1f3ff:   // emoji skin-tone modifiers
+			continue
+		case r > 0xffff:
+			if !lastReplacement {
+				out.WriteByte('*')
+				lastReplacement = true
+			}
+			continue
+		default:
+			out.WriteRune(r)
+			lastReplacement = false
+		}
+	}
+	return out.String()
+}
+
 // parseBackgroundPosition parses simple background-position values like "-24px 0" or "0 0".
 // Returns x, y pixel offsets; boolean indicates if any value was parsed.
 func parseBackgroundPosition(val string) (int, int, bool) {
@@ -3802,6 +3831,9 @@ func walkRich(cur *html.Node, base string, p renderTarget, visited map[*html.Nod
 				}
 				if !skip {
 					txt := textNodeContent(c, st)
+					if prefs.LegacyBasicOM2 {
+						txt = legacyBasicSafeText(txt)
+					}
 					if txt != "" {
 						if !visited[c] {
 							visited[c] = true
