@@ -74,6 +74,34 @@ func TestCSSFloatIconDrawerRendersThreeColumnOMSTiles(t *testing.T) {
 	}
 }
 
+func TestLegacyBasicCSSFloatIconDrawerUsesNativeInlineTiles(t *testing.T) {
+	opts := defaultRenderPrefs()
+	opts.ScreenW = 240
+	opts.ScreenH = 320
+	opts.ImageMIME = "image/jpeg"
+	opts.MaxInlineKB = 8
+	opts.DialectID = "om2-basic"
+	opts.LegacyBasicOM2 = true
+
+	cell := func(path, label string) string {
+		return `<div class="appcell"><a href="` + path + `"><img src="` + tinyPNGDataURI + `" alt=""><span class="label">` + label + `</span></a></div>`
+	}
+	html := `<style>.appcell{float:left;width:33%;height:82px;text-align:center}.appcell img{width:44px;height:44px;display:block}</style>` +
+		`<div class="drawer">` + cell("/one", "One") + cell("/two", "Two") + cell("/three", "Three") + `</div>`
+	res := renderFixture(t, obmlFixture{name: "legacy_basic_float_icon_drawer", html: html, opts: &opts})
+	images := res.tokensByTag('I')
+	if len(images) != 3 {
+		t.Fatalf("expected three native tiles, got %d; tokens=%v", len(images), res.tokens)
+	}
+	for index, token := range images {
+		width := int(binary.BigEndian.Uint16(token.data[0:2]))
+		height := int(binary.BigEndian.Uint16(token.data[2:4]))
+		if width > legacyBasicInlineImageLimit || height > legacyBasicInlineImageLimit {
+			t.Fatalf("tile %d=%dx%d exceeds native inline limit", index, width, height)
+		}
+	}
+}
+
 func TestTextOnlyCSSFloatsKeepLinearFallback(t *testing.T) {
 	res := renderFixture(t, obmlFixture{
 		name: "text_float_fallback",

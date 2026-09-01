@@ -18,6 +18,26 @@ type linkedImage struct {
 	maxW  int
 }
 
+const legacyBasicInlineImageLimit = 38
+
+func constrainLegacyBasicInlineImage(prefs RenderOptions, width, height int) (int, int) {
+	if !prefs.LegacyBasicOM2 || width <= 0 || height <= 0 ||
+		(width <= legacyBasicInlineImageLimit && height <= legacyBasicInlineImageLimit) {
+		return width, height
+	}
+	scale := math.Min(float64(legacyBasicInlineImageLimit)/float64(width),
+		float64(legacyBasicInlineImageLimit)/float64(height))
+	width = int(math.Floor(float64(width) * scale))
+	height = int(math.Floor(float64(height) * scale))
+	if width < 1 {
+		width = 1
+	}
+	if height < 1 {
+		height = 1
+	}
+	return width, height
+}
+
 func elementChildren(n *html.Node) []*html.Node {
 	var out []*html.Node
 	if n == nil {
@@ -120,6 +140,7 @@ func renderSizedImageNode(n *html.Node, base string, p renderTarget, st *walkSta
 		}
 		width = maxWidth
 	}
+	width, height = constrainLegacyBasicInlineImage(prefs, width, height)
 	if width <= 0 || height <= 0 {
 		renderImageFromURL(p, st, base, src, alt, prefs)
 		return
@@ -266,7 +287,11 @@ func renderIconToolbar(table *html.Node, base string, p renderTarget, st *walkSt
 	for index, item := range items {
 		left := screenW * index / len(items)
 		right := screenW * (index + 1) / len(items)
-		data, width, encodedH, ok := renderToolbarTile(item, table, base, st, prefs, right-left, height)
+		tileWidth := right - left
+		if prefs.LegacyBasicOM2 && tileWidth > legacyBasicInlineImageLimit {
+			tileWidth = legacyBasicInlineImageLimit
+		}
+		data, width, encodedH, ok := renderToolbarTile(item, table, base, st, prefs, tileWidth, height)
 		if !ok {
 			return false
 		}

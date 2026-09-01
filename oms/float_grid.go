@@ -173,6 +173,9 @@ func fitGridLabel(label string, face font.Face, maxWidth int) string {
 func renderFloatIconTile(cell floatIconCell, base string, st *walkState, prefs RenderOptions, width int) ([]byte, int, int, bool) {
 	cellProps := computeStyleFor(cell.node, st.css)
 	height := cssValueToPx(cssPropValue(cellProps, getAttr(cell.node, "style"), "height"), prefs.ScreenH)
+	if prefs.LegacyBasicOM2 {
+		height = legacyBasicInlineImageLimit
+	}
 	if height <= 0 {
 		height = 72
 	}
@@ -259,6 +262,9 @@ func renderFloatIconGrid(container *html.Node, base string, p renderTarget, st *
 		screenW = 240
 	}
 	cellW := screenW / columns
+	if prefs.LegacyBasicOM2 && cellW > legacyBasicInlineImageLimit {
+		cellW = legacyBasicInlineImageLimit
+	}
 	if cellW < 24 {
 		return false
 	}

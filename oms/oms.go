@@ -245,7 +245,7 @@ func shrinkPartToMaxBytes(part []byte, limit int, clientVersion ClientVersion) [
 			}
 			ln := int(binary.BigEndian.Uint16(part[np : np+2]))
 			np += 2 + ln
-		case 'E', 'B', '+', 'V', 'Q', 'l':
+		case 'E', 'B', '+', 'V', 'Q', 'l', 'C':
 			// no payload
 		case 'D', 'R':
 			np += colorDataLen
@@ -549,7 +549,7 @@ PreludeDone:
 			l := int(binary.BigEndian.Uint16(b[p : p+2]))
 			p += 2 + l
 			tagHeap += l * 2 // Java strings are retained as UTF-16
-		case 'E', 'B', '+', 'V', 'Q', 'l':
+		case 'E', 'B', '+', 'V', 'Q', 'l', 'C':
 			// no payload
 		case 'D', 'R':
 			p += colorDataLen
@@ -1443,6 +1443,10 @@ type RenderOptions struct {
 	WantFullCache bool
 	ClientVersion ClientVersion
 	DialectID     string
+	// LegacyBasicOM2 enables layout workarounds for the original Opera Mini
+	// 2.0 Basic renderer. Unlike later clients, it forces images larger than
+	// 38 pixels in either dimension onto their own display-list row.
+	LegacyBasicOM2 bool
 	// CachePartition isolates temporary packed-page artifacts by gateway
 	// session. It is not sent to origins or encoded into the document.
 	CachePartition string
@@ -4226,10 +4230,53 @@ func cacheCandidatesFor(prefs RenderOptions) []cacheCandidate {
 }
 
 func jpegQualityFor(prefs RenderOptions) int {
+	if usesLowMemoryImagePalette(prefs) {
+		if prefs.HighQuality {
+			return 76
+		}
+		return 32
+	}
 	if prefs.HighQuality {
 		return 85
 	}
 	return 40
+}
+
+const lowMemoryImageHeapLimit = 512 << 10
+
+func usesLowMemoryImagePalette(prefs RenderOptions) bool {
+	return prefs.HeapBytes > 0 && prefs.HeapBytes <= lowMemoryImageHeapLimit
+}
+
+func expandQuantizedChannel(value uint8, bits uint) uint8 {
+	levels := uint32((1 << bits) - 1)
+	quantized := (uint32(value)*levels + 127) / 255
+	return uint8((quantized*255 + levels/2) / levels)
+}
+
+// quantizeLowMemoryImage reduces both decoded working-set diversity and
+// encoded entropy for very small Java ME heaps. High quality uses RGB444;
+// low quality uses RGB332, matching the limited displays of these handsets.
+func quantizeLowMemoryImage(img image.Image, highQuality bool) image.Image {
+	if img == nil {
+		return img
+	}
+	bounds := img.Bounds()
+	out := image.NewNRGBA(image.Rect(0, 0, bounds.Dx(), bounds.Dy()))
+	redBits, greenBits, blueBits := uint(3), uint(3), uint(2)
+	if highQuality {
+		redBits, greenBits, blueBits = 4, 4, 4
+	}
+	for y := 0; y < bounds.Dy(); y++ {
+		for x := 0; x < bounds.Dx(); x++ {
+			pixel := color.NRGBAModel.Convert(img.At(bounds.Min.X+x, bounds.Min.Y+y)).(color.NRGBA)
+			pixel.R = expandQuantizedChannel(pixel.R, redBits)
+			pixel.G = expandQuantizedChannel(pixel.G, greenBits)
+			pixel.B = expandQuantizedChannel(pixel.B, blueBits)
+			out.SetNRGBA(x, y, pixel)
+		}
+	}
+	return out
 }
 
 func fetchAndEncodeImage(absURL string, prefs RenderOptions) ([]byte, int, int, bool) {
@@ -4362,9 +4409,9 @@ func imageCacheVariantKey(absURL string, prefs RenderOptions) string {
 	if strings.TrimSpace(prefs.CachePartition) == "" {
 		return ""
 	}
-	return fmt.Sprintf("%s|session=%s|viewport=%dx%d|mime=%s|quality=%t|inline=%d|dialect=%s|v=3",
+	return fmt.Sprintf("%s|session=%s|viewport=%dx%d|mime=%s|quality=%t|inline=%d|dialect=%s|lowmem=%t|v=4",
 		absURL, prefs.CachePartition, prefs.ScreenW, prefs.ScreenH, prefs.ImageMIME,
-		prefs.HighQuality, prefs.MaxInlineKB, prefs.DialectID)
+		prefs.HighQuality, prefs.MaxInlineKB, prefs.DialectID, usesLowMemoryImagePalette(prefs))
 }
 
 func clampImageToScreenWidth(img image.Image, maxWidth int) (image.Image, int, int) {
@@ -4627,6 +4674,10 @@ func encodeImage(img image.Image, prefs RenderOptions) ([]byte, int, int, string
 			want = "image/png"
 		}
 	}
+	if usesLowMemoryImagePalette(prefs) {
+		img = quantizeLowMemoryImage(img, prefs.HighQuality)
+		w, h = img.Bounds().Dx(), img.Bounds().Dy()
+	}
 
 	var out bytes.Buffer
 	quality := 0
@@ -4646,7 +4697,7 @@ func encodeImage(img image.Image, prefs RenderOptions) ([]byte, int, int, string
 			return data, fitW, fitH, want, quality, err
 		}
 		enc := png.Encoder{CompressionLevel: png.DefaultCompression}
-		if prefs.HighQuality {
+		if prefs.HighQuality || usesLowMemoryImagePalette(prefs) {
 			enc.CompressionLevel = png.BestCompression
 		}
 		if err := enc.Encode(&out, img); err != nil {

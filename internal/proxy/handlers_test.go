@@ -144,6 +144,26 @@ func TestRenderOptionsFromParamsQuality(t *testing.T) {
 		t.Fatalf("expected HighQuality true for Q=HI, got %v", hi2.HighQuality)
 	}
 
+	versionHi := s.renderOptionsFromParams(r, map[string]string{
+		"v": "Opera Mini/2.0.4509/hifi/woodland/ru",
+	}, hdr, "")
+	if !versionHi.HighQuality {
+		t.Fatal("expected /hifi/ client version to select high image quality")
+	}
+	versionLo := s.renderOptionsFromParams(r, map[string]string{
+		"v": "Opera Mini/2.0.4509/lofi/woodland/ru",
+	}, hdr, "")
+	if versionLo.HighQuality {
+		t.Fatal("expected /lofi/ client version to select low image quality")
+	}
+	explicitLow := s.renderOptionsFromParams(r, map[string]string{
+		"v": "Opera Mini/2.0.4509/hifi/woodland/ru",
+		"d": "q:0",
+	}, hdr, "")
+	if explicitLow.HighQuality {
+		t.Fatal("explicit q:0 must override /hifi/ version hint")
+	}
+
 	viewport := s.renderOptionsFromParams(r, map[string]string{"d": "w:240;h:320;c:65536;m:1966084;i:1;q:0;f:0;j:0;l:256"}, hdr, "")
 	if viewport.ScreenW != 240 || viewport.ScreenH != 320 {
 		t.Fatalf("expected 240x320 viewport, got %dx%d", viewport.ScreenW, viewport.ScreenH)

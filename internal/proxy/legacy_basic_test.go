@@ -37,6 +37,25 @@ func TestLegacyBasicImageMIMEFollowsClientJPEGProbe(t *testing.T) {
 	}
 }
 
+func TestLegacyBasicRenderProfileKeepsSelectedQuality(t *testing.T) {
+	opt := &oms.RenderOptions{
+		HighQuality: true,
+		Compression: oms.CompressionDeflate,
+		AuthCode:    "synthetic-code",
+		AuthPrefix:  "synthetic-prefix",
+	}
+	applyLegacyBasicRenderProfile(opt, map[string]string{"k": "image/jpeg"})
+	if !opt.HighQuality {
+		t.Fatal("legacy profile must preserve the client's hifi selection")
+	}
+	if !opt.LegacyBasicOM2 || !opt.ImagesOn || opt.ImageMIME != "image/jpeg" || opt.MaxInlineKB != 8 {
+		t.Fatalf("unexpected legacy profile: %+v", opt)
+	}
+	if opt.Compression != oms.CompressionNone || opt.AuthCode != "" || opt.AuthPrefix != "" {
+		t.Fatalf("unsafe legacy transport fields were retained: %+v", opt)
+	}
+}
+
 func TestLegacyBasicOM2FrameDeflate(t *testing.T) {
 	page := oms.NewPage()
 	page.SetTransport(oms.ClientVersion2, oms.CompressionDeflate)

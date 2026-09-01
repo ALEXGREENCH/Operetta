@@ -50,10 +50,10 @@ func cacheKey(target string, opt *oms.RenderOptions) string {
 	}
 	effectiveTags, effectiveWireBytes, effectiveHeapBytes := oms.EffectivePaginationLimits(opt)
 	variant := fmt.Sprintf(
-		"target=%q|partition=%q|mime=%q|images=%t|hq=%t|maxkb=%d|maxpage=%d|pageheap=%d|screen=%dx%d|colors=%d|heap=%d|alpha=%d|version=%d|dialect=%q|compression=%d|tags=%d|lang=%q|ua=%q|js=%s",
+		"target=%q|partition=%q|mime=%q|images=%t|hq=%t|maxkb=%d|maxpage=%d|pageheap=%d|screen=%dx%d|colors=%d|heap=%d|alpha=%d|version=%d|dialect=%q|basic=%t|compression=%d|tags=%d|lang=%q|ua=%q|js=%s",
 		target, opt.CachePartition, opt.ImageMIME, opt.ImagesOn, opt.HighQuality,
 		opt.MaxInlineKB, effectiveWireBytes, effectiveHeapBytes, opt.ScreenW, opt.ScreenH, opt.NumColors, opt.HeapBytes,
-		opt.AlphaLevels, opt.ClientVersion, opt.DialectID, opt.Compression, effectiveTags,
+		opt.AlphaLevels, opt.ClientVersion, opt.DialectID, opt.LegacyBasicOM2, opt.Compression, effectiveTags,
 		opt.ReqHeaders.Get("Accept-Language"), opt.ReqHeaders.Get("User-Agent"), js,
 	)
 	sum := sha256.Sum256([]byte(variant))

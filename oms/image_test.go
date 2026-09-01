@@ -1,8 +1,10 @@
 package oms
 
 import (
+	"bytes"
 	"image"
 	"image/color"
+	_ "image/png"
 	"math"
 	"strings"
 	"testing"
@@ -91,6 +93,62 @@ func TestEncodeImageHighQualityRetainsRequestedQuality(t *testing.T) {
 	want := jpegQualityFor(opts)
 	if quality != want {
 		t.Fatalf("expected quality=%d in high quality mode, got %d", want, quality)
+	}
+}
+
+func TestLowMemoryJPEGQualityUsesTighterCompression(t *testing.T) {
+	low := defaultRenderPrefs()
+	low.HeapBytes = lowMemoryImageHeapLimit
+	if got := jpegQualityFor(low); got != 32 {
+		t.Fatalf("low-memory low-quality JPEG=%d, want 32", got)
+	}
+	low.HighQuality = true
+	if got := jpegQualityFor(low); got != 76 {
+		t.Fatalf("low-memory high-quality JPEG=%d, want 76", got)
+	}
+	normal := low
+	normal.HeapBytes = lowMemoryImageHeapLimit + 1
+	if got := jpegQualityFor(normal); got != 85 {
+		t.Fatalf("normal-memory high-quality JPEG=%d, want 85", got)
+	}
+}
+
+func TestLowMemoryPNGUsesRGB444AndRGB332Palettes(t *testing.T) {
+	source := image.NewNRGBA(image.Rect(0, 0, 1, 1))
+	source.SetNRGBA(0, 0, color.NRGBA{R: 123, G: 77, B: 219, A: 201})
+
+	for _, test := range []struct {
+		name string
+		high bool
+		bits [3]uint
+	}{
+		{name: "rgb332", bits: [3]uint{3, 3, 2}},
+		{name: "rgb444", high: true, bits: [3]uint{4, 4, 4}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			opts := defaultRenderPrefs()
+			opts.ImageMIME = "image/png"
+			opts.HeapBytes = lowMemoryImageHeapLimit
+			opts.HighQuality = test.high
+			data, _, _, _, _, err := encodeImage(source, opts)
+			if err != nil {
+				t.Fatal(err)
+			}
+			decoded, _, err := image.Decode(bytes.NewReader(data))
+			if err != nil {
+				t.Fatal(err)
+			}
+			got := color.NRGBAModel.Convert(decoded.At(0, 0)).(color.NRGBA)
+			want := color.NRGBA{
+				R: expandQuantizedChannel(123, test.bits[0]),
+				G: expandQuantizedChannel(77, test.bits[1]),
+				B: expandQuantizedChannel(219, test.bits[2]),
+				A: 201,
+			}
+			if got != want {
+				t.Fatalf("quantized pixel=%v, want %v", got, want)
+			}
+		})
 	}
 }
 
@@ -281,7 +339,7 @@ func TestImageCacheVariantKeySeparatesDialectsAndCodecGeneration(t *testing.T) {
 	if legacy == base {
 		t.Fatalf("dialect must partition image cache: %q", legacy)
 	}
-	if !strings.Contains(legacy, "|dialect=om2-basic|v=3") {
+	if !strings.Contains(legacy, "|dialect=om2-basic|lowmem=false|v=4") {
 		t.Fatalf("legacy cache key missing dialect/generation: %q", legacy)
 	}
 }

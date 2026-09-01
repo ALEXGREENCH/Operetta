@@ -54,6 +54,9 @@ Core Tags (byte values) and Payloads
   - Payload: BE‑u16 encoded color (same as 'R')
 - 'I' — Inline image
   - Payload: BE‑u16 width, BE‑u16 height, BE‑u16 dataLen, BE‑u16 reserved(0), then `dataLen` bytes of encoded image (JPEG/PNG)
+  - Original Opera Mini 2.0 Basic forces an image above 38 px in either
+    dimension onto a separate row. Its dedicated render profile therefore
+    caps toolbar, grid and inline-strip tiles at 38×38 while preserving aspect.
 - 'J' — Image placeholder
   - Payload: BE‑u16 width, BE‑u16 height
 
@@ -80,7 +83,8 @@ Forms (controls)
 - 'i' — Hidden input — name (str), value (str)
 - 'c' — Checkbox — name (str), value (str), 1 byte checked (0/1)
 - 'r' — Radio — name (str), value (str), 1 byte checked (0/1)
-- 'u' — Submit — name (str), value (str)
+- 'C' — Submit action marker (no payload); applies to the next form control
+- 'u' — Submit/button — name (str), value (str); form submits are emitted as `C` + `u`
 - 'b' — Button — name (str), value (str)
 - 'e' — Reset — name (str), value (str)
 - 's' — Select begin — name (str), 1 byte multiple (0/1), BE‑u16 optionCount
@@ -110,6 +114,9 @@ Notes
 - Strings are produced as UTF‑8 on the server (legacy pages are transcoded from cp1251/KOI8‑R).
 - Link URLs generally use the `0/` prefix for absolute targets, matching client expectations.
 - Some server encodings are conservative variants of what the client supports; OM 2.06 Mod is tolerant.
+- When a client reports a heap of at most 512 KiB, decoded images are reduced
+  to RGB444 in high-quality mode or RGB332 in low-quality mode. JPEG quality
+  is also tightened to 76/32 respectively and PNG uses best compression.
 
 Testing Tips
 - Server endpoint `/validate?url=...` returns analysis including magic/size and a compact rendering.

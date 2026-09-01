@@ -37,10 +37,26 @@ func legacyBasicImageMIME(params map[string]string) string {
 	return "image/png"
 }
 
+func applyLegacyBasicRenderProfile(opt *oms.RenderOptions, params map[string]string) {
+	if opt == nil {
+		return
+	}
+	opt.ImagesOn = true
+	opt.ImageMIME = legacyBasicImageMIME(params)
+	opt.MaxInlineKB = 8
+	opt.DialectID = "om2-basic"
+	opt.LegacyBasicOM2 = true
+	opt.Compression = oms.CompressionNone
+	// Server-side association is resolved before rendering. These synthetic
+	// records are only understood by later clients.
+	opt.AuthCode = ""
+	opt.AuthPrefix = ""
+}
+
 // legacyBasicOM2Frame converts Operetta's normal OM2 wire frame into the
 // uncompressed transport consumed by the original 2.0.4509 Basic client:
 //
-//   0x18 0x33 <be32 total-size> <35-byte OMS v2 page header> <UTF URL> ...
+//	0x18 0x33 <be32 total-size> <35-byte OMS v2 page header> <UTF URL> ...
 //
 // c(InputStream,true) consumes 0x18 as H. The first c.a() control record then
 // consumes '3' (0x33) plus the 32-bit frame size and stops the pre-header loop.

@@ -49,6 +49,47 @@ func TestIconNavigationTableRendersAsOneToolbarRow(t *testing.T) {
 	}
 }
 
+func TestLegacyBasicIconToolbarStaysBelowNativeInlineLimit(t *testing.T) {
+	opts := defaultRenderPrefs()
+	opts.ScreenW = 240
+	opts.ScreenH = 320
+	opts.ImageMIME = "image/jpeg"
+	opts.MaxInlineKB = 8
+	opts.LegacyBasicOM2 = true
+
+	var cells strings.Builder
+	for index := 0; index < 5; index++ {
+		cells.WriteString(`<td><a href="/nav/`)
+		cells.WriteString(string(rune('a' + index)))
+		cells.WriteString(`"><img class="icon" src="` + tinyPNGDataURI + `" alt="Nav"></a></td>`)
+	}
+	res := renderFixture(t, obmlFixture{
+		name: "legacy_basic_icon_toolbar",
+		html: `<style>.bar{background:#4c4c4c}.icon{width:16px;height:16px}</style>` +
+			`<div class="bar"><table><tbody><tr>` + cells.String() + `</tr></tbody></table></div>`,
+		opts: &opts,
+	})
+
+	images := res.tokensByTag('I')
+	if len(images) != 5 {
+		t.Fatalf("toolbar images=%d, want 5; tokens=%v", len(images), res.tokens)
+	}
+	seen := 0
+	for _, token := range res.tokens {
+		if token.tag == 'I' {
+			seen++
+			width := int(binary.BigEndian.Uint16(token.data[:2]))
+			height := int(binary.BigEndian.Uint16(token.data[2:4]))
+			if width > legacyBasicInlineImageLimit || height > legacyBasicInlineImageLimit {
+				t.Fatalf("native OM2 tile=%dx%d exceeds %dpx inline limit", width, height, legacyBasicInlineImageLimit)
+			}
+		}
+		if token.tag == 'B' && seen > 0 && seen < len(images) {
+			t.Fatalf("native OM2 toolbar broke after %d icons; tokens=%v", seen, res.tokens)
+		}
+	}
+}
+
 func TestInlineBlockImageStripStaysHorizontal(t *testing.T) {
 	res := renderFixture(t, obmlFixture{
 		name: "inline_image_strip",
@@ -66,6 +107,29 @@ func TestInlineBlockImageStripStaysHorizontal(t *testing.T) {
 		}
 		if token.tag == 'B' && seen == 1 {
 			t.Fatalf("image strip became vertical; tokens=%v", res.tokens)
+		}
+	}
+}
+
+func TestLegacyBasicImageStripScalesEachImageBelowInlineLimit(t *testing.T) {
+	opts := defaultRenderPrefs()
+	opts.LegacyBasicOM2 = true
+	res := renderFixture(t, obmlFixture{
+		name: "legacy_basic_inline_image_strip",
+		html: `<style>.tile{display:inline-block;width:40%}.tile img{width:76px;height:53px}</style><div class="strip">` +
+			`<div class="tile"><a href="/one"><img src="` + tinyPNGDataURI + `" alt="One"></a></div>` +
+			`<div class="tile"><a href="/two"><img src="` + tinyPNGDataURI + `" alt="Two"></a></div></div>`,
+		opts: &opts,
+	})
+	images := res.tokensByTag('I')
+	if len(images) != 2 {
+		t.Fatalf("strip images=%d, want 2", len(images))
+	}
+	for _, token := range images {
+		width := int(binary.BigEndian.Uint16(token.data[:2]))
+		height := int(binary.BigEndian.Uint16(token.data[2:4]))
+		if width > legacyBasicInlineImageLimit || height > legacyBasicInlineImageLimit {
+			t.Fatalf("native OM2 strip image=%dx%d exceeds inline limit", width, height)
 		}
 	}
 }

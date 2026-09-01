@@ -525,7 +525,7 @@ func parseTagCountFromDec(dec []byte, headerLen int, clientVersion ClientVersion
 			}
 			l := int(binary.BigEndian.Uint16(dec[p : p+2]))
 			p += 2 + l
-		case 'E', 'B', '+', 'V', 'Q', 'l':
+		case 'E', 'B', '+', 'V', 'Q', 'l', 'C':
 		case 'D', 'R':
 			p += colorDataLen
 		case 'S':

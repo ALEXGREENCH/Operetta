@@ -183,7 +183,7 @@ func parseTags(dec []byte, version oms.ClientVersion) (int, []byte, map[byte]int
 				return len(tags), tags, counts, summary, fmt.Errorf("tag L string: %w", err)
 			}
 			appendSample(&summary.Links, clipSampleText(s), 12)
-		case 'E', 'B', '+', 'V', 'Q', 'l':
+		case 'E', 'B', '+', 'V', 'Q', 'l', 'C':
 		case 'D', 'R':
 			if p+colorDataLen > limit {
 				return len(tags), tags, counts, summary, fmt.Errorf("tag %q missing %d bytes", tag, colorDataLen)

@@ -372,7 +372,7 @@ func parseTokens(payload []byte, version ClientVersion) ([]obmlToken, error) {
 			}
 			tok.data = append(tok.data, payload[idx])
 			idx++
-		case 'E', 'B', '+', 'V', 'Q', 'l':
+		case 'E', 'B', '+', 'V', 'Q', 'l', 'C':
 		default:
 			return nil, fmt.Errorf("unknown tag %q", tag)
 		}
@@ -961,6 +961,11 @@ func TestRenderDocumentSyntheticSites(t *testing.T) {
 				}
 				if res.countTag('x') != 1 || res.countTag('u') != 1 {
 					t.Fatalf("expected captcha text+submit controls, x=%d u=%d", res.countTag('x'), res.countTag('u'))
+				}
+				for index, token := range res.tokens {
+					if token.tag == 'u' && (index == 0 || res.tokens[index-1].tag != 'C') {
+						t.Fatalf("submit control is missing native OM2 action marker: %v", res.tokens)
+					}
 				}
 			},
 		},

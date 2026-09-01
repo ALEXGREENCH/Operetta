@@ -353,6 +353,10 @@ func (p *Page) AddCheckbox(name, value string, checked bool) {
 }
 
 func (p *Page) AddSubmit(name, value string) {
+	// The original OM2 parser applies C to the next form control. Without it,
+	// the following u record is displayed as a generic focusable control and
+	// Enter may appear to activate earlier elements instead of submitting.
+	p.addTag('C')
 	p.addTag('u')
 	p.AddString(name)
 	p.AddString(value)
@@ -616,7 +620,7 @@ func analyzePayloadCounts(b []byte, clientVersion ClientVersion) (int, int) {
 			l := int(binary.BigEndian.Uint16(b[p : p+2]))
 			strings++
 			p += 2 + l
-		case 'E', 'B', '+', 'V', 'Q', 'l':
+		case 'E', 'B', '+', 'V', 'Q', 'l', 'C':
 		case 'D', 'R':
 			p += colorDataLen
 		case 'S':

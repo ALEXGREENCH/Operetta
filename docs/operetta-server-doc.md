@@ -54,7 +54,7 @@ j=opf=1&q=Yukaba&btnG=Search+in+Google
 | `C` | Device identifier (model/firmware string). |
 | `D` | Device UI language code. |
 | `E` | Preferred character encoding (for example `ISO-8859-1`). |
-| `d` | Capability block (`w` width px, `h` height px, `c` colours, `m` heap KB, `i` images on/off, `q` image quality, `f/j/l` extra flags). |
+| `d` | Capability block (`w` width px, `h` height px, `c` colours, `m` heap bytes, `i` images on/off, `q` image quality, `f/j/l` extra flags). |
 | `c` | Authentication code (hash) used by Opera to validate responses. |
 | `h` | Authentication prefix paired with `c`. |
 | `f` | Referrer URL from the client. |
@@ -90,8 +90,8 @@ Operationally this explains why the first request you see is small (~hundreds of
 - **Stylesheet assembly.** `buildStylesheet` collects inline `<style>` blocks and up to three linked stylesheets, normalises simple CSS properties, and feeds them to `computeStyleFor` for decisions such as `display:none` and colours.
 - **DOM traversal.** The recursive `walkRich` walker skips hidden nodes, recognises structure (`p`, headings, lists, `hr`/`br`), emits OBML tags, and ensures headings become bold separators via `AddPlus` and style flags.
 - **Text & styles.** Text nodes become `T` tags with UTF-8 payload; `walkState` tracks style bits (`styleBoldBit`, `styleItalicBit`, `styleUnderBit`, `styleCenterBit`, `styleRightBit`) and emits `S` tags when the active style changes.
-- **Forms & controls.** `<form>` (`h`), `<input>` (`x`, `p`, `i`, `u`, `b`, `e`, `c`, `r`), and `<select>` (`s`, `o`, optional `l`) are rendered, mirroring OperaвЂ™s expectations and echoing submitted payload via `RenderOptions.FormBody`.
-- **Images.** `fetchAndEncodeImage` obeys `RenderOptions.ImagesOn`, uses in-memory and optional disk LRU caches (`OMS_IMG_CACHE_DIR`, `OMS_IMG_CACHE_MB`), converts to JPEG/PNG as requested, rescales with `golang.org/x/image/draw`, and emits `I` tags; oversized or disabled images fall back to `J` placeholders.
+- **Forms & controls.** `<form>` (`h`), `<input>` (`x`, `p`, `i`, `C` + `u`, `b`, `e`, `c`, `r`), and `<select>` (`s`, `o`, optional `l`) are rendered, mirroring OperaвЂ™s expectations and echoing submitted payload via `RenderOptions.FormBody`.
+- **Images.** `fetchAndEncodeImage` obeys `RenderOptions.ImagesOn`, uses in-memory and optional disk LRU caches (`OMS_IMG_CACHE_DIR`, `OMS_IMG_CACHE_MB`), converts to JPEG/PNG as requested, rescales with `golang.org/x/image/draw`, and emits `I` tags; oversized or disabled images fall back to `J` placeholders. A reported heap of at most 512 KiB enables RGB444 (high quality) or RGB332 (low quality) pre-quantization and tighter encoding.
 - **Pagination & navigation.** `RenderOptions.MaxTagsPerPage` splits payloads via `splitByTags`; navigation fragments are appended when `RenderOptions.ServerBase` is known. Packed snapshots land in `Page.CachePacked` for reuse by `SelectOMSPartFromPacked`.
 - **Finalisation & normalisation.** `Page.finalize()` appends the terminal `Q`, computes conservative tag/string counts (tunable via `OMS_TAGCOUNT_MODE` / `OMS_TAGCOUNT_DELTA`), writes the V2 header, deflates the payload, and prefixes the transport header. `NormalizeOMS` / `NormalizeOMSWithStag` repack responses to stabilise counts (e.g., force `stag_count = 0x0400`).
 - **Auth echo & cookies.** The renderer mirrors `AuthCode` / `AuthPrefix` into `k` tags, records origin `Set-Cookie` values, and exposes them through `page.SetCookies` so the HTTP layer forwards them to the client.

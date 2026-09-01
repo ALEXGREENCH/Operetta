@@ -391,20 +391,13 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 				// then dataLen raw bytes. Operetta's existing zero reserved u16 is an
 				// empty UTF string, so the bytes are wire-compatible. Keep the image
 				// budget deliberately small for CLDC-1.0 era heaps.
-				opt.ImagesOn = true
-				opt.HighQuality = false
-				opt.ImageMIME = legacyBasicImageMIME(params)
-				opt.MaxInlineKB = 8
-				opt.DialectID = "om2-basic"
-				opt.Compression = oms.CompressionNone
+				applyLegacyBasicRenderProfile(opt, params)
 				if s.logger != nil {
 					s.logger.Printf("legacy OM2 Basic image profile: requested_k=%q mime=%s screen=%dx%d heap=%d inline=%dKB", params["k"], opt.ImageMIME, opt.ScreenW, opt.ScreenH, opt.HeapBytes, opt.MaxInlineKB)
 				}
 				// Do not echo synthetic Operetta auth records into the original
 				// Basic client. The server-side jar/auth association was resolved
 				// above already; these k-records are only needed by later clients.
-				opt.AuthCode = ""
-				opt.AuthPrefix = ""
 				if os.Getenv("OMS_LEGACY_BASIC_SMOKE") == "1" {
 					page := renderLegacyBasicSmokePage()
 					s.writeOMSForClient(w, page.Data, page.SetCookies, &page.Stats, true)
@@ -719,6 +712,7 @@ func (s *Server) headersFromQuery(r *http.Request) http.Header {
 
 func (s *Server) renderOptionsFromParams(r *http.Request, params map[string]string, hdr http.Header, jarKey string) *oms.RenderOptions {
 	opt := defaultRenderOptions()
+	applyVersionImageQuality(opt, params["v"])
 	if km := params["k"]; strings.HasPrefix(strings.ToLower(km), "image/") {
 		opt.ImageMIME = km
 	}
@@ -877,6 +871,7 @@ func (s *Server) renderOptionsFromParams(r *http.Request, params map[string]stri
 func (s *Server) renderOptionsFromQuery(r *http.Request, hdr http.Header) *oms.RenderOptions {
 	q := r.URL.Query()
 	opt := defaultRenderOptions()
+	applyVersionImageQuality(opt, q.Get("v"))
 	if v := q.Get("img"); v != "" {
 		if b, ok := interpretImageMode(v); ok {
 			opt.ImagesOn = b
@@ -969,6 +964,19 @@ func (s *Server) renderOptionsFromQuery(r *http.Request, hdr http.Header) *oms.R
 	applyAcceptImagePreference(opt, hdr)
 	applyJSOptionsFromQuery(opt, q)
 	return opt
+}
+
+func applyVersionImageQuality(opt *oms.RenderOptions, version string) {
+	if opt == nil {
+		return
+	}
+	version = strings.ToLower(strings.TrimSpace(version))
+	switch {
+	case strings.Contains(version, "/hifi/"):
+		opt.HighQuality = true
+	case strings.Contains(version, "/lofi/"):
+		opt.HighQuality = false
+	}
 }
 
 func applyAcceptImagePreference(opt *oms.RenderOptions, hdr http.Header) {

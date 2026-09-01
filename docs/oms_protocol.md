@@ -68,17 +68,18 @@ Forms
 - 'o': Option → OMS_STRING value, OMS_STRING label, selected (u8)
 - 'l': Select end (used by some producers; readers may rely on count only)
 
-Less common/unknown
+Less common/compatibility
 
 - 'A' Anchor, 'C' SubmitFlag, 'F' rich field (id/width/data), 'Y'/'y' style reuse, 'z' indent,
   'M' alert, 'N' string, images/links 'I' 'J' 'K' 'X' 'Z' 'W' '^' '@' 'm' '\x08' '\x09'.
-  These are not required for basic text/forms rendering and are currently not produced by the Go server.
+  The Go server emits `C` immediately before a submit `u`; the original Opera
+  Mini 2.0 parser uses it to mark the next control as the form action.
 
 Go Implementation (go/oms)
 
 - Framing: magic/size/deflate as above; 'Q' appended before compression.
 - V2 header fields and tag_count swapping match C.
-- Tags implemented: T,B,V,+,D,S,R, L/E, k, h, x, p, u, i, b, e, c, r, s, o (without 'l' by default).
+- Tags implemented: T,B,V,+,D,S,R, L/E, k, h, x, p, C/u, i, b, e, c, r, s, o, l.
 - HTML mapping: title/body/br/hr/p/a/img/form/textarea/input/select/option; display:none textarea ignored. <img> becomes text "[Img]".
 
 Validation checklist
