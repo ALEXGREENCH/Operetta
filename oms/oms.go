@@ -2820,7 +2820,32 @@ func walkRich(cur *html.Node, base string, p renderTarget, visited map[*html.Nod
 			// Do not recurse into heading children to avoid duplicate text
 			recurse = false
 		case "div", "section", "article", "header", "footer", "main", "nav", "aside":
+			if renderSectionTitle(c, base, p, st) {
+				recurse = false
+				finishCurrent()
+				continue
+			}
+			if renderFloatMetadataRow(c, base, p, visited, st, prefs) {
+				recurse = false
+				finishCurrent()
+				continue
+			}
+			if renderLeadingRightMetadata(c, base, p, visited, st, prefs) {
+				recurse = false
+				finishCurrent()
+				continue
+			}
+			if renderInlineImageStrip(c, base, p, st, prefs) {
+				recurse = false
+				finishCurrent()
+				continue
+			}
 			if renderFloatIconGrid(c, base, p, st, prefs) {
+				recurse = false
+				finishCurrent()
+				continue
+			}
+			if renderMediaObject(c, base, p, visited, st, prefs) {
 				recurse = false
 				finishCurrent()
 				continue
@@ -2965,7 +2990,12 @@ func walkRich(cur *html.Node, base string, p renderTarget, visited map[*html.Nod
 				// a line boundary before popBgcolor() restores the parent colour.
 				bgBoundaryOnFinish = true
 			}
-			p.AddParagraph()
+			// A generic block establishes a line boundary, not paragraph
+			// spacing. Mapping every nested div to V compounded quarter-em gaps
+			// in wrapper-heavy mobile sites. Empty/consecutive B records collapse
+			// naturally in legacy clients, while real p/list/quote elements keep
+			// their explicit paragraph spacing.
+			p.AddBreak()
 		case "b", "strong":
 			st.pushStyle(p, st.curStyle|styleBoldBit)
 			if c.FirstChild != nil {
@@ -3468,6 +3498,11 @@ func walkRich(cur *html.Node, base string, p renderTarget, visited map[*html.Nod
 				recurse = false
 			}
 		case "table":
+			if renderIconToolbar(c, base, p, st, prefs) {
+				recurse = false
+				finishCurrent()
+				continue
+			}
 			if hasFormControls(c) || hasAnchorLinks(c) {
 				// let recursion process interactive content to preserve links
 			} else {

@@ -134,6 +134,19 @@ func gridColor(value string, fallback color.RGBA) color.RGBA {
 	return fallback
 }
 
+func omRasterBackground(value string, fallback color.RGBA) color.RGBA {
+	value = strings.TrimSpace(value)
+	if value == "" || strings.EqualFold(value, "transparent") {
+		return fallback
+	}
+	safe := normalizeBgForBlackText(value)
+	if safe == "" {
+		safe = value
+	}
+	safe = ensureMinForRGB565(safe)
+	return gridColor(safe, fallback)
+}
+
 func fitGridLabel(label string, face font.Face, maxWidth int) string {
 	label = strings.TrimSpace(condenseSpaces(label))
 	if label == "" || maxWidth <= 0 {
@@ -170,9 +183,9 @@ func renderFloatIconTile(cell floatIconCell, base string, st *walkState, prefs R
 		height = 160
 	}
 
-	bg := gridColor(st.curBg, color.RGBA{R: 0xff, G: 0xff, B: 0xff, A: 0xff})
+	bg := omRasterBackground(st.curBg, color.RGBA{R: 0xff, G: 0xff, B: 0xff, A: 0xff})
 	if own := cssPropValue(cellProps, getAttr(cell.node, "style"), "background-color"); own != "" {
-		bg = gridColor(own, bg)
+		bg = omRasterBackground(own, bg)
 	}
 	fg := gridColor(cssEffectiveProp(cell.node, st.css, cellProps, "color"), color.RGBA{A: 0xff})
 	tile := image.NewRGBA(image.Rect(0, 0, width, height))
