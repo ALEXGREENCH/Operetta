@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"log"
@@ -88,6 +89,13 @@ func TestNativeOM4NavigationWorksWithoutCapturedOnboarding(t *testing.T) {
 	for _, drawing := range document.Drawings {
 		if drawing.Kind == 'I' {
 			images++
+			resource := officialImageResource(document.Page, drawing.ImagePointer)
+			if len(resource) == 0 || !bytes.HasPrefix(resource, []byte("\x89PNG\r\n\x1a\n")) {
+				t.Fatalf("emoji resource is not PNG: bytes=%d prefix=%x", len(resource), resource[:min(len(resource), 8)])
+			}
+			if len(resource) > 2048 {
+				t.Fatalf("emoji PNG is too large for a tiny glyph: %d bytes", len(resource))
+			}
 		}
 	}
 	if images == 0 {
@@ -127,6 +135,25 @@ func TestSpacesMobileHostSurvivesWorldRedirects(t *testing.T) {
 		if isSpacesMobileHost(host) {
 			t.Fatalf("non-Spaces host recognized: %q", host)
 		}
+	}
+}
+
+func TestPlaceSectionTextsIgnoresDecorativeSeparators(t *testing.T) {
+	lines := []operamini4.WelcomeLine{{Text: "·"}, {Text: "timestamp"}, {Text: "author"}}
+	placed := make([]bool, len(lines))
+	place := func(index, x, y, width, height int) {
+		lines[index].X, lines[index].Y = x, y
+		lines[index].Width, lines[index].Height = width, height
+		placed[index] = true
+	}
+	placeSectionTexts(lines, placed, 0, len(lines), [][4]int{
+		{10, 20, 30, 14}, {40, 50, 60, 14},
+	}, place)
+	if placed[0] || !placed[1] || !placed[2] {
+		t.Fatalf("separator/data placement = %v", placed)
+	}
+	if lines[1].X != 10 || lines[1].Y != 20 || lines[2].X != 40 || lines[2].Y != 50 {
+		t.Fatalf("section text shifted by separator: %+v", lines)
 	}
 }
 

@@ -281,14 +281,13 @@ func (s *Server) renderNativeOrigin(ctx context.Context, target string, jar http
 		effectiveURL = target
 	}
 	if parsed, parseErr := url.Parse(effectiveURL); parseErr == nil && isSpacesMobileHost(parsed.Hostname()) {
-		lines = arrangeSpacesNativePage(lines)
+		lines, documentHeight = arrangeSpacesNativePage(lines)
 		if searchIcon := fetchNativeAsset(ctx, "http://world82.spcs.bio/i/search_icon.png?r=1", headers); len(searchIcon) > 0 && len(searchIcon) <= 0xffff {
 			lines = append(lines, operamini4.WelcomeLine{
 				Image: searchIcon, Width: 16, Height: 16, X: 212, Y: 121,
 				Positioned: true, Absolute: true, Background: 0xffffffff,
 			})
 		}
-		documentHeight = 2735
 		title = "Spaces — Социальная сеть (официальный сайт)"
 		background = 0xffffffff
 	}
@@ -335,7 +334,7 @@ func arrangeNativeImageRows(lines []operamini4.WelcomeLine) []operamini4.Welcome
 // blocks; preserving only DOM order turns every icon, caption and card field
 // into a separate row.  These rules express the same 231px layout primitives
 // that the Opera Mini 4 reference renderer emits.
-func arrangeSpacesNativePage(lines []operamini4.WelcomeLine) []operamini4.WelcomeLine {
+func arrangeSpacesNativePage(lines []operamini4.WelcomeLine) ([]operamini4.WelcomeLine, int) {
 	cut := len(lines)
 	for index := range lines {
 		if strings.EqualFold(strings.TrimSpace(lines[index].Text), "Тема:") {
@@ -466,60 +465,61 @@ func arrangeSpacesNativePage(lines []operamini4.WelcomeLine) []operamini4.Welcom
 			place(index-1, 205, y+1, 21, 14)
 		}
 	}
-	section(ai, 197, 58)
-	section(photos, 501, 122)
-	section(blogs, 614, 41)
-	section(videos, 1229, 128)
-	section(communities, 1319, 162)
-	section(games, 1540, 120)
+	section(ai, 150, 58)
+	section(photos, 454, 122)
+	section(blogs, 567, 41)
+	section(videos, 1000, 128)
+	section(communities, 1090, 162)
+	section(games, 1325, 120)
 
 	// AI/video tiles, navigation icons and photo tiles.
 	aiImages := imagesBetween(ai+1, photos)
-	placeImages(aiImages, [][4]int{{3, 218, 76, 53}, {81, 218, 76, 53}, {5, 287, 16, 16}, {5, 313, 16, 16}, {5, 339, 16, 16}, {5, 365, 17, 16}, {5, 391, 16, 16}, {5, 417, 16, 16}, {5, 443, 16, 15}, {5, 469, 16, 16}})
+	placeImages(aiImages, [][4]int{{3, 171, 76, 53}, {81, 171, 76, 53}, {5, 240, 16, 16}, {5, 266, 16, 16}, {5, 292, 16, 16}, {5, 318, 17, 16}, {5, 344, 16, 16}, {5, 370, 16, 16}, {5, 396, 16, 15}, {5, 422, 16, 16}})
 	for index, item := range []string{"Зона обмена", "Музыка", "Люди", "Сообщества", "Знакомства", "Форум", "Чат", "Онлайн-Игры"} {
-		placeText(item, 24, 288+index*26, 190, 14)
+		placeText(item, 24, 241+index*26, 190, 14)
 	}
-	placeImages(imagesBetween(photos+1, blogs), [][4]int{{3, 522, 76, 76}, {81, 522, 76, 76}})
-	placeImages(imagesBetween(videos+1, communities), [][4]int{{3, 1250, 76, 53}, {81, 1250, 76, 53}})
+	placeImages(imagesBetween(photos+1, blogs), [][4]int{{3, 475, 76, 76}, {81, 475, 76, 76}})
+	placeImages(imagesBetween(videos+1, communities), [][4]int{{3, 1021, 76, 53}, {81, 1021, 76, 53}})
 
 	// Blog cards. Text and status fields occupy the same rows as their icons.
 	placeImages(imagesBetween(blogs+1, videos), [][4]int{
-		{6, 643, 14, 14}, {81, 643, 8, 15}, {6, 661, 80, 80}, {6, 800, 16, 16},
-		{6, 827, 17, 16}, {6, 843, 80, 80}, {6, 996, 16, 16},
-		{6, 1023, 17, 16}, {6, 1039, 80, 80}, {6, 1192, 16, 16},
+		{6, 596, 16, 16}, {81, 596, 8, 15}, {6, 612, 80, 80}, {6, 668, 16, 16},
+		{6, 695, 16, 16}, {6, 711, 80, 80}, {6, 767, 16, 16},
+		{6, 794, 16, 16}, {6, 810, 80, 80}, {6, 963, 16, 16},
 	})
 	blogTextGeometry := [][4]int{
-		{189, 644, 36, 14}, {23, 647, 100, 14}, {6, 744, 215, 14}, {6, 758, 219, 42},
-		{25, 801, 24, 14}, {148, 800, 36, 14}, {187, 800, 38, 14},
-		{147, 828, 78, 14}, {25, 828, 118, 14}, {6, 926, 219, 28}, {6, 954, 219, 42},
-		{25, 997, 24, 14}, {96, 996, 129, 14},
-		{189, 1024, 36, 14}, {25, 1024, 160, 14}, {6, 1122, 219, 28}, {6, 1150, 219, 42},
-		{25, 1193, 24, 14}, {46, 1192, 179, 14},
+		{189, 597, 36, 14}, {25, 597, 120, 14}, {95, 596, 130, 28}, {6, 626, 219, 42},
+		{25, 669, 24, 14}, {69, 668, 36, 14}, {108, 668, 117, 14},
+		{189, 696, 36, 14}, {25, 696, 72, 14}, {100, 695, 125, 28}, {6, 725, 219, 42},
+		{25, 768, 24, 14}, {105, 767, 36, 14}, {144, 767, 81, 14},
+		{189, 795, 36, 14}, {25, 795, 120, 14}, {6, 893, 219, 28}, {6, 921, 219, 42},
+		{25, 964, 24, 14}, {63, 963, 36, 14}, {102, 963, 123, 14},
 	}
 	placeSectionTexts(lines, placed, blogs+1, videos, blogTextGeometry, place)
 
 	// Community and game cards use a left thumbnail and a compact text stack.
 	communityImages := imagesBetween(communities+1, games)
-	placeImages(communityImages, [][4]int{{6, 1348, 40, 40}, {51, 1377, 16, 16}, {6, 1404, 40, 40}, {51, 1447, 16, 16}, {6, 1474, 40, 40}, {51, 1503, 16, 16}})
+	placeImages(communityImages, [][4]int{{6, 1119, 40, 40}, {51, 1148, 16, 16}, {6, 1175, 40, 40}, {51, 1204, 16, 16}, {6, 1231, 40, 40}, {51, 1288, 16, 16}})
 	placeSectionTexts(lines, placed, communities+1, games, [][4]int{
-		{51, 1349, 174, 14}, {51, 1363, 174, 28}, {70, 1378, 155, 14},
-		{51, 1405, 174, 14}, {51, 1419, 174, 28}, {70, 1448, 155, 14},
-		{51, 1475, 174, 14}, {51, 1489, 174, 14}, {70, 1504, 155, 14},
+		{51, 1120, 174, 14}, {51, 1134, 174, 28}, {70, 1149, 155, 14},
+		{51, 1176, 174, 14}, {51, 1190, 174, 28}, {70, 1205, 155, 14},
+		{51, 1232, 174, 14}, {51, 1246, 174, 42}, {70, 1289, 155, 14},
 	}, place)
-	placeImages(imagesBetween(games+1, seo), [][4]int{{6, 1569, 50, 50}, {6, 1637, 50, 50}, {6, 1705, 50, 50}, {5, 1783, 15, 16}, {5, 1809, 16, 16}, {5, 1835, 16, 16}, {5, 1861, 16, 16}})
+	placeImages(imagesBetween(games+1, seo), [][4]int{{6, 1354, 50, 50}, {6, 1422, 50, 50}, {6, 1490, 50, 50}, {5, 1568, 15, 16}, {5, 1594, 16, 16}, {5, 1620, 16, 16}, {5, 1646, 16, 16}})
 	placeSectionTexts(lines, placed, games+1, seo, [][4]int{
-		{62, 1569, 163, 14}, {62, 1583, 163, 28}, {62, 1612, 163, 14},
-		{62, 1637, 163, 14}, {62, 1651, 163, 28}, {62, 1680, 163, 14},
-		{62, 1705, 163, 14}, {62, 1719, 163, 28}, {62, 1748, 163, 14},
-		{23, 1784, 202, 14}, {24, 1810, 201, 14}, {24, 1836, 201, 14}, {24, 1862, 201, 28},
+		{62, 1354, 163, 14}, {62, 1368, 163, 28}, {62, 1397, 163, 14},
+		{62, 1422, 163, 14}, {62, 1436, 163, 28}, {62, 1465, 163, 14},
+		{62, 1490, 163, 14}, {62, 1504, 163, 28}, {62, 1533, 163, 14},
+		{23, 1569, 202, 14}, {24, 1595, 201, 14}, {24, 1621, 201, 14}, {24, 1647, 201, 28},
 	}, place)
 
 	// Long explanatory copy and footer.
+	contentEndY := 2353
 	if seo >= 0 {
 		lines[seo].Text = "SPACES — ТВОЙ МИР СВОБОДЫ И\nВДОХНОВЕНИЯ!"
 		lines[seo].Color, lines[seo].Font = 0xff323232, 1
-		place(seo, 16, 1908, 199, 28)
-		y := 1941
+		place(seo, 16, 1693, 199, 28)
+		y := 1726
 		for index := seo + 1; index < len(lines); index++ {
 			text := strings.TrimSpace(strings.ReplaceAll(lines[index].Text, "\n", " "))
 			if text == "" || text == "Зарегистрироваться" || isSpacesFooterText(text) || len(lines[index].Image) > 0 {
@@ -528,13 +528,10 @@ func arrangeSpacesNativePage(lines []operamini4.WelcomeLine) []operamini4.Welcom
 			if strings.EqualFold(text, "Spaces") {
 				lines[index].Text, lines[index].Color, lines[index].Font = "Spaces", 0xff617989, 1
 				place(index, 6, y, 38, 14)
+				y += 14
 				continue
 			}
-			maxLines := 6
-			if strings.HasPrefix(text, "Присоединяйся") {
-				maxLines = 2
-			}
-			lines[index].Text, _ = wrapOM4Text(text, 35, maxLines)
+			lines[index].Text, _ = wrapOM4Text(text, 39, 32)
 			lines[index].Color = 0xff617989
 			if lines[index].Font != 0 {
 				lines[index].Color, lines[index].Font = 0xff323232, 1
@@ -543,13 +540,17 @@ func arrangeSpacesNativePage(lines []operamini4.WelcomeLine) []operamini4.Welcom
 			place(index, 6, y, 219, height)
 			y += height + 14
 		}
+		if y > 2353 {
+			contentEndY = y
+		}
 	}
+	registerY := max(2363, contentEndY+10)
 	register := textIndex("Зарегистрироваться")
-	place(register, 66, 2578, 158, 14)
+	place(register, 66, registerY, 158, 14)
 	if register > 0 && len(lines[register-1].Image) > 0 {
-		place(register-1, 47, 2577, 16, 16)
+		place(register-1, 47, registerY-1, 16, 16)
 	}
-	footerX, footerY := 1, 2613
+	footerX, footerY := 1, registerY+35
 	footerBackgroundSet := false
 	for _, value := range []string{"Контакты", "·", "О нас", "Реклама", "Правила", "Тех.поддержка"} {
 		index := textIndex(value)
@@ -563,7 +564,7 @@ func arrangeSpacesNativePage(lines []operamini4.WelcomeLine) []operamini4.Welcom
 		place(index, footerX, footerY, width, 14)
 		lines[index].Color = 0xffffffff
 		if !footerBackgroundSet {
-			placeBackground(index, 0, 2608, 231, 47, 0xff8298a8)
+			placeBackground(index, 0, footerY-5, 231, 47, 0xff8298a8)
 			footerBackgroundSet = true
 		} else {
 			lines[index].Background = 0
@@ -572,25 +573,23 @@ func arrangeSpacesNativePage(lines []operamini4.WelcomeLine) []operamini4.Welcom
 	}
 
 	result := []operamini4.WelcomeLine{
-		nativeBackgroundBlock(0, 32, 231, 2703, 0xfff5f5f5),
+		nativeBackgroundBlock(0, 32, 231, max(2488, footerY+47-32), 0xfff5f5f5),
 		nativeBackgroundBlock(1, 146, 229, 40, 0xffffffff),
-		nativeBackgroundBlock(1, 216, 229, 60, 0xffffffff),
-		nativeBackgroundBlock(1, 283, 229, 207, 0xffffffff),
-		nativeBackgroundBlock(1, 520, 229, 83, 0xffffffff),
-		nativeBackgroundBlock(1, 633, 229, 585, 0xffffffff),
-		nativeBackgroundBlock(1, 1248, 229, 62, 0xffffffff),
-		nativeBackgroundBlock(1, 1338, 229, 189, 0xffffffff),
-		nativeBackgroundBlock(1, 1559, 229, 208, 0xffffffff),
-		nativeBackgroundBlock(1, 1779, 229, 117, 0xffffffff),
-		nativeBackgroundBlock(1, 1903, 229, 594, 0xffffffff),
-		nativeBackgroundBlock(1, 2573, 229, 25, 0xffffffff),
+		nativeBackgroundBlock(1, 169, 229, 274, 0xffffffff),
+		nativeBackgroundBlock(1, 473, 229, 83, 0xffffffff),
+		nativeBackgroundBlock(1, 586, 229, 403, 0xffffffff),
+		nativeBackgroundBlock(1, 1019, 229, 62, 0xffffffff),
+		nativeBackgroundBlock(1, 1109, 229, 207, 0xffffffff),
+		nativeBackgroundBlock(1, 1344, 229, 334, 0xffffffff),
+		nativeBackgroundBlock(1, 1712, 229, max(25, registerY-1722), 0xffffffff),
+		nativeBackgroundBlock(1, registerY-5, 229, 25, 0xffffffff),
 	}
 	for index := range lines {
 		if placed[index] {
 			result = append(result, lines[index])
 		}
 	}
-	return result
+	return result, max(2520, footerY+47)
 }
 
 func nativeBackgroundBlock(x, y, width, height int, color uint32) operamini4.WelcomeLine {
@@ -628,7 +627,8 @@ func fetchNativeAsset(ctx context.Context, target string, headers http.Header) [
 func placeSectionTexts(lines []operamini4.WelcomeLine, placed []bool, start, end int, geometry [][4]int, place func(int, int, int, int, int)) {
 	textIndexes := make([]int, 0, len(geometry))
 	for index := max(0, start); index < end && index < len(lines); index++ {
-		if !placed[index] && strings.TrimSpace(lines[index].Text) != "" && !strings.EqualFold(strings.TrimSpace(lines[index].Text), "Все") {
+		text := strings.TrimSpace(lines[index].Text)
+		if !placed[index] && text != "" && text != "·" && text != "|" && !strings.EqualFold(text, "Все") {
 			textIndexes = append(textIndexes, index)
 		}
 	}
