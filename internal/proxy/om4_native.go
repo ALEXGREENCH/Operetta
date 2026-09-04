@@ -197,6 +197,8 @@ func (s *Server) renderNativeOrigin(ctx context.Context, target string, jar http
 	lines := make([]operamini4.WelcomeLine, 0, 128)
 	style := presentation.TextStyle{}
 	currentLink := ""
+	currentLinkGroup := 0
+	nextLinkGroup := 0
 	pendingGap := 0
 	currentBackground := background
 	for _, op := range model.Operations {
@@ -208,8 +210,11 @@ func (s *Server) renderNativeOrigin(ctx context.Context, target string, jar http
 			style = op.Style
 		case presentation.LinkStart:
 			currentLink = resolveNativeURL(model.URL, op.URL)
+			nextLinkGroup++
+			currentLinkGroup = nextLinkGroup
 		case presentation.LinkEnd:
 			currentLink = ""
+			currentLinkGroup = 0
 		case presentation.Background:
 			if color, ok := nativeColor(op.Color); ok {
 				currentBackground = color
@@ -232,7 +237,7 @@ func (s *Server) renderNativeOrigin(ctx context.Context, target string, jar http
 					height = 24
 				}
 				lines = append(lines, operamini4.WelcomeLine{
-					URL: currentLink, Image: op.Data, Width: op.Width, Height: height,
+					URL: currentLink, LinkGroup: currentLinkGroup, Image: op.Data, Width: op.Width, Height: height,
 					Background: currentBackground, Gap: max(2, pendingGap),
 				})
 				pendingGap = 0
@@ -242,7 +247,7 @@ func (s *Server) renderNativeOrigin(ctx context.Context, target string, jar http
 			if op.Width > 0 && op.Height > 0 {
 				label = fmt.Sprintf("▧ Изображение %d×%d", op.Width, op.Height)
 			}
-			lines = append(lines, operamini4.WelcomeLine{Text: label, URL: currentLink, Color: linkColor, Background: currentBackground, Height: 24, Gap: 5})
+			lines = append(lines, operamini4.WelcomeLine{Text: label, URL: currentLink, LinkGroup: currentLinkGroup, Color: linkColor, Background: currentBackground, Height: 24, Gap: 5})
 			pendingGap = 0
 		case presentation.Text, presentation.Option:
 			text := strings.Join(strings.Fields(op.Text), " ")
@@ -266,7 +271,7 @@ func (s *Server) renderNativeOrigin(ctx context.Context, target string, jar http
 			}
 			gap := max(2, pendingGap)
 			lines = append(lines, operamini4.WelcomeLine{
-				Text: wrapped, URL: currentLink, Color: color, Background: currentBackground, Font: font, Height: lineCount * 14, Gap: gap,
+				Text: wrapped, URL: currentLink, LinkGroup: currentLinkGroup, Color: color, Background: currentBackground, Font: font, Height: lineCount * 14, Gap: gap,
 			})
 			pendingGap = 0
 		}

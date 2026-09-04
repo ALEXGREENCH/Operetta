@@ -27,8 +27,12 @@ type WelcomePage struct {
 
 // WelcomeLine is one styled block in a native OM4 welcome page.
 type WelcomeLine struct {
-	Text                 string
-	URL                  string
+	Text string
+	URL  string
+	// LinkGroup identifies drawing fragments produced by the same source
+	// anchor. OM4 exposes one focus target for the whole anchor even when it
+	// contains both an icon and text. Zero keeps the legacy one-line behavior.
+	LinkGroup            int
 	Image                []byte
 	Width                int
 	X                    int
@@ -112,10 +116,25 @@ func BuildWelcomePage(spec WelcomePage) ([]byte, error) {
 		url    string
 	}
 	links := make([]linkPosition, 0)
+	groupIndexes := make(map[int]int)
 	for _, positioned := range positionedLines {
-		if positioned.line.URL != "" {
-			links = append(links, linkPosition{x: positioned.x, y: positioned.y, width: positioned.width, height: positioned.height, url: positioned.line.URL})
+		line := positioned.line
+		if line.URL == "" {
+			continue
 		}
+		if line.LinkGroup > 0 {
+			if index, ok := groupIndexes[line.LinkGroup]; ok && links[index].url == line.URL {
+				left := min(links[index].x, positioned.x)
+				top := min(links[index].y, positioned.y)
+				right := max(links[index].x+links[index].width, positioned.x+positioned.width)
+				bottom := max(links[index].y+links[index].height, positioned.y+positioned.height)
+				links[index].x, links[index].y = left, top
+				links[index].width, links[index].height = right-left, bottom-top
+				continue
+			}
+			groupIndexes[line.LinkGroup] = len(links)
+		}
+		links = append(links, linkPosition{x: positioned.x, y: positioned.y, width: positioned.width, height: positioned.height, url: line.URL})
 	}
 	if len(links) > 0 {
 		var interactions bytes.Buffer

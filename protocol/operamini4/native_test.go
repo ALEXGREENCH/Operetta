@@ -165,3 +165,27 @@ func TestNativeWelcomeDocumentHeightIsExactOverride(t *testing.T) {
 		t.Fatalf("document height = %d, want exact override 400", header.DocumentHeight)
 	}
 }
+
+func TestNativeWelcomeMergesFragmentsOfOneSourceLink(t *testing.T) {
+	page, err := BuildWelcomePage(WelcomePage{
+		Lines: []WelcomeLine{
+			{Image: []byte{0xff, 0xd8, 0xff, 0xd9}, URL: "https://example.test/chat", LinkGroup: 1, X: 5, Y: 20, Width: 16, Height: 16, Positioned: true, Absolute: true},
+			{Text: "Chat", URL: "https://example.test/chat", LinkGroup: 1, X: 24, Y: 21, Width: 190, Height: 14, Positioned: true, Absolute: true},
+			{Text: "Chat again", URL: "https://example.test/chat", LinkGroup: 2, X: 5, Y: 50, Width: 209, Height: 14, Positioned: true, Absolute: true},
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	header, err := DecodePageHeader(page)
+	if err != nil {
+		t.Fatal(err)
+	}
+	links := DecodeLinkElements(page, header.ContentOffset)
+	if len(links) != 2 {
+		t.Fatalf("links=%+v, want two source anchors", links)
+	}
+	if links[0].X != 5 || links[0].Y != 20 || links[0].Width != 209 || links[0].Height != 16 {
+		t.Fatalf("merged link=%+v, want 5,20 209x16", links[0])
+	}
+}
