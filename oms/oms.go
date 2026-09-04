@@ -1475,6 +1475,9 @@ type JSBakingOptions struct {
 	TimeoutMS         int
 	RasterizeEmoji    bool
 	Scripts           []string
+	// FinalScripts run synchronously after the bounded network/DOM settle and
+	// immediately before emoji rasterization and the HTML snapshot.
+	FinalScripts []string
 }
 
 // UpstreamDocument is kept as a source-compatible alias. New code should use

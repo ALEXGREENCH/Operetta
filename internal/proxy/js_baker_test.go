@@ -62,11 +62,15 @@ func TestApplyJSOptionsIncludesSettleAndEmojiControls(t *testing.T) {
 		"js_dom_idle": []string{"450"},
 		"js_settle":   []string{"2400"},
 		"js_emoji":    []string{"1"},
+		"js_script":   []string{"window.prepared=true"},
+		"js_final_script": []string{
+			"document.querySelector('.late').remove()",
+		},
 	})
 	if opts.JS == nil || opts.JS.Mode != oms.JSExecutionModeEnabled ||
 		opts.JS.WaitAfterLoadMS != 1200 || opts.JS.WaitNetworkIdleMS != 300 ||
 		opts.JS.WaitDOMIdleMS != 450 || opts.JS.MaxSettleMS != 2400 ||
-		!opts.JS.RasterizeEmoji || !shouldUseJS(opts.JS) {
+		!opts.JS.RasterizeEmoji || len(opts.JS.Scripts) != 1 || len(opts.JS.FinalScripts) != 1 || !shouldUseJS(opts.JS) {
 		t.Fatalf("unexpected JS options: %+v", opts.JS)
 	}
 }
@@ -75,11 +79,14 @@ func TestRewriteOnlySiteConfigEnablesJSBaking(t *testing.T) {
 	jsOpts := (&SiteConfig{Rewrite: &RewriteConfig{
 		RemoveSelectors: []string{".advert"},
 	}}).JSOptions()
-	if jsOpts == nil || len(jsOpts.Scripts) != 1 || !shouldUseJS(jsOpts) {
+	if jsOpts == nil || len(jsOpts.Scripts) != 1 || len(jsOpts.FinalScripts) != 1 || !shouldUseJS(jsOpts) {
 		t.Fatalf("rewrite must enable JS baking: %+v", jsOpts)
 	}
 	if !strings.Contains(jsOpts.Scripts[0], `".advert"`) {
 		t.Fatalf("rewrite selector was not JSON-encoded into script: %s", jsOpts.Scripts[0])
+	}
+	if strings.Contains(jsOpts.FinalScripts[0], `"click":["`) || !strings.Contains(jsOpts.FinalScripts[0], `".advert"`) {
+		t.Fatalf("final rewrite must clean without repeating clicks: %s", jsOpts.FinalScripts[0])
 	}
 }
 
@@ -89,7 +96,7 @@ func TestJSBakerWaitsForAsyncDOMAndRasterizesEmoji(t *testing.T) {
 		_, _ = io.WriteString(w, `<!doctype html><html><body>`+
 			`<aside class="noise">remove me</aside>`+
 			`<main id="content"><div id="result">loading</div>`+
-			`<button id="load" onclick="setTimeout(function(){document.getElementById('result').textContent='ready 😀';},180)">load</button>`+
+			`<button id="load" onclick="setTimeout(function(){document.getElementById('result').textContent='ready 😀';var late=document.createElement('aside');late.className='noise';late.textContent='late noise';document.body.appendChild(late);},180)">load</button>`+
 			`</main></body></html>`)
 	}))
 	defer upstream.Close()
@@ -131,7 +138,7 @@ func TestJSBakerWaitsForAsyncDOMAndRasterizesEmoji(t *testing.T) {
 	if !strings.Contains(body, `id="result">ready `) {
 		t.Fatalf("late DOM mutation was not captured: %s", body)
 	}
-	if strings.Contains(body, "remove me") || strings.Contains(body, `id="load"`) {
+	if strings.Contains(body, "remove me") || strings.Contains(body, "late noise") || strings.Contains(body, `id="load"`) {
 		t.Fatalf("site rewrite did not remove unwanted content: %s", body)
 	}
 	if !strings.Contains(body, `data-operetta-rewrite="1"`) {

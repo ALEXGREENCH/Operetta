@@ -1075,6 +1075,14 @@ func applyJSOptionsFromQuery(opt *oms.RenderOptions, q url.Values) {
 			}
 		}
 	}
+	if scripts := q["js_final_script"]; len(scripts) > 0 {
+		js := ensureJSOptions(opt)
+		for _, sc := range scripts {
+			if trimmed := strings.TrimSpace(sc); trimmed != "" {
+				js.FinalScripts = append(js.FinalScripts, trimmed)
+			}
+		}
+	}
 }
 
 func applyJSOptionsFromParams(opt *oms.RenderOptions, params map[string]string) {
@@ -1131,6 +1139,10 @@ func applyJSOptionsFromParams(opt *oms.RenderOptions, params map[string]string) 
 		js := ensureJSOptions(opt)
 		js.Scripts = append(js.Scripts, script)
 	}
+	if script := strings.TrimSpace(params["js_final_script"]); script != "" {
+		js := ensureJSOptions(opt)
+		js.FinalScripts = append(js.FinalScripts, script)
+	}
 }
 
 func mergeJSOptions(base, override *oms.JSBakingOptions) *oms.JSBakingOptions {
@@ -1142,6 +1154,9 @@ func mergeJSOptions(base, override *oms.JSBakingOptions) *oms.JSBakingOptions {
 		*result = *base
 		if len(base.Scripts) > 0 {
 			result.Scripts = append([]string(nil), base.Scripts...)
+		}
+		if len(base.FinalScripts) > 0 {
+			result.FinalScripts = append([]string(nil), base.FinalScripts...)
 		}
 	}
 	if override != nil {
@@ -1172,6 +1187,9 @@ func mergeJSOptions(base, override *oms.JSBakingOptions) *oms.JSBakingOptions {
 		if len(override.Scripts) > 0 {
 			result.Scripts = append(result.Scripts, override.Scripts...)
 		}
+		if len(override.FinalScripts) > 0 {
+			result.FinalScripts = append(result.FinalScripts, override.FinalScripts...)
+		}
 	}
 	if result.Mode == oms.JSExecutionModeAuto &&
 		result.WaitAfterLoadMS == 0 &&
@@ -1181,7 +1199,8 @@ func mergeJSOptions(base, override *oms.JSBakingOptions) *oms.JSBakingOptions {
 		result.WaitSelector == "" &&
 		result.TimeoutMS == 0 &&
 		!result.RasterizeEmoji &&
-		len(result.Scripts) == 0 {
+		len(result.Scripts) == 0 &&
+		len(result.FinalScripts) == 0 {
 		return nil
 	}
 	return result
@@ -1204,7 +1223,8 @@ func shouldUseJS(opts *oms.JSBakingOptions) bool {
 			opts.WaitSelector != "" ||
 			opts.TimeoutMS > 0 ||
 			opts.RasterizeEmoji ||
-			len(opts.Scripts) > 0 {
+			len(opts.Scripts) > 0 ||
+			len(opts.FinalScripts) > 0 {
 			return true
 		}
 	}

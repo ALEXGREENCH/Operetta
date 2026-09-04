@@ -34,6 +34,13 @@ func TestPageCacheKeyIsSessionAndDialectScoped(t *testing.T) {
 	if got := cacheKey("https://example.test/private", &otherDialect); got == key {
 		t.Fatal("two protocol dialects received the same cache key")
 	}
+	withFinalScript := *base
+	withFinalScript.JS = &oms.JSBakingOptions{FinalScripts: []string{"document.body.dataset.cleaned='1'"}}
+	withoutFinalScript := withFinalScript
+	withoutFinalScript.JS = &oms.JSBakingOptions{}
+	if cacheKey("https://example.test/private", &withFinalScript) == cacheKey("https://example.test/private", &withoutFinalScript) {
+		t.Fatal("final DOM cleanup script is missing from cache key")
+	}
 	unscoped := *base
 	unscoped.CachePartition = ""
 	if got := cacheKey("https://example.test/private", &unscoped); got != "" {

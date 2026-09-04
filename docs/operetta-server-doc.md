@@ -155,6 +155,13 @@ Operationally this explains why the first request you see is small (~hundreds of
 In code, `proxy.DefaultConfig()` exposes the same defaults while letting you override bookmarks, logging, the clock source and site-config directory before calling `proxy.New(cfg)`.
 `/fetch` also honours `img`, `hq`, `mime`, `maxkb`, `pp`, `page`, `ua`, and `lang`, which map directly onto `RenderOptions`. Per-site JSON files accept `{"mode":"full|compact","headers":{...}}`.
 
+Per-site `rewrite` rules run both before the bounded JavaScript settle and once
+again immediately before capture. The second pass skips clicks and reapplies
+only idempotent DOM cleanup/CSS, catching advertisements and consent wrappers
+inserted asynchronously. Custom `bake.finalScripts` and the diagnostic
+`js_final_script` parameter provide the same post-settle hook; their contents
+participate in the page-cache key.
+
 ## Debugging and Tooling
 - **Log dumps.** `OMS_DEBUG_DUMP=1` enables binary OMS head dumps; they are disabled by default.
 - **Validator.** With `OMS_ENABLE_DIAGNOSTICS=1`, `/validate?url=...` renders full and compact variants, runs `analyzeOMS`, and reports parser status, tag counts, pagination data, sampled text/links, and parsed form metadata in JSON.

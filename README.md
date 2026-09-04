@@ -149,7 +149,7 @@ small inline PNGs before the OMS renderer sees the page.
 
 For one-off diagnostics, the same controls are available as request parameters:
 `js=on`, `js_wait`, `js_idle`, `js_dom_idle`, `js_settle`, `js_timeout`,
-`js_selector` and `js_emoji=1`. See
+`js_selector`, `js_script`, `js_final_script` and `js_emoji=1`. See
 [`config/sites/README.md`](config/sites/README.md) and
 [`config/sites/_example.json`](config/sites/_example.json) for the complete
 per-host format.

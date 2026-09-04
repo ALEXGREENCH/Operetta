@@ -382,6 +382,19 @@ func (b *jsBaker) Fetch(ctx context.Context, target string, hdr http.Header, opt
 		}),
 	)
 
+	// Modern sites frequently inject banners and wrappers after load. The
+	// first template pass handles clicks and starts async work; this synchronous
+	// final pass cleans the settled DOM immediately before it is captured.
+	if jsOpts != nil && len(jsOpts.FinalScripts) > 0 {
+		for _, snippet := range jsOpts.FinalScripts {
+			code := strings.TrimSpace(snippet)
+			if code == "" {
+				continue
+			}
+			actions = append(actions, chromedp.Evaluate(code, nil))
+		}
+	}
+
 	rasterizeEmoji := jsOpts != nil && jsOpts.RasterizeEmoji
 	if opt != nil && opt.LegacyBasicOM2 {
 		rasterizeEmoji = true

@@ -13,6 +13,9 @@
     "emojiAsImages": true,
     "scripts": [
       "document.documentElement.classList.add('operetta-legacy')"
+    ],
+    "finalScripts": [
+      "document.querySelectorAll('[aria-hidden=true]').forEach(function(node){node.remove()})"
     ]
   },
   "rewrite": {

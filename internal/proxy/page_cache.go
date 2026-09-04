@@ -45,9 +45,9 @@ func cacheKey(target string, opt *oms.RenderOptions) string {
 	}
 	js := ""
 	if opt.JS != nil {
-		js = fmt.Sprintf("%d/%d/%d/%d/%d/%s/%d/%t/%q", opt.JS.Mode, opt.JS.WaitAfterLoadMS,
+		js = fmt.Sprintf("%d/%d/%d/%d/%d/%s/%d/%t/%q/%q", opt.JS.Mode, opt.JS.WaitAfterLoadMS,
 			opt.JS.WaitNetworkIdleMS, opt.JS.WaitDOMIdleMS, opt.JS.MaxSettleMS,
-			opt.JS.WaitSelector, opt.JS.TimeoutMS, opt.JS.RasterizeEmoji, opt.JS.Scripts)
+			opt.JS.WaitSelector, opt.JS.TimeoutMS, opt.JS.RasterizeEmoji, opt.JS.Scripts, opt.JS.FinalScripts)
 	}
 	effectiveTags, effectiveWireBytes, effectiveHeapBytes := oms.EffectivePaginationLimits(opt)
 	variant := fmt.Sprintf(

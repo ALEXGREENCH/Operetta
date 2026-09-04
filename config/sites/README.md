@@ -20,11 +20,17 @@ period:
 - `unwrapSelectors` removes wrappers while preserving their children;
 - `css` injects a final style override before the DOM snapshot.
 
+Declarative cleanup runs twice: once before settling (including
+`clickSelectors`) and once immediately before capture. The final pass does not
+repeat clicks, but it removes late-injected matches, unwraps late wrappers and
+refreshes the compatibility CSS without adding duplicate `<style>` elements.
+
 The `bake` block controls JavaScript execution and settling. Defaults are a
 minimum 1500 ms grace period, 350 ms of network quiet, 350 ms of DOM quiet and
 a maximum of 2500 ms. Event streams and media downloads do not keep the page
 open indefinitely. `scripts` is an escape hatch for sites that need custom DOM
-logic. `emojiAsImages` converts rendered emoji into tiny inline PNG images so
+logic before settling; `finalScripts` runs synchronous last-mile cleanup after
+settling. `emojiAsImages` converts rendered emoji into tiny inline PNG images so
 clients without suitable fonts can display them.
 
 See `_example.json` for all supported fields. Copy it to `<host>.json` and

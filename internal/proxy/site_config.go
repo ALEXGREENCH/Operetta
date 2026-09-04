@@ -29,6 +29,7 @@ type BakeConfig struct {
 	TimeoutMS       int      `json:"timeoutMs,omitempty"`
 	EmojiAsImages   bool     `json:"emojiAsImages,omitempty"`
 	Scripts         []string `json:"scripts,omitempty"`
+	FinalScripts    []string `json:"finalScripts,omitempty"`
 }
 
 // RewriteConfig is the declarative part of the legacy site template system.
@@ -42,7 +43,7 @@ type RewriteConfig struct {
 	CSS             string   `json:"css,omitempty"`
 }
 
-func (cfg *RewriteConfig) script() string {
+func (cfg *RewriteConfig) script(includeClicks bool) string {
 	if cfg == nil {
 		return ""
 	}
@@ -53,9 +54,13 @@ func (cfg *RewriteConfig) script() string {
 		Unwrap []string `json:"unwrap"`
 		CSS    string   `json:"css"`
 	}
+	clicks := cfg.ClickSelectors
+	if !includeClicks {
+		clicks = nil
+	}
 	data, err := json.Marshal(payload{
 		Main:   strings.TrimSpace(cfg.MainSelector),
-		Click:  cfg.ClickSelectors,
+		Click:  clicks,
 		Remove: cfg.RemoveSelectors,
 		Unwrap: cfg.UnwrapSelectors,
 		CSS:    cfg.CSS,
@@ -81,10 +86,13 @@ func (cfg *RewriteConfig) script() string {
     if (node.parentNode) node.replaceWith.apply(node, Array.prototype.slice.call(node.childNodes));
   });
   if (c.css) {
-    var style = document.createElement('style');
-    style.setAttribute('data-operetta-rewrite', '1');
+    var style = document.querySelector('style[data-operetta-rewrite="1"]');
+    if (!style) {
+      style = document.createElement('style');
+      style.setAttribute('data-operetta-rewrite', '1');
+      (document.head || document.documentElement).appendChild(style);
+    }
     style.textContent = c.css;
-    (document.head || document.documentElement).appendChild(style);
   }
 })(` + string(data) + `)`
 }
@@ -193,8 +201,11 @@ func (cfg *SiteConfig) JSOptions() *oms.JSBakingOptions {
 		}
 		js.RasterizeEmoji = cfg.Bake.EmojiAsImages
 	}
-	if rewrite := cfg.Rewrite.script(); rewrite != "" {
+	if rewrite := cfg.Rewrite.script(true); rewrite != "" {
 		js.Scripts = append(js.Scripts, rewrite)
+	}
+	if rewrite := cfg.Rewrite.script(false); rewrite != "" {
+		js.FinalScripts = append(js.FinalScripts, rewrite)
 	}
 	if cfg.Bake != nil && len(cfg.Bake.Scripts) > 0 {
 		for _, script := range cfg.Bake.Scripts {
@@ -203,7 +214,14 @@ func (cfg *SiteConfig) JSOptions() *oms.JSBakingOptions {
 			}
 		}
 	}
-	if js.Mode == oms.JSExecutionModeAuto && js.WaitAfterLoadMS == 0 && js.WaitNetworkIdleMS == 0 && js.WaitDOMIdleMS == 0 && js.MaxSettleMS == 0 && js.WaitSelector == "" && js.TimeoutMS == 0 && !js.RasterizeEmoji && len(js.Scripts) == 0 {
+	if cfg.Bake != nil && len(cfg.Bake.FinalScripts) > 0 {
+		for _, script := range cfg.Bake.FinalScripts {
+			if trimmed := strings.TrimSpace(script); trimmed != "" {
+				js.FinalScripts = append(js.FinalScripts, trimmed)
+			}
+		}
+	}
+	if js.Mode == oms.JSExecutionModeAuto && js.WaitAfterLoadMS == 0 && js.WaitNetworkIdleMS == 0 && js.WaitDOMIdleMS == 0 && js.MaxSettleMS == 0 && js.WaitSelector == "" && js.TimeoutMS == 0 && !js.RasterizeEmoji && len(js.Scripts) == 0 && len(js.FinalScripts) == 0 {
 		return nil
 	}
 	return js
