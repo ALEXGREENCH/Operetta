@@ -157,6 +157,16 @@ func TestPlaceSectionTextsIgnoresDecorativeSeparators(t *testing.T) {
 	}
 }
 
+func TestEllipsizeNativeTextFitsBanner(t *testing.T) {
+	got := ellipsizeNativeText("🎮Мини игры: Шашки, шахматы, раскраски...", 205)
+	if nativeTextWidth(got) > 205 || !strings.HasSuffix(got, "…") || !strings.Contains(got, "Мини игры") {
+		t.Fatalf("ellipsized banner = %q width=%d", got, nativeTextWidth(got))
+	}
+	if got := ellipsizeNativeText("Короткий текст", 205); got != "Короткий текст" {
+		t.Fatalf("short banner changed to %q", got)
+	}
+}
+
 func TestNativeFramesChallengeIsOnlySentOnce(t *testing.T) {
 	response := []operamini4.Frame{
 		{Type: 15, Channel: 0, Payload: make([]byte, 8)},

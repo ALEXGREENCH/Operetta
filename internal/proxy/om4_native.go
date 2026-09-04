@@ -340,14 +340,6 @@ func arrangeNativeImageRows(lines []operamini4.WelcomeLine) []operamini4.Welcome
 // into a separate row.  These rules express the same 231px layout primitives
 // that the Opera Mini 4 reference renderer emits.
 func arrangeSpacesNativePage(lines []operamini4.WelcomeLine) ([]operamini4.WelcomeLine, int) {
-	cut := len(lines)
-	for index := range lines {
-		if strings.EqualFold(strings.TrimSpace(lines[index].Text), "Тема:") {
-			cut = index
-			break
-		}
-	}
-	lines = lines[:cut]
 	for index := range lines {
 		lines[index].Background = 0
 		lines[index].BackgroundPositioned = false
@@ -372,6 +364,15 @@ func arrangeSpacesNativePage(lines []operamini4.WelcomeLine) ([]operamini4.Welco
 		line.BackgroundX, line.BackgroundY = x, y
 		line.BackgroundWidth, line.BackgroundHeight = width, height
 		line.BackgroundPositioned = true
+	}
+	placeLink := func(index, x, y, width, height int) {
+		if index < 0 || index >= len(lines) {
+			return
+		}
+		line := &lines[index]
+		line.LinkX, line.LinkY = x, y
+		line.LinkWidth, line.LinkHeight = width, height
+		line.LinkPositioned = true
 	}
 	textIndex := func(value string) int {
 		for index := range lines {
@@ -420,6 +421,7 @@ func arrangeSpacesNativePage(lines []operamini4.WelcomeLine) ([]operamini4.Welco
 	blogs, videos := sectionIndex("Блоги"), sectionIndex("Популярные видео")
 	communities, games := sectionIndex("Интересные сообщества"), sectionIndex("Популярные игры")
 	seo := sectionIndex("Spaces — твой мир свободы и вдохновения!")
+	theme := sectionIndex("Тема:")
 
 	// Top banner, logo, session links and centered status.
 	topImages := imagesBetween(0, ai)
@@ -433,9 +435,17 @@ func arrangeSpacesNativePage(lines []operamini4.WelcomeLine) ([]operamini4.Welco
 	if len(topImages) > 2 {
 		place(topImages[len(topImages)-1], 5, 150, 16, 17)
 	}
-	if index := textIndex("✨ Новый AI-сервис: Оживление фото🪄"); index >= 0 {
-		lines[index].Text = "✨ Новый AI-сервис: Оживление"
-		place(index, 19, 2, 176, 14)
+	promo := -1
+	for index := 0; index < ai && index < len(lines); index++ {
+		text := strings.TrimSpace(strings.ReplaceAll(lines[index].Text, "\n", " "))
+		if lines[index].URL != "" && len([]rune(text)) > 12 && text != "Регистрация" {
+			promo = index
+			break
+		}
+	}
+	if promo >= 0 {
+		lines[promo].Text = ellipsizeNativeText(lines[promo].Text, 205)
+		place(promo, 2, 2, 205, 14)
 	}
 	placeText("Вход", 126, 33, 26, 14)
 	placeText("|", 155, 33, 3, 14)
@@ -480,6 +490,9 @@ func arrangeSpacesNativePage(lines []operamini4.WelcomeLine) ([]operamini4.Welco
 	// AI/video tiles, navigation icons and photo tiles.
 	aiImages := imagesBetween(ai+1, photos)
 	placeImages(aiImages, [][4]int{{3, 171, 76, 53}, {81, 171, 76, 53}, {5, 240, 16, 16}, {5, 266, 16, 16}, {5, 292, 16, 16}, {5, 318, 17, 16}, {5, 344, 16, 16}, {5, 370, 16, 16}, {5, 396, 16, 15}, {5, 422, 16, 16}})
+	for index := 2; index < len(aiImages) && index < 10; index++ {
+		placeLink(aiImages[index], 2, 237+(index-2)*26, 227, 24)
+	}
 	for index, item := range []string{"Зона обмена", "Музыка", "Люди", "Сообщества", "Знакомства", "Форум", "Чат", "Онлайн-Игры"} {
 		placeText(item, 24, 241+index*26, 190, 14)
 	}
@@ -525,7 +538,11 @@ func arrangeSpacesNativePage(lines []operamini4.WelcomeLine) ([]operamini4.Welco
 		lines[seo].Color, lines[seo].Font = 0xff323232, 1
 		place(seo, 16, 1693, 199, 28)
 		y := 1726
-		for index := seo + 1; index < len(lines); index++ {
+		seoEnd := len(lines)
+		if theme > seo {
+			seoEnd = theme
+		}
+		for index := seo + 1; index < seoEnd; index++ {
 			text := strings.TrimSpace(strings.ReplaceAll(lines[index].Text, "\n", " "))
 			if text == "" || text == "Зарегистрироваться" || isSpacesFooterText(text) || len(lines[index].Image) > 0 {
 				continue
@@ -554,8 +571,10 @@ func arrangeSpacesNativePage(lines []operamini4.WelcomeLine) ([]operamini4.Welco
 	place(register, 66, registerY, 158, 14)
 	if register > 0 && len(lines[register-1].Image) > 0 {
 		place(register-1, 47, registerY-1, 16, 16)
+		placeLink(register-1, 2, registerY-4, 227, 23)
 	}
 	footerX, footerY := 1, registerY+35
+	footerStartY := footerY
 	footerBackgroundSet := false
 	for _, value := range []string{"Контакты", "·", "О нас", "Реклама", "Правила", "Тех.поддержка"} {
 		index := textIndex(value)
@@ -574,11 +593,50 @@ func arrangeSpacesNativePage(lines []operamini4.WelcomeLine) ([]operamini4.Welco
 		} else {
 			lines[index].Background = 0
 		}
+		switch value {
+		case "Контакты":
+			placeLink(index, 2, footerStartY+1, 50, 12)
+		case "О нас":
+			placeLink(index, 63, footerStartY+1, 29, 12)
+		case "Реклама":
+			placeLink(index, 103, footerStartY+1, 45, 12)
+		case "Правила":
+			placeLink(index, 159, footerStartY+1, 46, 12)
+		case "Тех.поддержка":
+			placeLink(index, 2, footerStartY+15, 79, 12)
+		}
 		footerX += width + 6
 	}
 
+	// Theme and client-version controls are compact inline rows in the OM4
+	// reference output. Keep their real anchors and the two footer badges so
+	// keyboard navigation reaches everything visible at the bottom of Spaces.
+	themeY := registerY + 71
+	placeText("Тема:", 2, themeY, 35, 14)
+	placeText("Светлая", 40, themeY, 48, 14)
+	placeText("|", 89, themeY, 3, 14)
+	darkTheme := placeText("Тёмная", 94, themeY, 38, 14)
+	placeLink(darkTheme, 94, themeY, 38, 12)
+	versionY := themeY + 19
+	placeText("Версия:", 2, versionY, 46, 14)
+	placeText("Mobile", 51, versionY, 40, 14)
+	placeText("|", 93, versionY, 3, 14)
+	lite := placeText("Lite", 98, versionY, 20, 14)
+	placeLink(lite, 98, versionY+1, 20, 12)
+	placeText("|", 120, versionY, 3, 14)
+	footerImages := imagesBetween(theme, len(lines))
+	if len(footerImages) > 0 {
+		place(footerImages[0], 126, versionY, 14, 14)
+		placeLink(footerImages[0], 126, versionY, 14, 14)
+	}
+	if len(footerImages) > 1 {
+		place(footerImages[1], 80, versionY+21, 72, 25)
+		placeLink(footerImages[1], 80, versionY+21, 70, 23)
+	}
+
+	documentHeight := max(2520, versionY+67)
 	result := []operamini4.WelcomeLine{
-		nativeBackgroundBlock(0, 32, 231, max(2488, footerY+47-32), 0xfff5f5f5),
+		nativeBackgroundBlock(0, 32, 231, documentHeight-32, 0xfff5f5f5),
 		nativeBackgroundBlock(1, 146, 229, 40, 0xffffffff),
 		nativeBackgroundBlock(1, 169, 229, 274, 0xffffffff),
 		nativeBackgroundBlock(1, 473, 229, 83, 0xffffffff),
@@ -594,7 +652,7 @@ func arrangeSpacesNativePage(lines []operamini4.WelcomeLine) ([]operamini4.Welco
 			result = append(result, lines[index])
 		}
 	}
-	return result, max(2520, footerY+47)
+	return result, documentHeight
 }
 
 func nativeBackgroundBlock(x, y, width, height int, color uint32) operamini4.WelcomeLine {
@@ -682,6 +740,18 @@ func nativeTextWidth(value string) int {
 		}
 	}
 	return max(3, width)
+}
+
+func ellipsizeNativeText(value string, maxWidth int) string {
+	value = strings.Join(strings.Fields(value), " ")
+	if nativeTextWidth(value) <= maxWidth {
+		return value
+	}
+	runes := []rune(value)
+	for len(runes) > 0 && nativeTextWidth(string(runes)+"…") > maxWidth {
+		runes = runes[:len(runes)-1]
+	}
+	return strings.TrimSpace(string(runes)) + "…"
 }
 
 func om4CookieJarKey(request *http.Request, session *operamini4.SessionRequest) string {

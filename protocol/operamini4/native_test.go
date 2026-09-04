@@ -189,3 +189,23 @@ func TestNativeWelcomeMergesFragmentsOfOneSourceLink(t *testing.T) {
 		t.Fatalf("merged link=%+v, want 5,20 209x16", links[0])
 	}
 }
+
+func TestNativeWelcomeUsesExplicitLinkBounds(t *testing.T) {
+	page, err := BuildWelcomePage(WelcomePage{
+		Lines: []WelcomeLine{{
+			Text: "Chat", URL: "https://example.test/chat", X: 24, Y: 21, Width: 190, Height: 14, Positioned: true, Absolute: true,
+			LinkX: 2, LinkY: 17, LinkWidth: 227, LinkHeight: 24, LinkPositioned: true,
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	header, err := DecodePageHeader(page)
+	if err != nil {
+		t.Fatal(err)
+	}
+	links := DecodeLinkElements(page, header.ContentOffset)
+	if len(links) != 1 || links[0].X != 2 || links[0].Y != 17 || links[0].Width != 227 || links[0].Height != 24 {
+		t.Fatalf("links=%+v, want explicit 2,17 227x24 bounds", links)
+	}
+}

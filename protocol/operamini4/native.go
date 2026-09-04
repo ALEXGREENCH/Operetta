@@ -33,6 +33,11 @@ type WelcomeLine struct {
 	// anchor. OM4 exposes one focus target for the whole anchor even when it
 	// contains both an icon and text. Zero keeps the legacy one-line behavior.
 	LinkGroup            int
+	LinkX                int
+	LinkY                int
+	LinkWidth            int
+	LinkHeight           int
+	LinkPositioned       bool
 	Image                []byte
 	Width                int
 	X                    int
@@ -122,19 +127,23 @@ func BuildWelcomePage(spec WelcomePage) ([]byte, error) {
 		if line.URL == "" {
 			continue
 		}
+		linkX, linkY, linkWidth, linkHeight := positioned.x, positioned.y, positioned.width, positioned.height
+		if line.LinkPositioned {
+			linkX, linkY, linkWidth, linkHeight = line.LinkX, line.LinkY, line.LinkWidth, line.LinkHeight
+		}
 		if line.LinkGroup > 0 {
 			if index, ok := groupIndexes[line.LinkGroup]; ok && links[index].url == line.URL {
-				left := min(links[index].x, positioned.x)
-				top := min(links[index].y, positioned.y)
-				right := max(links[index].x+links[index].width, positioned.x+positioned.width)
-				bottom := max(links[index].y+links[index].height, positioned.y+positioned.height)
+				left := min(links[index].x, linkX)
+				top := min(links[index].y, linkY)
+				right := max(links[index].x+links[index].width, linkX+linkWidth)
+				bottom := max(links[index].y+links[index].height, linkY+linkHeight)
 				links[index].x, links[index].y = left, top
 				links[index].width, links[index].height = right-left, bottom-top
 				continue
 			}
 			groupIndexes[line.LinkGroup] = len(links)
 		}
-		links = append(links, linkPosition{x: positioned.x, y: positioned.y, width: positioned.width, height: positioned.height, url: line.URL})
+		links = append(links, linkPosition{x: linkX, y: linkY, width: linkWidth, height: linkHeight, url: line.URL})
 	}
 	if len(links) > 0 {
 		var interactions bytes.Buffer
