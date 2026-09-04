@@ -165,6 +165,7 @@ participate in the page-cache key.
 ## Debugging and Tooling
 - **Log dumps.** `OMS_DEBUG_DUMP=1` enables binary OMS head dumps; they are disabled by default.
 - **Validator.** With `OMS_ENABLE_DIAGNOSTICS=1`, `/validate?url=...` renders full and compact variants, runs `analyzeOMS`, and reports parser status, tag counts, pagination data, sampled text/links, and parsed form metadata in JSON.
+- **OM4 visual comparison.** `cmd/om4compare` writes `report.html` beside its JSON and frame artifacts. The self-contained report renders official and local scenes side by side, embeds their inline images, synchronizes scrolling and toggles focus rectangles.
 - **Index helper.** The `GET /` HTML form (`indexHTML`) lets you test the server manually without Opera Mini.
 - **Image tracing.** Set `OMS_IMG_DEBUG=1` to log cache hits/misses and conversion issues while fetching images.
 - **OMPD smoke.** `docs/ompd-smoke-checklist.md` defines the manual acceptance loop for the browser extension viewer at the target `240x320` profile.

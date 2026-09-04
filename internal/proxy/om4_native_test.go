@@ -126,7 +126,7 @@ func TestResolveNativeURLStripsLegacyOMSNavigationPrefix(t *testing.T) {
 }
 
 func TestSpacesMobileHostSurvivesWorldRedirects(t *testing.T) {
-	for _, host := range []string{"world82.spcs.bio", "WORLD83.SPCS.BIO", "world1.spcs.bio"} {
+	for _, host := range []string{"world83.spcs.bio", "WORLD82.SPCS.BIO", "world1.spcs.bio"} {
 		if !isSpacesMobileHost(host) {
 			t.Fatalf("Spaces mobile host not recognized: %q", host)
 		}

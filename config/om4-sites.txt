@@ -1,7 +1,7 @@
 # Required regression sites.
-https://world82.spcs.bio/
-https://world82.spcs.bio/sz/
-https://world82.spcs.bio/registration/loginform/
+https://world83.spcs.bio/
+https://world83.spcs.bio/sz/
+https://world83.spcs.bio/registration/loginform/
 https://sefan.ru/
 https://www.opennet.ru/
 

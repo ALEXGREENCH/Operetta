@@ -287,7 +287,9 @@ func (s *Server) renderNativeOrigin(ctx context.Context, target string, jar http
 	}
 	if parsed, parseErr := url.Parse(effectiveURL); parseErr == nil && isSpacesMobileHost(parsed.Hostname()) {
 		lines, documentHeight = arrangeSpacesNativePage(lines)
-		if searchIcon := fetchNativeAsset(ctx, "http://world82.spcs.bio/i/search_icon.png?r=1", headers); len(searchIcon) > 0 && len(searchIcon) <= 0xffff {
+		assetURL := *parsed
+		assetURL.Path, assetURL.RawPath, assetURL.RawQuery, assetURL.Fragment = "/i/search_icon.png", "", "r=1", ""
+		if searchIcon := fetchNativeAsset(ctx, assetURL.String(), headers); len(searchIcon) > 0 && len(searchIcon) <= 0xffff {
 			lines = append(lines, operamini4.WelcomeLine{
 				Image: searchIcon, Width: 16, Height: 16, X: 212, Y: 121,
 				Positioned: true, Absolute: true, Background: 0xffffffff,

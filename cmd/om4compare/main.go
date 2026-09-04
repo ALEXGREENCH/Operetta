@@ -80,6 +80,8 @@ type comparison struct {
 	NextRequestToken    []byte   `json:"-"`
 	NextNativeLinkID    string   `json:"-"`
 	NextNativeToken     []byte   `json:"-"`
+	referenceVisual     *visualScene
+	nativeVisual        *visualScene
 }
 
 type exchangeFunc func(context.Context, *operamini4.SessionRequest) ([]operamini4.Frame, error)
@@ -199,6 +201,7 @@ func main() {
 	data, err := json.MarshalIndent(report, "", "  ")
 	check(err)
 	check(os.WriteFile(filepath.Join(*outDir, "report.json"), append(data, '\n'), 0o600))
+	check(writeVisualReport(filepath.Join(*outDir, "report.html"), report))
 }
 
 func compare(target string, request *operamini4.SessionRequest, reference exchangeFunc, localRequest *operamini4.SessionRequest, local exchangeFunc, outDir string, timeout time.Duration, upstreamUA string) comparison {
@@ -228,6 +231,7 @@ func compare(target string, request *operamini4.SessionRequest, reference exchan
 			result.ReferenceError = decodeErr.Error()
 		} else {
 			referenceDocument = document
+			result.referenceVisual = buildVisualScene(document)
 			result.ReferenceURL = document.Header.URL
 			result.ReferenceTitle = document.Header.Title
 			result.ReferenceRecords = len(document.Records)
@@ -263,6 +267,7 @@ func compare(target string, request *operamini4.SessionRequest, reference exchan
 			result.NativeError = decodeErr.Error()
 		} else {
 			nativeDocument = document
+			result.nativeVisual = buildVisualScene(document)
 			result.NativeURL = document.Header.URL
 			result.NativeTitle = document.Header.Title
 			result.NativeRecords = len(document.Records)

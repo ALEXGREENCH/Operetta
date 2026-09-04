@@ -108,7 +108,9 @@ document-height deltas and per-side duration. If the official endpoint is
 temporarily unavailable, native collection continues; pass `-require-reference`
 to retain fail-fast behavior. Scene links drop wire-only `0/`/`1/` prefixes and
 leading NUL; relative targets are resolved through the document base URL while
-query parameters remain intact.
+query parameters remain intact. `report.html` is a self-contained visual
+comparison: it renders both drawing streams with their actual embedded images,
+synchronizes scrolling and can overlay every keyboard-focus rectangle.
 
 `cmd/om4probe` can replay a complete captured OM4 wire request against a
 reference endpoint for isolated protocol analysis. Corpus frame files are the

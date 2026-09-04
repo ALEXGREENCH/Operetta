@@ -115,6 +115,38 @@ func TestWriteComparisonSceneReportsWriteError(t *testing.T) {
 	}
 }
 
+func TestWriteVisualReportEmbedsScenesAndImagesSafely(t *testing.T) {
+	document := &operamini4.ApplicationDocument{
+		Header: operamini4.PageHeader{ViewportWidth: 231, DocumentHeight: 320, URL: "http://example.test/"},
+		Page:   []byte{0, 4, 0xff, 0xd8, 0xff, 0xd9},
+		Drawings: []operamini4.DrawingElement{
+			{Kind: 'B', X: 0, Y: 0, Width: 231, Height: 320, Color: 0xffffffff},
+			{Kind: 'T', X: 2, Y: 4, Width: 80, Height: 14, Color: 0xff000000, Text: "hello"},
+			{Kind: 'I', X: 2, Y: 20, Width: 8, Height: 8, ImagePointer: 0},
+		},
+		Links: []operamini4.LinkElement{{X: 1, Y: 1, Width: 90, Height: 24, URL: "http://example.test/next"}},
+	}
+	visual := buildVisualScene(document)
+	path := filepath.Join(t.TempDir(), "report.html")
+	evil := "https://example.test/</script><script>alert(1)</script>"
+	if err := writeVisualReport(path, []comparison{{RequestedURL: evil, ReferenceTextCount: 1, ReferenceLinks: 1, referenceVisual: visual, nativeVisual: visual}}); err != nil {
+		t.Fatalf("writeVisualReport: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	html := string(data)
+	for _, expected := range []string{"Operetta OM4 visual comparison", "sky.scene.v1", "data:image/jpeg;base64,", "focus regions"} {
+		if !strings.Contains(html, expected) {
+			t.Fatalf("visual report missing %q", expected)
+		}
+	}
+	if strings.Contains(html, "</script><script>alert(1)</script>") {
+		t.Fatal("untrusted URL escaped the embedded JSON script")
+	}
+}
+
 func TestTemplateLoadersFallBackToEmbeddedStartup(t *testing.T) {
 	corpusDir := t.TempDir()
 	startup, err := loadStartupRequest("", corpusDir)
