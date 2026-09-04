@@ -73,7 +73,7 @@ func BuildWelcomePage(spec WelcomePage) ([]byte, error) {
 	}
 
 	positionedLines, documentHeight := positionWelcomeLines(spec.Lines)
-	if spec.DocumentHeight > documentHeight {
+	if spec.DocumentHeight > 0 {
 		documentHeight = spec.DocumentHeight
 	}
 	if documentHeight < 282 {

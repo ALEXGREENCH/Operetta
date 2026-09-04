@@ -280,7 +280,7 @@ func (s *Server) renderNativeOrigin(ctx context.Context, target string, jar http
 	if effectiveURL == "" {
 		effectiveURL = target
 	}
-	if parsed, parseErr := url.Parse(effectiveURL); parseErr == nil && strings.EqualFold(parsed.Hostname(), "world82.spcs.bio") {
+	if parsed, parseErr := url.Parse(effectiveURL); parseErr == nil && isSpacesMobileHost(parsed.Hostname()) {
 		lines = arrangeSpacesNativePage(lines)
 		if searchIcon := fetchNativeAsset(ctx, "http://world82.spcs.bio/i/search_icon.png?r=1", headers); len(searchIcon) > 0 && len(searchIcon) <= 0xffff {
 			lines = append(lines, operamini4.WelcomeLine{
@@ -295,6 +295,16 @@ func (s *Server) renderNativeOrigin(ctx context.Context, target string, jar http
 	return nativeOriginPage{
 		Title: title, Base: effectiveURL, URL: effectiveURL, DocumentHeight: documentHeight, HideAccent: documentHeight > 0, Background: background, Accent: linkColor, Lines: lines,
 	}, nil
+}
+
+func isSpacesMobileHost(host string) bool {
+	host = strings.ToLower(strings.TrimSpace(host))
+	label := strings.TrimSuffix(host, ".spcs.bio")
+	if label == host || !strings.HasPrefix(label, "world") || strings.Contains(label, ".") {
+		return false
+	}
+	number := strings.TrimPrefix(label, "world")
+	return number != "" && onlyASCIIDigits(number)
 }
 
 func arrangeNativeImageRows(lines []operamini4.WelcomeLine) []operamini4.WelcomeLine {

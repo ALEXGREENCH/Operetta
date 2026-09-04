@@ -145,3 +145,23 @@ func TestNativeWelcomeAbsoluteImageAndBackgroundGeometry(t *testing.T) {
 		t.Fatalf("absolute geometry: background=%+v image=%+v", background, image)
 	}
 }
+
+func TestNativeWelcomeDocumentHeightIsExactOverride(t *testing.T) {
+	page, err := BuildWelcomePage(WelcomePage{
+		DocumentHeight: 400,
+		Lines: []WelcomeLine{{
+			Text: "positioned beyond logical page", X: 0, Y: 900,
+			Width: 200, Height: 100, Positioned: true, Absolute: true,
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	header, err := DecodePageHeader(page)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if header.DocumentHeight != 400 {
+		t.Fatalf("document height = %d, want exact override 400", header.DocumentHeight)
+	}
+}

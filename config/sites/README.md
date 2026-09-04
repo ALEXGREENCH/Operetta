@@ -5,6 +5,10 @@ directory. For `m.example.com`, it tries `m.example.com.json`, then
 `example.com.json`, then `com.json`. Set `OMS_SITES_DIR` to use another
 directory.
 
+Files are re-read when their size or modification time changes, so templates
+can be tuned while the server is running. Removing a file also takes effect on
+the next request.
+
 The `rewrite` block is the declarative successor to Opera Mini's per-site
 replacer templates. The same acquisition stage feeds legacy OMS and native
 OM4. It runs in Chromium after the page is loaded and before the bounded settle

@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"time"
 
 	"operetta/oms"
 )
@@ -91,13 +92,19 @@ func (cfg *RewriteConfig) script() string {
 type siteConfigStore struct {
 	dir   string
 	mu    sync.RWMutex
-	cache map[string]*SiteConfig
+	cache map[string]siteConfigCacheEntry
+}
+
+type siteConfigCacheEntry struct {
+	config  *SiteConfig
+	modTime time.Time
+	size    int64
 }
 
 func newSiteConfigStore(dir string) *siteConfigStore {
 	return &siteConfigStore{
 		dir:   dir,
-		cache: make(map[string]*SiteConfig),
+		cache: make(map[string]siteConfigCacheEntry),
 	}
 }
 
@@ -110,26 +117,13 @@ func (s *siteConfigStore) Find(target string) *SiteConfig {
 	if host == "" {
 		return nil
 	}
-	s.mu.RLock()
-	if cfg, ok := s.cache[host]; ok {
-		s.mu.RUnlock()
-		return cfg
-	}
-	s.mu.RUnlock()
-
 	labels := strings.Split(host, ".")
 	for i := 0; i < len(labels); i++ {
 		candidate := strings.Join(labels[i:], ".")
 		if cfg := s.load(candidate); cfg != nil {
-			s.mu.Lock()
-			s.cache[host] = cfg
-			s.mu.Unlock()
 			return cfg
 		}
 	}
-	s.mu.Lock()
-	s.cache[host] = nil
-	s.mu.Unlock()
 	return nil
 }
 
@@ -138,16 +132,36 @@ func (s *siteConfigStore) load(host string) *SiteConfig {
 		return nil
 	}
 	path := filepath.Join(s.dir, host+".json")
+	info, err := os.Stat(path)
+	if err != nil {
+		s.mu.Lock()
+		delete(s.cache, host)
+		s.mu.Unlock()
+		return nil
+	}
+	s.mu.RLock()
+	entry, ok := s.cache[host]
+	s.mu.RUnlock()
+	if ok && entry.size == info.Size() && entry.modTime.Equal(info.ModTime()) {
+		return entry.config
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil
 	}
 	var cfg SiteConfig
 	if err := json.Unmarshal(data, &cfg); err != nil {
+		s.mu.Lock()
+		s.cache[host] = siteConfigCacheEntry{modTime: info.ModTime(), size: info.Size()}
+		s.mu.Unlock()
 		return nil
 	}
 	cfg.Mode = strings.TrimSpace(strings.ToLower(cfg.Mode))
-	return &cfg
+	result := &cfg
+	s.mu.Lock()
+	s.cache[host] = siteConfigCacheEntry{config: result, modTime: info.ModTime(), size: info.Size()}
+	s.mu.Unlock()
+	return result
 }
 
 func (cfg *SiteConfig) JSOptions() *oms.JSBakingOptions {

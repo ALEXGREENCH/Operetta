@@ -117,6 +117,19 @@ func TestResolveNativeURLStripsLegacyOMSNavigationPrefix(t *testing.T) {
 	}
 }
 
+func TestSpacesMobileHostSurvivesWorldRedirects(t *testing.T) {
+	for _, host := range []string{"world82.spcs.bio", "WORLD83.SPCS.BIO", "world1.spcs.bio"} {
+		if !isSpacesMobileHost(host) {
+			t.Fatalf("Spaces mobile host not recognized: %q", host)
+		}
+	}
+	for _, host := range []string{"spcs.bio", "world.spcs.bio", "evilworld83.spcs.bio", "world83.example.com"} {
+		if isSpacesMobileHost(host) {
+			t.Fatalf("non-Spaces host recognized: %q", host)
+		}
+	}
+}
+
 func TestNativeFramesChallengeIsOnlySentOnce(t *testing.T) {
 	response := []operamini4.Frame{
 		{Type: 15, Channel: 0, Payload: make([]byte, 8)},
