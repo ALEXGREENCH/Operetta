@@ -128,7 +128,7 @@ func analyzeOMS(b []byte) omsAnalysis {
 	}
 	out.TagsHead = string(buf)
 
-	sampleKeys := []byte{'T', 'L', 'E', 'B', '+', 'V', 'D', 'S', 'R', 'k', 'h', 'x', 'p', 'u', 'i', 'b', 'e', 'c', 'r', 's', 'o', 'Q'}
+	sampleKeys := []byte{'T', 'L', 'E', 'B', '+', 'V', 'D', 'S', 'R', 'I', 'J', 'k', 'h', 'x', 'p', 'u', 'i', 'b', 'e', 'c', 'r', 's', 'o', 'Q'}
 	for _, k := range sampleKeys {
 		if v, ok := counts[k]; ok && v > 0 {
 			out.Counts[string([]byte{k})] = v

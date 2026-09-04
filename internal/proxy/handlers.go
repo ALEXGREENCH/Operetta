@@ -1044,6 +1044,18 @@ func applyJSOptionsFromQuery(opt *oms.RenderOptions, q url.Values) {
 			js.WaitNetworkIdleMS = n
 		}
 	}
+	if idle := strings.TrimSpace(q.Get("js_dom_idle")); idle != "" {
+		if n, err := strconv.Atoi(idle); err == nil && n >= 0 {
+			js := ensureJSOptions(opt)
+			js.WaitDOMIdleMS = n
+		}
+	}
+	if settle := strings.TrimSpace(q.Get("js_settle")); settle != "" {
+		if n, err := strconv.Atoi(settle); err == nil && n >= 0 {
+			js := ensureJSOptions(opt)
+			js.MaxSettleMS = n
+		}
+	}
 	if sel := strings.TrimSpace(q.Get("js_selector")); sel != "" {
 		js := ensureJSOptions(opt)
 		js.WaitSelector = sel
@@ -1052,6 +1064,12 @@ func applyJSOptionsFromQuery(opt *oms.RenderOptions, q url.Values) {
 		if n, err := strconv.Atoi(to); err == nil && n >= 0 {
 			js := ensureJSOptions(opt)
 			js.TimeoutMS = n
+		}
+	}
+	if raw := strings.TrimSpace(q.Get("js_emoji")); raw != "" {
+		if enabled, ok := parseOperaBool(raw); ok {
+			js := ensureJSOptions(opt)
+			js.RasterizeEmoji = enabled
 		}
 	}
 	if scripts := q["js_script"]; len(scripts) > 0 {
@@ -1086,6 +1104,18 @@ func applyJSOptionsFromParams(opt *oms.RenderOptions, params map[string]string) 
 			js.WaitNetworkIdleMS = n
 		}
 	}
+	if idle := strings.TrimSpace(params["js_dom_idle"]); idle != "" {
+		if n, err := strconv.Atoi(idle); err == nil && n >= 0 {
+			js := ensureJSOptions(opt)
+			js.WaitDOMIdleMS = n
+		}
+	}
+	if settle := strings.TrimSpace(params["js_settle"]); settle != "" {
+		if n, err := strconv.Atoi(settle); err == nil && n >= 0 {
+			js := ensureJSOptions(opt)
+			js.MaxSettleMS = n
+		}
+	}
 	if sel := strings.TrimSpace(params["js_selector"]); sel != "" {
 		js := ensureJSOptions(opt)
 		js.WaitSelector = sel
@@ -1094,6 +1124,12 @@ func applyJSOptionsFromParams(opt *oms.RenderOptions, params map[string]string) 
 		if n, err := strconv.Atoi(to); err == nil && n >= 0 {
 			js := ensureJSOptions(opt)
 			js.TimeoutMS = n
+		}
+	}
+	if raw := strings.TrimSpace(params["js_emoji"]); raw != "" {
+		if enabled, ok := parseOperaBool(raw); ok {
+			js := ensureJSOptions(opt)
+			js.RasterizeEmoji = enabled
 		}
 	}
 	if script := strings.TrimSpace(params["js_script"]); script != "" {
@@ -1123,11 +1159,20 @@ func mergeJSOptions(base, override *oms.JSBakingOptions) *oms.JSBakingOptions {
 		if override.WaitNetworkIdleMS > 0 {
 			result.WaitNetworkIdleMS = override.WaitNetworkIdleMS
 		}
+		if override.WaitDOMIdleMS > 0 {
+			result.WaitDOMIdleMS = override.WaitDOMIdleMS
+		}
+		if override.MaxSettleMS > 0 {
+			result.MaxSettleMS = override.MaxSettleMS
+		}
 		if override.WaitSelector != "" {
 			result.WaitSelector = override.WaitSelector
 		}
 		if override.TimeoutMS > 0 {
 			result.TimeoutMS = override.TimeoutMS
+		}
+		if override.RasterizeEmoji {
+			result.RasterizeEmoji = true
 		}
 		if len(override.Scripts) > 0 {
 			result.Scripts = append(result.Scripts, override.Scripts...)
@@ -1136,8 +1181,11 @@ func mergeJSOptions(base, override *oms.JSBakingOptions) *oms.JSBakingOptions {
 	if result.Mode == oms.JSExecutionModeAuto &&
 		result.WaitAfterLoadMS == 0 &&
 		result.WaitNetworkIdleMS == 0 &&
+		result.WaitDOMIdleMS == 0 &&
+		result.MaxSettleMS == 0 &&
 		result.WaitSelector == "" &&
 		result.TimeoutMS == 0 &&
+		!result.RasterizeEmoji &&
 		len(result.Scripts) == 0 {
 		return nil
 	}
@@ -1156,8 +1204,11 @@ func shouldUseJS(opts *oms.JSBakingOptions) bool {
 	case oms.JSExecutionModeAuto:
 		if opts.WaitAfterLoadMS > 0 ||
 			opts.WaitNetworkIdleMS > 0 ||
+			opts.WaitDOMIdleMS > 0 ||
+			opts.MaxSettleMS > 0 ||
 			opts.WaitSelector != "" ||
 			opts.TimeoutMS > 0 ||
+			opts.RasterizeEmoji ||
 			len(opts.Scripts) > 0 {
 			return true
 		}

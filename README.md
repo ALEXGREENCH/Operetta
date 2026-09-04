@@ -121,7 +121,7 @@ Operetta can be configured via environment variables or programmatically through
 | `PORT` | Overrides the listen port for `cmd/operetta` (falls back to `-addr`). |
 | `OMS_BOOKMARKS_MODE` | `remote/pass/passthrough` keeps Opera’s portal; anything else serves the local list. |
 | `OMS_BOOKMARKS` | Comma-separated `title|url` pairs for the local bookmark page. |
-| `OMS_SITES_DIR` | Directory with per-host JSON overrides (`mode`, custom headers). Defaults to `config/sites`. |
+| `OMS_SITES_DIR` | Directory with per-host JSON overrides (mode, headers, JS baking and legacy rewrites). Defaults to `config/sites`. |
 | `OMS_IMG_CACHE_DIR` / `OMS_IMG_CACHE_MB` | On-disk image cache location and size. |
 | `OMS_TAGCOUNT_MODE` / `OMS_TAGCOUNT_DELTA` | Tweaks for legacy OMS tag-count compatibility. |
 | `OMS_ENABLE_DIAGNOSTICS` | `1` enables the network-capable `/validate` diagnostic endpoint; disabled by default. |
@@ -129,6 +129,24 @@ Operetta can be configured via environment variables or programmatically through
 | `OMS_OM4_OFFICIAL_URL` | Overrides the official endpoint used by explicit plaintext-bridge requests. |
 | `OMS_OM4_STARTUP_REQUEST` | Optional encrypted `.bin` or decrypted `.frames.bin` startup template override. |
 | `OMS_OM4_CORPUS_DIR` | Saves decrypted OM4 request/response frame pairs for renderer research. |
+
+JavaScript baking and site templates
+------------------------------------
+
+Files in `config/sites` provide a small declarative replacer/template layer for
+modern pages before they are converted to OMS. A template can click controls,
+keep the useful page subtree, remove or unwrap elements, inject compatibility
+CSS and run custom JavaScript. Page capture waits for both network and DOM
+quiet, with a bounded 1.5–2.5 second default grace period so long polls do not
+stall feature-phone requests. Optional `emojiAsImages` turns emoji glyphs into
+small inline PNGs before the OMS renderer sees the page.
+
+For one-off diagnostics, the same controls are available as request parameters:
+`js=on`, `js_wait`, `js_idle`, `js_dom_idle`, `js_settle`, `js_timeout`,
+`js_selector` and `js_emoji=1`. See
+[`config/sites/README.md`](config/sites/README.md) and
+[`config/sites/_example.json`](config/sites/_example.json) for the complete
+per-host format.
 
 Embedding example:
 

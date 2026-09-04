@@ -1,0 +1,25 @@
+{
+  "headers": {
+    "Accept-Language": "ru-RU,ru;q=0.9"
+  },
+  "bake": {
+    "mode": "on",
+    "waitAfterLoadMs": 1500,
+    "waitIdleMs": 350,
+    "waitDomIdleMs": 350,
+    "maxSettleMs": 2500,
+    "waitSelector": "main",
+    "timeoutMs": 25000,
+    "emojiAsImages": true,
+    "scripts": [
+      "document.documentElement.classList.add('operetta-legacy')"
+    ]
+  },
+  "rewrite": {
+    "clickSelectors": ["button.load-more"],
+    "mainSelector": "main",
+    "removeSelectors": ["script", "noscript", ".advert", ".cookie-banner"],
+    "unwrapSelectors": [".layout-wrapper"],
+    "css": "main{display:block!important}"
+  }
+}

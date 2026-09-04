@@ -1469,8 +1469,11 @@ type JSBakingOptions struct {
 	Mode              JSExecutionMode
 	WaitAfterLoadMS   int
 	WaitNetworkIdleMS int
+	WaitDOMIdleMS     int
+	MaxSettleMS       int
 	WaitSelector      string
 	TimeoutMS         int
+	RasterizeEmoji    bool
 	Scripts           []string
 }
 

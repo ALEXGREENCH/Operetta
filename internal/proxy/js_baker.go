@@ -26,6 +26,112 @@ type jsBaker struct {
 	logger    *log.Logger
 }
 
+type jsSettlePlan struct {
+	minimum     time.Duration
+	networkIdle time.Duration
+	domIdle     time.Duration
+	maximum     time.Duration
+}
+
+func makeJSSettlePlan(opts *oms.JSBakingOptions) jsSettlePlan {
+	plan := jsSettlePlan{
+		minimum:     1500 * time.Millisecond,
+		networkIdle: 350 * time.Millisecond,
+		domIdle:     350 * time.Millisecond,
+		maximum:     2500 * time.Millisecond,
+	}
+	if opts == nil {
+		return plan
+	}
+	if opts.WaitAfterLoadMS > 0 {
+		plan.minimum = time.Duration(opts.WaitAfterLoadMS) * time.Millisecond
+	}
+	if opts.WaitNetworkIdleMS > 0 {
+		plan.networkIdle = time.Duration(opts.WaitNetworkIdleMS) * time.Millisecond
+	}
+	if opts.WaitDOMIdleMS > 0 {
+		plan.domIdle = time.Duration(opts.WaitDOMIdleMS) * time.Millisecond
+	}
+	if opts.MaxSettleMS > 0 {
+		plan.maximum = time.Duration(opts.MaxSettleMS) * time.Millisecond
+	}
+	if plan.maximum < plan.minimum {
+		plan.maximum = plan.minimum
+	}
+	return plan
+}
+
+func trackForPageSettle(resourceType network.ResourceType) bool {
+	switch resourceType {
+	case network.ResourceTypeEventSource, network.ResourceTypeMedia:
+		return false
+	default:
+		return true
+	}
+}
+
+const mutationObserverScript = `(function () {
+  window.__operettaLastMutation = Date.now();
+  if (window.__operettaMutationObserver) return;
+  window.__operettaMutationObserver = new MutationObserver(function () {
+    window.__operettaLastMutation = Date.now();
+  });
+  window.__operettaMutationObserver.observe(document.documentElement, {
+    subtree: true, childList: true, attributes: true, characterData: true
+  });
+})()`
+
+const emojiRasterizerScript = `(function () {
+  if (!document.body || !document.createTreeWalker) return 0;
+  var pattern = /(?:\p{Regional_Indicator}{2}|[#*0-9]\uFE0F?\u20E3|\p{Extended_Pictographic}(?:\uFE0E|\uFE0F)?(?:\u200D\p{Extended_Pictographic}(?:\uFE0E|\uFE0F)?)*)/gu;
+  var blocked = {SCRIPT:1, STYLE:1, TEXTAREA:1, PRE:1, CODE:1, OPTION:1};
+  var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, {
+    acceptNode: function (node) {
+	  if (!node.parentElement || blocked[node.parentElement.tagName]) return NodeFilter.FILTER_REJECT;
+	  pattern.lastIndex = 0;
+	  return pattern.test(node.data) ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_REJECT;
+    }
+  });
+  var nodes = [], node;
+  while ((node = walker.nextNode())) nodes.push(node);
+  var cache = Object.create(null), count = 0;
+  function pngFor(value) {
+    if (cache[value]) return cache[value];
+    var canvas = document.createElement('canvas');
+    var probe = canvas.getContext('2d');
+    var font = '16px "Segoe UI Emoji", "Noto Color Emoji", "Apple Color Emoji", sans-serif';
+    probe.font = font;
+    canvas.width = Math.max(16, Math.min(40, Math.ceil(probe.measureText(value).width) + 2));
+    canvas.height = 18;
+    var ctx = canvas.getContext('2d');
+    ctx.font = font;
+    ctx.textBaseline = 'alphabetic';
+    ctx.fillText(value, 1, 16);
+    return cache[value] = {src: canvas.toDataURL('image/png'), width: canvas.width, height: canvas.height};
+  }
+  nodes.forEach(function (textNode) {
+    pattern.lastIndex = 0;
+    var source = textNode.data, cursor = 0, fragment = document.createDocumentFragment(), match;
+    while ((match = pattern.exec(source))) {
+      if (match.index > cursor) fragment.appendChild(document.createTextNode(source.slice(cursor, match.index)));
+      var png = pngFor(match[0]);
+      var image = document.createElement('img');
+      image.src = png.src;
+      image.width = png.width;
+      image.height = png.height;
+      image.alt = match[0];
+      image.setAttribute('aria-label', match[0]);
+      image.style.cssText = 'display:inline;vertical-align:middle;width:' + png.width + 'px;height:' + png.height + 'px';
+      fragment.appendChild(image);
+      cursor = pattern.lastIndex;
+      count++;
+    }
+    if (cursor < source.length) fragment.appendChild(document.createTextNode(source.slice(cursor)));
+    textNode.parentNode.replaceChild(fragment, textNode);
+  });
+  return count;
+})()`
+
 func newJSBaker(logger *log.Logger) (*jsBaker, error) {
 	opts := append(chromedp.DefaultExecAllocatorOptions[:],
 		chromedp.Flag("headless", true),
@@ -99,7 +205,7 @@ func (b *jsBaker) Fetch(ctx context.Context, target string, hdr http.Header, opt
 	setCookieHeaders := []string{}
 
 	var mu sync.Mutex
-	activeRequests := 0
+	activeRequests := make(map[network.RequestID]network.ResourceType)
 	lastActivity := time.Now()
 	mainRequestID := network.RequestID("")
 
@@ -107,28 +213,30 @@ func (b *jsBaker) Fetch(ctx context.Context, target string, hdr http.Header, opt
 		switch e := ev.(type) {
 		case *network.EventRequestWillBeSent:
 			mu.Lock()
-			activeRequests++
-			lastActivity = time.Now()
+			if trackForPageSettle(e.Type) {
+				activeRequests[e.RequestID] = e.Type
+				lastActivity = time.Now()
+			}
 			if e.Type == network.ResourceTypeDocument {
 				mainRequestID = e.RequestID
 			}
 			mu.Unlock()
 		case *network.EventLoadingFinished:
 			mu.Lock()
-			if activeRequests > 0 {
-				activeRequests--
+			if _, ok := activeRequests[e.RequestID]; ok {
+				delete(activeRequests, e.RequestID)
+				lastActivity = time.Now()
 			}
-			lastActivity = time.Now()
 			if e.RequestID == mainRequestID {
 				encodedLen = e.EncodedDataLength
 			}
 			mu.Unlock()
 		case *network.EventLoadingFailed:
 			mu.Lock()
-			if activeRequests > 0 {
-				activeRequests--
+			if _, ok := activeRequests[e.RequestID]; ok {
+				delete(activeRequests, e.RequestID)
+				lastActivity = time.Now()
 			}
-			lastActivity = time.Now()
 			mu.Unlock()
 		case *network.EventResponseReceived:
 			if e.RequestID == mainRequestID && e.Type == network.ResourceTypeDocument {
@@ -224,18 +332,45 @@ func (b *jsBaker) Fetch(ctx context.Context, target string, hdr http.Header, opt
 	if jsOpts != nil && strings.TrimSpace(jsOpts.WaitSelector) != "" {
 		actions = append(actions, chromedp.WaitVisible(strings.TrimSpace(jsOpts.WaitSelector), chromedp.ByQuery))
 	}
+	// Site rewrite scripts run before settling so clicks, unwrapping and other
+	// template changes get the same bounded async grace period as page code.
+	if jsOpts != nil && len(jsOpts.Scripts) > 0 {
+		for _, snippet := range jsOpts.Scripts {
+			code := strings.TrimSpace(snippet)
+			if code == "" {
+				continue
+			}
+			actions = append(actions, chromedp.Evaluate(code, nil))
+		}
+	}
 
-	if jsOpts != nil && jsOpts.WaitNetworkIdleMS > 0 {
-		waitDur := time.Duration(jsOpts.WaitNetworkIdleMS) * time.Millisecond
-		actions = append(actions, chromedp.ActionFunc(func(ctx context.Context) error {
+	settle := makeJSSettlePlan(jsOpts)
+	actions = append(actions,
+		chromedp.Evaluate(mutationObserverScript, nil),
+		chromedp.ActionFunc(func(ctx context.Context) error {
+			started := time.Now()
 			ticker := time.NewTicker(50 * time.Millisecond)
 			defer ticker.Stop()
 			for {
 				mu.Lock()
-				active := activeRequests
-				elapsed := time.Since(lastActivity)
+				active := len(activeRequests)
+				networkQuietFor := time.Since(lastActivity)
 				mu.Unlock()
-				if active == 0 && elapsed >= waitDur {
+
+				var domQuietMS float64
+				if err := chromedp.Evaluate(`Date.now() - (window.__operettaLastMutation || Date.now())`, &domQuietMS).Do(ctx); err != nil {
+					return err
+				}
+				elapsed := time.Since(started)
+				if elapsed >= settle.minimum && active == 0 &&
+					networkQuietFor >= settle.networkIdle &&
+					time.Duration(domQuietMS)*time.Millisecond >= settle.domIdle {
+					return nil
+				}
+				// Long polling and continuously animated pages must not hold a
+				// feature phone request forever. Capture the best stable state seen
+				// inside the bounded V8 grace period.
+				if elapsed >= settle.maximum {
 					return nil
 				}
 				select {
@@ -244,20 +379,23 @@ func (b *jsBaker) Fetch(ctx context.Context, target string, hdr http.Header, opt
 				case <-ticker.C:
 				}
 			}
-		}))
-	}
+		}),
+	)
 
-	if jsOpts != nil && jsOpts.WaitAfterLoadMS > 0 {
-		actions = append(actions, chromedp.Sleep(time.Duration(jsOpts.WaitAfterLoadMS)*time.Millisecond))
+	rasterizeEmoji := jsOpts != nil && jsOpts.RasterizeEmoji
+	if opt != nil && opt.LegacyBasicOM2 {
+		rasterizeEmoji = true
 	}
-
-	if jsOpts != nil && len(jsOpts.Scripts) > 0 {
-		for _, snippet := range jsOpts.Scripts {
-			code := strings.TrimSpace(snippet)
-			if code == "" {
-				continue
-			}
-			actions = append(actions, chromedp.Evaluate(code, nil))
+	if rasterizeEmoji {
+		var emojiCount int
+		actions = append(actions, chromedp.Evaluate(emojiRasterizerScript, &emojiCount))
+		if b.logger != nil {
+			actions = append(actions, chromedp.ActionFunc(func(context.Context) error {
+				if emojiCount > 0 {
+					b.logger.Printf("js baker rasterized emoji: url=%s count=%d", targetURL, emojiCount)
+				}
+				return nil
+			}))
 		}
 	}
 
