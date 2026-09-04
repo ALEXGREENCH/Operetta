@@ -3,7 +3,6 @@ package proxy
 import (
 	"bytes"
 	"context"
-	"encoding/base64"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -19,11 +18,6 @@ import (
 )
 
 const defaultOM4OfficialURL = "http://server4.operamini.com/"
-
-// Generic, decrypted Opera Mini 4.2 startup application frames. Transport
-// keys, MACs and application-session headers are intentionally absent; the
-// bridge creates fresh values for every explicit official request.
-const embeddedOM4StartupFrames = "gAIAAAAIAGxpbmtpZAAQAAAAAAAFAQAAAAAIAQAAAR4AAAEagAYBCENMREMtMS4xAghNSURQLTIuMAMSTm9raWE2NzAwYy0xLzEzLjEwBAVlbi1VUwUKSVNPLTg4NTktMUYAAAAgbVsYgsvbRGa76EJLu5AKUBIrrJj2Wn+o7PM2nJQ5p4gHFHNlYXJjaDpnb29nbGUwOD9xPSVz0AAH6AGT59QAAAEalWQWBzIwNzI1ODCXAtgAAJgVoAchACIGbGlua2lkKAAxAnJ1NSdodHRwOi8vd3d3Lm9wZXJhbWluaS5jb20vZmlyc3R0aW1lLzQuMi82MU9wZXJhIE1pbmkvNC4yLjE1NDEwTW9kLmJ5LkhhbmRsZXIvaGlmaS9saW5raWQvZW45APpqWQH6Ow1FdXJvcGUvTW9zY293"
 
 var om4SessionHeaderPattern = regexp.MustCompile(`[0-9a-f]{64}`)
 
@@ -297,34 +291,7 @@ func loadPlainOM4StartupRequest() (*operamini4.SessionRequest, error) {
 		}
 		return request, nil
 	}
-	data, err := base64.StdEncoding.DecodeString(embeddedOM4StartupFrames)
-	if err != nil {
-		return nil, err
-	}
-	frames, err := decodeEmbeddedOM4Frames(data)
-	if err != nil {
-		return nil, err
-	}
-	return &operamini4.SessionRequest{Frames: frames}, nil
-}
-
-func decodeEmbeddedOM4Frames(data []byte) ([]operamini4.Frame, error) {
-	frames := make([]operamini4.Frame, 0, 4)
-	for offset := 0; offset < len(data); {
-		if offset+6 > len(data) {
-			return nil, errors.New("truncated embedded OM4 frame header")
-		}
-		length := int(binary.BigEndian.Uint32(data[offset+2 : offset+6]))
-		if length < 0 || offset+6+length > len(data) {
-			return nil, errors.New("truncated embedded OM4 frame payload")
-		}
-		frames = append(frames, operamini4.Frame{
-			Type: data[offset], Channel: data[offset+1],
-			Payload: append([]byte(nil), data[offset+6:offset+6+length]...),
-		})
-		offset += 6 + length
-	}
-	return frames, nil
+	return operamini4.DefaultStartupRequest()
 }
 
 func cloneOM4Request(source *operamini4.SessionRequest) *operamini4.SessionRequest {

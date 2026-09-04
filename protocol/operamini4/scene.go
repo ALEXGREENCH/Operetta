@@ -76,6 +76,7 @@ type SceneFragment struct {
 // the drawings in their source order.
 func BuildScene(document *ApplicationDocument) Scene {
 	background := "#ffffff"
+	backgroundArea := -1
 	fragments := make([]SceneFragment, 0, len(document.Drawings)+len(document.Links))
 	for _, drawing := range document.Drawings {
 		fragment := SceneFragment{
@@ -86,8 +87,10 @@ func BuildScene(document *ApplicationDocument) Scene {
 		case 'B':
 			fragment.Kind = "background"
 			fragment.Color = sceneColor(drawing.Color)
-			if drawing.X == 0 && drawing.Y == 0 && drawing.Width >= document.Header.ViewportWidth {
+			area := drawing.Width * drawing.Height
+			if drawing.X == 0 && drawing.Y == 0 && drawing.Width >= document.Header.ViewportWidth && area > backgroundArea {
 				background = fragment.Color
+				backgroundArea = area
 			}
 		case 'T':
 			fragment.Kind = "text"

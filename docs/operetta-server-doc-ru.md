@@ -9,7 +9,7 @@
 - `internal/proxy/` — HTTP-слой: конфигурация (`config.go`), обработчики (`handlers.go`), журналирование, хранилище предпочтений рендера, per-client cookie jar, кэш пагинации, загрузчик JSON-override’ов по хосту.
 - `internal/proxy/url.go` — вспомогательные функции для нормализации Opera-style URL и построения action/get.
 - `oms/` — движок рендеринга, разбитый на модули (`page.go`, `normalize.go`, `cache_disk.go`, …): загрузка HTML, CSS-эвристики, обход DOM, генерация OBML, конвейер изображений и финализация OMS.
-- `config/sites/` — примеры JSON-override’ов (`mode`, `headers`); директория переопределяется переменной `OMS_SITES_DIR`.
+- `config/sites/` — заголовки, выполнение JavaScript и декларативные DOM-шаблоны для legacy OMS и native OM4; директория переопределяется переменной `OMS_SITES_DIR`.
 - `docs/` — справочные материалы (OBML, протокол, это руководство).
 - `dist/`, `build.ps1`, `build.sh`, `Makefile` — скрипты сборки и упаковки.
 

@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -40,6 +41,7 @@ type comparison struct {
 	ReferenceImages     int      `json:"reference_native_images"`
 	ReferenceBlocks     int      `json:"reference_native_blocks"`
 	OperettaURL         string   `json:"operetta_url,omitempty"`
+	OperettaTitle       string   `json:"operetta_title,omitempty"`
 	OperettaTexts       []string `json:"operetta_texts,omitempty"`
 	OperettaTextCount   int      `json:"operetta_text_count"`
 	OperettaLinks       int      `json:"operetta_links"`
@@ -57,9 +59,20 @@ type comparison struct {
 	NativeStyles        []string `json:"native_styles,omitempty"`
 	NativeImages        int      `json:"native_images"`
 	NativeBlocks        int      `json:"native_blocks"`
+	NativeHeightDelta   int      `json:"native_height_delta"`
+	NativeLinkDelta     int      `json:"native_link_delta"`
+	NativeImageDelta    int      `json:"native_image_delta"`
+	NativeBlockDelta    int      `json:"native_block_delta"`
+	NativeDurationDelta int64    `json:"native_duration_delta_ms"`
+	ReferenceMissing    []string `json:"reference_texts_missing_from_native,omitempty"`
+	NativeExtra         []string `json:"native_extra_texts,omitempty"`
+	MissingTokens       []string `json:"reference_tokens_missing_from_native,omitempty"`
+	ExtraTokens         []string `json:"native_extra_tokens,omitempty"`
 	TokenCoverage       float64  `json:"reference_token_coverage"`
 	NativeCoverage      float64  `json:"reference_native_token_coverage"`
 	StyleCoverage       float64  `json:"reference_native_style_coverage"`
+	ColorCoverage       float64  `json:"reference_native_color_coverage"`
+	GeometryCoverage    float64  `json:"reference_native_geometry_coverage"`
 	ReferenceError      string   `json:"reference_error,omitempty"`
 	OperettaError       string   `json:"operetta_error,omitempty"`
 	NativeError         string   `json:"native_error,omitempty"`
@@ -85,11 +98,12 @@ func main() {
 	outDir := flag.String("out", "build/om4-compare", "comparison output directory")
 	endpoint := flag.String("reference", "http://server4.operamini.com/", "compatible OM4 reference endpoint")
 	localEndpoint := flag.String("operetta", "http://127.0.0.1:8081/", "local Operetta OM4 endpoint")
-	bootstrapRequest := flag.String("bootstrap-request", "build/latest-om4-request.bin", "clean captured first-time OM4 wire request")
+	bootstrapRequest := flag.String("bootstrap-request", "", "optional clean captured first-time OM4 wire request; built-in template is used when empty")
 	startupRequest := flag.String("startup-request", "", "historical decrypted startup request.bin; auto-detected when empty")
 	navigationTemplate := flag.String("navigation-request", "", "decrypted navigation request.frames.bin; auto-detected when empty")
 	limit := flag.Int("limit", 0, "maximum number of sites; zero means all")
 	timeout := flag.Duration("timeout", 75*time.Second, "per-side request timeout")
+	requireReference := flag.Bool("require-reference", false, "stop when the official reference session is unavailable")
 	upstreamUA := flag.String("upstream-ua", operamini4.OriginUserAgent, "User-Agent used by Operetta's origin fetch")
 	flag.Parse()
 	var urls []string
@@ -108,21 +122,33 @@ func main() {
 		urls = urls[:*limit]
 	}
 	check(os.MkdirAll(*outDir, 0o700))
+	startup, err := loadStartupRequest(*startupRequest, "build/om4-corpus")
+	check(err)
+	navigation, err := loadNavigationTemplate(*navigationTemplate, "build/om4-corpus")
+	check(err)
 	reference, err := operamini4.NewReferenceClient(*endpoint)
 	check(err)
 	defer reference.CloseIdleConnections()
 	local, err := operamini4.NewReferenceClient(*localEndpoint)
 	check(err)
 	defer local.CloseIdleConnections()
-	header, err := initializeReference(reference, *bootstrapRequest, *timeout)
-	check(err)
-	localHeader, err := initializeReference(local, *bootstrapRequest, *timeout)
-	check(err)
-	startup, err := loadStartupRequest(*startupRequest, "build/om4-corpus")
-	check(err)
-	navigation, err := loadNavigationTemplate(*navigationTemplate, "build/om4-corpus")
-	check(err)
-	fmt.Printf("sessions initialized: reference=%s… local=%s…\n", header[:8], localHeader[:8])
+	header, referenceInitErr := initializeReference(reference, *bootstrapRequest, startup, *timeout)
+	if referenceInitErr != nil && *requireReference {
+		check(referenceInitErr)
+	}
+	var referenceExchange exchangeFunc = reference.Exchange
+	if referenceInitErr != nil {
+		fmt.Printf("reference unavailable, native collection continues: %v\n", referenceInitErr)
+		referenceExchange = func(context.Context, *operamini4.SessionRequest) ([]operamini4.Frame, error) {
+			return nil, referenceInitErr
+		}
+	} else {
+		fmt.Printf("reference session initialized: %s…\n", header[:8])
+	}
+	// The native server does not depend on an opaque Opera application session;
+	// a non-empty diagnostic header keeps navigation requests out of onboarding.
+	localHeader := strings.Repeat("0", 64)
+	fmt.Printf("native session ready: %s…\n", localHeader[:8])
 	report := make([]comparison, 0, len(urls))
 	linkID := "h22-02-04"
 	var requestToken []byte
@@ -132,18 +158,23 @@ func main() {
 		fmt.Printf("[%d/%d] %s\n", index+1, len(urls), target)
 		var request *operamini4.SessionRequest
 		var localRequest *operamini4.SessionRequest
-		if index == 0 {
+		if referenceInitErr == nil && index == 0 {
 			request, err = startupNavigationRequest(startup, header, target)
 			check(err)
+		} else if referenceInitErr == nil {
+			request, err = navigationRequestFromTemplate(navigation, header, linkID, requestToken, target)
+			check(err)
+		} else {
+			request = &operamini4.SessionRequest{}
+		}
+		if index == 0 {
 			localRequest, err = startupNavigationRequest(startup, localHeader, target)
 			check(err)
 		} else {
-			request, err = navigationRequestFromTemplate(navigation, header, linkID, requestToken, target)
-			check(err)
 			localRequest, err = navigationRequestFromTemplate(navigation, localHeader, localLinkID, localRequestToken, target)
 			check(err)
 		}
-		item := compare(target, request, reference, localRequest, local, *outDir, *timeout, *upstreamUA)
+		item := compare(target, request, referenceExchange, localRequest, local.Exchange, *outDir, *timeout, *upstreamUA)
 		if item.NextLinkID != "" {
 			linkID = item.NextLinkID
 		}
@@ -157,9 +188,10 @@ func main() {
 			localRequestToken = append(localRequestToken[:0], item.NextNativeToken...)
 		}
 		report = append(report, item)
-		fmt.Printf("  reference=%d model=%d native=%d links=%d/%d coverage=%.1f%% native=%.1f%% ref_error=%q native_error=%q own_error=%q\n",
+		fmt.Printf("  reference=%d model=%d native=%d links=%d/%d coverage=%.1f%% native=%.1f%% colors=%.1f%% geometry=%.1f%% ref_error=%q native_error=%q own_error=%q\n",
 			item.ReferenceTextCount, item.OperettaTextCount, item.NativeTextCount, item.ReferenceLinks, item.NativeLinks,
-			item.TokenCoverage*100, item.NativeCoverage*100, item.ReferenceError, item.NativeError, item.OperettaError)
+			item.TokenCoverage*100, item.NativeCoverage*100, item.ColorCoverage*100, item.GeometryCoverage*100,
+			item.ReferenceError, item.NativeError, item.OperettaError)
 		data, marshalErr := json.MarshalIndent(item, "", "  ")
 		check(marshalErr)
 		check(os.WriteFile(filepath.Join(*outDir, fmt.Sprintf("%02d-%s.json", index+1, safeName(target))), append(data, '\n'), 0o600))
@@ -169,11 +201,12 @@ func main() {
 	check(os.WriteFile(filepath.Join(*outDir, "report.json"), append(data, '\n'), 0o600))
 }
 
-func compare(target string, request *operamini4.SessionRequest, reference *operamini4.ReferenceClient, localRequest *operamini4.SessionRequest, local *operamini4.ReferenceClient, outDir string, timeout time.Duration, upstreamUA string) comparison {
+func compare(target string, request *operamini4.SessionRequest, reference exchangeFunc, localRequest *operamini4.SessionRequest, local exchangeFunc, outDir string, timeout time.Duration, upstreamUA string) comparison {
 	result := comparison{RequestedURL: target}
+	var referenceDocument, nativeDocument *operamini4.ApplicationDocument
 	referenceExchange, nativeExchange := exchangePair(
-		reference.Exchange, request,
-		local.Exchange, localRequest,
+		reference, request,
+		local, localRequest,
 		timeout,
 	)
 	result.ReferenceDurationMS = referenceExchange.duration.Milliseconds()
@@ -194,6 +227,7 @@ func compare(target string, request *operamini4.SessionRequest, reference *opera
 		} else if document, decodeErr := operamini4.DecodeApplicationDocument(frames); decodeErr != nil {
 			result.ReferenceError = decodeErr.Error()
 		} else {
+			referenceDocument = document
 			result.ReferenceURL = document.Header.URL
 			result.ReferenceTitle = document.Header.Title
 			result.ReferenceRecords = len(document.Records)
@@ -228,6 +262,7 @@ func compare(target string, request *operamini4.SessionRequest, reference *opera
 		} else if document, decodeErr := operamini4.DecodeApplicationDocument(localFrames); decodeErr != nil {
 			result.NativeError = decodeErr.Error()
 		} else {
+			nativeDocument = document
 			result.NativeURL = document.Header.URL
 			result.NativeTitle = document.Header.Title
 			result.NativeRecords = len(document.Records)
@@ -262,6 +297,7 @@ func compare(target string, request *operamini4.SessionRequest, reference *opera
 		model, err = oms.TransformDocument(document, options.ReqHeaders, options)
 		if err == nil {
 			result.OperettaURL = model.URL
+			result.OperettaTitle = model.Title
 			result.OperettaTexts, result.OperettaLinks, result.OperettaImages, result.OperettaForms = summarizeModel(model)
 			result.OperettaStyles = summarizePresentationStyles(model)
 			result.OperettaTextCount = len(result.OperettaTexts)
@@ -274,6 +310,15 @@ func compare(target string, request *operamini4.SessionRequest, reference *opera
 	result.TokenCoverage = tokenCoverage(result.ReferenceTexts, result.OperettaTexts)
 	result.NativeCoverage = tokenCoverage(result.ReferenceTexts, result.NativeTexts)
 	result.StyleCoverage = stringCoverage(result.ReferenceStyles, result.NativeStyles)
+	result.ColorCoverage = stringCoverage(styleColors(result.ReferenceStyles), styleColors(result.NativeStyles))
+	result.GeometryCoverage = drawingGeometryCoverage(referenceDocument, nativeDocument)
+	result.ReferenceMissing, result.NativeExtra = setDifference(result.ReferenceTexts, result.NativeTexts)
+	result.MissingTokens, result.ExtraTokens = setDifference(sortedSet(tokenSet(result.ReferenceTexts)), sortedSet(tokenSet(result.NativeTexts)))
+	result.NativeHeightDelta = result.NativeHeight - result.ReferenceHeight
+	result.NativeLinkDelta = result.NativeLinks - result.ReferenceLinks
+	result.NativeImageDelta = result.NativeImages - result.ReferenceImages
+	result.NativeBlockDelta = result.NativeBlocks - result.ReferenceBlocks
+	result.NativeDurationDelta = result.NativeDurationMS - result.ReferenceDurationMS
 	return result
 }
 
@@ -351,7 +396,7 @@ func loadStartupRequest(path, corpusDir string) (*operamini4.SessionRequest, err
 			return request, nil
 		}
 	}
-	return nil, errors.New("no historical OM4 startup request found; use -startup-request")
+	return operamini4.DefaultStartupRequest()
 }
 
 func loadNavigationTemplate(path, corpusDir string) (*operamini4.SessionRequest, error) {
@@ -377,7 +422,7 @@ func loadNavigationTemplate(path, corpusDir string) (*operamini4.SessionRequest,
 			return &operamini4.SessionRequest{Frames: frames}, nil
 		}
 	}
-	return nil, errors.New("no safe OM4 navigation template found; use -navigation-request")
+	return operamini4.DefaultStartupRequest()
 }
 
 func startupNavigationRequest(template *operamini4.SessionRequest, header, target string) (*operamini4.SessionRequest, error) {
@@ -491,14 +536,23 @@ func readManifest(path string) ([]string, error) {
 	return items, scanner.Err()
 }
 
-func initializeReference(reference *operamini4.ReferenceClient, requestPath string, timeout time.Duration) (string, error) {
-	raw, err := os.ReadFile(requestPath)
-	if err != nil {
-		return "", fmt.Errorf("read bootstrap request: %w", err)
-	}
-	source, err := operamini4.ParseSessionRequest(raw)
-	if err != nil {
-		return "", fmt.Errorf("parse bootstrap request: %w", err)
+func initializeReference(reference *operamini4.ReferenceClient, requestPath string, fallback *operamini4.SessionRequest, timeout time.Duration) (string, error) {
+	var source *operamini4.SessionRequest
+	var err error
+	if strings.TrimSpace(requestPath) != "" {
+		raw, readErr := os.ReadFile(requestPath)
+		if readErr != nil {
+			return "", fmt.Errorf("read bootstrap request: %w", readErr)
+		}
+		source, err = operamini4.ParseSessionRequest(raw)
+		if err != nil {
+			return "", fmt.Errorf("parse bootstrap request: %w", err)
+		}
+	} else {
+		source = cloneSessionRequest(fallback)
+		if source == nil {
+			return "", errors.New("nil OM4 bootstrap template")
+		}
 	}
 	// A reusable batch must always start anonymously, even if the capture file
 	// was produced while another application session existed.
@@ -518,6 +572,25 @@ func initializeReference(reference *operamini4.ReferenceClient, requestPath stri
 		return "", fmt.Errorf("reference first-time document contains no session header")
 	}
 	return string(match), nil
+}
+
+func cloneSessionRequest(source *operamini4.SessionRequest) *operamini4.SessionRequest {
+	if source == nil {
+		return nil
+	}
+	result := &operamini4.SessionRequest{
+		Sequence: source.Sequence,
+		Token:    append([]byte(nil), source.Token...),
+		Header:   source.Header,
+		Frames:   make([]operamini4.Frame, len(source.Frames)),
+	}
+	for index, frame := range source.Frames {
+		result.Frames[index] = operamini4.Frame{
+			Type: frame.Type, Channel: frame.Channel,
+			Payload: append([]byte(nil), frame.Payload...),
+		}
+	}
+	return result
 }
 
 func uniqueTexts(elements []operamini4.TextElement) []string {
@@ -578,6 +651,102 @@ func stringCoverage(reference, own []string) float64 {
 		}
 	}
 	return float64(matched) / float64(len(reference))
+}
+
+func styleColors(styles []string) []string {
+	seen := make(map[string]struct{})
+	colors := make([]string, 0, len(styles))
+	for _, style := range styles {
+		if len(style) < 8 {
+			continue
+		}
+		color := strings.ToLower(style[2:8])
+		if _, ok := seen[color]; ok {
+			continue
+		}
+		seen[color] = struct{}{}
+		colors = append(colors, color)
+	}
+	return colors
+}
+
+func setDifference(reference, own []string) (missing, extra []string) {
+	referenceSet := make(map[string]struct{}, len(reference))
+	ownSet := make(map[string]struct{}, len(own))
+	for _, value := range reference {
+		referenceSet[value] = struct{}{}
+	}
+	for _, value := range own {
+		ownSet[value] = struct{}{}
+	}
+	for _, value := range reference {
+		if _, ok := ownSet[value]; !ok {
+			missing = append(missing, value)
+		}
+	}
+	for _, value := range own {
+		if _, ok := referenceSet[value]; !ok {
+			extra = append(extra, value)
+		}
+	}
+	return missing, extra
+}
+
+func sortedSet(values map[string]struct{}) []string {
+	result := make([]string, 0, len(values))
+	for value := range values {
+		result = append(result, value)
+	}
+	sort.Strings(result)
+	return result
+}
+
+func drawingGeometryCoverage(reference, native *operamini4.ApplicationDocument) float64 {
+	if reference == nil || native == nil {
+		return 0
+	}
+	used := make([]bool, len(native.Drawings))
+	total, matched := 0, 0.0
+	for _, want := range reference.Drawings {
+		if want.Kind != 'B' && want.Kind != 'T' && want.Kind != 'I' {
+			continue
+		}
+		total++
+		bestIndex, best := -1, 0.0
+		for index, got := range native.Drawings {
+			if used[index] || got.Kind != want.Kind {
+				continue
+			}
+			if want.Kind == 'T' && normalizeText(got.Text) != normalizeText(want.Text) {
+				continue
+			}
+			if score := rectangleIOU(want, got); score > best {
+				bestIndex, best = index, score
+			}
+		}
+		if bestIndex >= 0 {
+			used[bestIndex] = true
+			matched += best
+		}
+	}
+	if total == 0 {
+		return 0
+	}
+	return matched / float64(total)
+}
+
+func rectangleIOU(a, b operamini4.DrawingElement) float64 {
+	left, top := max(a.X, b.X), max(a.Y, b.Y)
+	right, bottom := min(a.X+a.Width, b.X+b.Width), min(a.Y+a.Height, b.Y+b.Height)
+	if right <= left || bottom <= top {
+		return 0
+	}
+	intersection := (right - left) * (bottom - top)
+	union := a.Width*a.Height + b.Width*b.Height - intersection
+	if union <= 0 {
+		return 0
+	}
+	return float64(intersection) / float64(union)
 }
 
 func summarizeModel(model *presentation.Document) ([]string, int, int, int) {

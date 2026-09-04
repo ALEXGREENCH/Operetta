@@ -72,7 +72,7 @@ func (s *Server) nativeOM4Frames(ctx context.Context, request *operamini4.Sessio
 		records = s.om4OnboardingRecords
 		url = "i:/firsttime/4.2/"
 	} else if target != "" {
-		origin, err := renderNativeOrigin(ctx, target, jar)
+		origin, err := s.renderNativeOrigin(ctx, target, jar)
 		if err != nil {
 			return nil, fmt.Errorf("render %s: %w", target, err)
 		}
@@ -155,7 +155,7 @@ type nativeOriginPage struct {
 	Lines          []operamini4.WelcomeLine
 }
 
-func renderNativeOrigin(ctx context.Context, target string, jar http.CookieJar) (nativeOriginPage, error) {
+func (s *Server) renderNativeOrigin(ctx context.Context, target string, jar http.CookieJar) (nativeOriginPage, error) {
 	headers := http.Header{
 		"Accept-Language": []string{"ru,en;q=0.8"},
 		"User-Agent":      []string{operamini4.OriginUserAgent},
@@ -164,16 +164,18 @@ func renderNativeOrigin(ctx context.Context, target string, jar http.CookieJar) 
 		ImagesOn: true, ImageMIME: "image/jpeg", MaxInlineKB: 48,
 		ScreenW: 231, ScreenH: 320, ReqHeaders: headers, Jar: jar,
 	}
-	document, err := oms.FetchDocumentWithHeadersAndOptionsCtx(ctx, target, headers, opts)
+	document, effectiveHeaders, err := s.loadDocument(ctx, target, headers, opts, nil)
 	if err != nil {
 		return nativeOriginPage{}, err
 	}
-	model, err := oms.TransformDocument(document, headers, opts)
+	model, err := oms.TransformDocument(document, effectiveHeaders, opts)
 	if err != nil {
 		return nativeOriginPage{}, err
 	}
 	title := "Operetta"
-	if parsed, parseErr := url.Parse(model.URL); parseErr == nil && parsed.Hostname() != "" {
+	if strings.TrimSpace(model.Title) != "" {
+		title = strings.TrimSpace(model.Title)
+	} else if parsed, parseErr := url.Parse(model.URL); parseErr == nil && parsed.Hostname() != "" {
 		title = parsed.Hostname()
 	}
 	background := uint32(0xffffffff)

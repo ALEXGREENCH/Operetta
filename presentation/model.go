@@ -83,6 +83,7 @@ type Metrics struct {
 // supplied only to an encoder.
 type Document struct {
 	URL          string
+	Title        string
 	Operations   []Operation
 	SetCookies   []string
 	FormHidden   map[string]map[string]string

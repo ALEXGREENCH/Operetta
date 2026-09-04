@@ -114,3 +114,59 @@ func TestWriteComparisonSceneReportsWriteError(t *testing.T) {
 		t.Fatalf("error field: %q", errorField)
 	}
 }
+
+func TestTemplateLoadersFallBackToEmbeddedStartup(t *testing.T) {
+	corpusDir := t.TempDir()
+	startup, err := loadStartupRequest("", corpusDir)
+	if err != nil {
+		t.Fatalf("loadStartupRequest: %v", err)
+	}
+	navigation, err := loadNavigationTemplate("", corpusDir)
+	if err != nil {
+		t.Fatalf("loadNavigationTemplate: %v", err)
+	}
+	const target = "https://example.test/compare"
+	if _, err := startupNavigationRequest(startup, "header", target); err != nil {
+		t.Fatalf("startup template cannot navigate: %v", err)
+	}
+	if _, err := navigationRequestFromTemplate(navigation, "header", "h22-02-04", nil, target); err != nil {
+		t.Fatalf("navigation template cannot navigate: %v", err)
+	}
+}
+
+func TestCloneSessionRequestDoesNotSharePayloads(t *testing.T) {
+	source, err := operamini4.DefaultStartupRequest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	clone := cloneSessionRequest(source)
+	clone.Frames[0].Payload[0] ^= 0xff
+	if clone.Frames[0].Payload[0] == source.Frames[0].Payload[0] {
+		t.Fatal("clone shares mutable frame payload")
+	}
+}
+
+func TestComparisonHelpersExposeActionableDifferences(t *testing.T) {
+	missing, extra := setDifference([]string{"same", "missing"}, []string{"same", "extra"})
+	if strings.Join(missing, ",") != "missing" || strings.Join(extra, ",") != "extra" {
+		t.Fatalf("text difference missing=%v extra=%v", missing, extra)
+	}
+	coverage := stringCoverage(
+		styleColors([]string{"cc000000/5", "cc334488/0"}),
+		styleColors([]string{"ff000000/2", "ff334488/0"}),
+	)
+	if coverage != 1 {
+		t.Fatalf("RGB color coverage = %v", coverage)
+	}
+	reference := &operamini4.ApplicationDocument{Drawings: []operamini4.DrawingElement{
+		{Kind: 'B', X: 0, Y: 0, Width: 100, Height: 100},
+		{Kind: 'T', X: 10, Y: 10, Width: 50, Height: 10, Text: "hello"},
+	}}
+	native := &operamini4.ApplicationDocument{Drawings: []operamini4.DrawingElement{
+		{Kind: 'B', X: 0, Y: 0, Width: 100, Height: 100},
+		{Kind: 'T', X: 10, Y: 10, Width: 50, Height: 10, Text: "hello"},
+	}}
+	if got := drawingGeometryCoverage(reference, native); got != 1 {
+		t.Fatalf("identical geometry coverage = %v", got)
+	}
+}

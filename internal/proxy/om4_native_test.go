@@ -1,12 +1,99 @@
 package proxy
 
 import (
+	"context"
+	"io"
+	"log"
+	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"operetta/protocol/operamini4"
 )
+
+func TestNativeOM4NavigationWorksWithoutCapturedOnboarding(t *testing.T) {
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = io.WriteString(w, `<html><head><title>Native smoke</title></head><body>`+
+			`<p class="noise">remove me</p><p id="result">loading</p>`+
+			`<button id="load" onclick="setTimeout(function(){document.getElementById('result').textContent='clean clone works 😀'},100)">load</button>`+
+			`</body></html>`)
+	}))
+	defer upstream.Close()
+
+	sitesDir := t.TempDir()
+	config := `{"bake":{"mode":"on","waitAfterLoadMs":300,"waitIdleMs":50,"waitDomIdleMs":50,"maxSettleMs":700,"emojiAsImages":true},` +
+		`"rewrite":{"clickSelectors":["#load"],"removeSelectors":["#load",".noise"]}}`
+	if err := os.WriteFile(filepath.Join(sitesDir, "127.0.0.1.json"), []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	server := New(Config{Logger: log.New(io.Discard, "", 0), SitesDir: sitesDir})
+	gateway := httptest.NewServer(server)
+	defer gateway.Close()
+	defer server.Close()
+
+	request, err := operamini4.DefaultStartupRequest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	request.Header = strings.Repeat("0", 64)
+	if !replacePlainOM4Target(request, upstream.URL) {
+		t.Fatal("default startup request has no replaceable URL")
+	}
+	client, err := operamini4.NewReferenceClient(gateway.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer client.CloseIdleConnections()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	frames, err := client.Exchange(ctx, request)
+	if err != nil {
+		t.Fatalf("native exchange: %v", err)
+	}
+	secondRequest, err := operamini4.DefaultStartupRequest()
+	if err != nil {
+		t.Fatal(err)
+	}
+	secondRequest.Header = request.Header
+	if !replacePlainOM4Target(secondRequest, upstream.URL) {
+		t.Fatal("second startup request has no replaceable URL")
+	}
+	frames, err = client.Exchange(ctx, secondRequest)
+	if err != nil {
+		t.Fatalf("second native exchange on one comparison client: %v", err)
+	}
+	document, err := operamini4.DecodeApplicationDocument(frames)
+	if err != nil {
+		t.Fatalf("decode native document: %v", err)
+	}
+	if document.Header.Title != "Native smoke" {
+		t.Fatalf("native document title = %q", document.Header.Title)
+	}
+	var rendered strings.Builder
+	for _, element := range document.Texts {
+		rendered.WriteString(element.Text)
+		rendered.WriteByte(' ')
+	}
+	if !strings.Contains(rendered.String(), "clean clone works") {
+		t.Fatalf("native text not rendered: %+v", document.Texts)
+	}
+	if strings.Contains(rendered.String(), "remove me") || strings.Contains(rendered.String(), "loading") {
+		t.Fatalf("native OM4 bypassed site rewrite: %q", rendered.String())
+	}
+	images := 0
+	for _, drawing := range document.Drawings {
+		if drawing.Kind == 'I' {
+			images++
+		}
+	}
+	if images == 0 {
+		t.Fatalf("rasterized emoji did not reach native OM4 drawings: %+v", document.Drawings)
+	}
+}
 
 func TestOM4CookieJarKeyUsesOpaqueSessionHeader(t *testing.T) {
 	httpRequest := httptest.NewRequest("POST", "http://127.0.0.1:8081/", nil)

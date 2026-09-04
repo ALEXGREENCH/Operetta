@@ -127,11 +127,6 @@ func (s *Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			if s.om4Reference == nil {
-				if len(s.om4OnboardingRecords) == 0 {
-					s.logger.Printf("OM4 session rejected: native onboarding is unavailable")
-					http.Error(w, "OM4 native onboarding unavailable", http.StatusServiceUnavailable)
-					return
-				}
 				nativeCtx, cancelNative := context.WithTimeout(r.Context(), 60*time.Second)
 				jarKey := om4CookieJarKey(r, request)
 				responseFrames, nativeErr := s.nativeOM4Frames(nativeCtx, request, s.cookieJars.Get(jarKey))
@@ -1455,6 +1450,28 @@ func (s *Server) loadPage(ctx context.Context, target string, hdr http.Header, o
 			return oms.LoadCompactPageWithHeaders(target, header)
 		}
 	}
+	doc, effectiveHeader, err := s.loadDocument(ctx, target, header, opt, cfg)
+	if err != nil {
+		return nil, err
+	}
+	return oms.RenderDocument(doc, effectiveHeader, opt)
+}
+
+// loadDocument is the common origin stage for legacy OMS and native OM4.
+// Site headers, V8 settling and declarative rewrites must be applied before
+// either protocol-specific presentation encoder sees the document.
+func (s *Server) loadDocument(ctx context.Context, target string, header http.Header, opt *oms.RenderOptions, cfg *SiteConfig) (*oms.UpstreamDocument, http.Header, error) {
+	if header == nil {
+		header = http.Header{}
+	}
+	if cfg == nil {
+		cfg = s.sites.Find(target)
+		if cfg != nil {
+			for k, v := range cfg.Headers {
+				header.Set(k, v)
+			}
+		}
+	}
 	var cfgJS *oms.JSBakingOptions
 	if cfg != nil {
 		cfgJS = cfg.JSOptions()
@@ -1469,7 +1486,7 @@ func (s *Server) loadPage(ctx context.Context, target string, hdr http.Header, o
 		baker, err := s.getJSBaker()
 		if err != nil {
 			if mergedJS != nil && mergedJS.Mode == oms.JSExecutionModeRequired {
-				return nil, err
+				return nil, header, err
 			}
 			if s.logger != nil {
 				s.logger.Printf("js baker unavailable: %v", err)
@@ -1477,19 +1494,10 @@ func (s *Server) loadPage(ctx context.Context, target string, hdr http.Header, o
 		} else {
 			doc, err := baker.Fetch(ctx, target, header, opt, mergedJS)
 			if err == nil && doc != nil {
-				page, renderErr := oms.RenderDocument(doc, header, opt)
-				if renderErr == nil {
-					return page, nil
-				}
-				if mergedJS != nil && mergedJS.Mode == oms.JSExecutionModeRequired {
-					return nil, renderErr
-				}
-				if s.logger != nil {
-					s.logger.Printf("js render fallback for %s: %v", target, renderErr)
-				}
+				return doc, header, nil
 			} else if err != nil {
 				if mergedJS != nil && mergedJS.Mode == oms.JSExecutionModeRequired {
-					return nil, err
+					return nil, header, err
 				}
 				if s.logger != nil {
 					s.logger.Printf("js fetch fallback for %s: %v", target, err)
@@ -1497,7 +1505,8 @@ func (s *Server) loadPage(ctx context.Context, target string, hdr http.Header, o
 			}
 		}
 	}
-	return oms.LoadPageWithHeadersAndOptionsCtx(ctx, target, header, opt)
+	doc, err := oms.FetchDocumentWithHeadersAndOptionsCtx(ctx, target, header, opt)
+	return doc, header, err
 }
 
 func (s *Server) writeOMS(w http.ResponseWriter, data []byte, _ []string, stats *oms.TrafficStats) {

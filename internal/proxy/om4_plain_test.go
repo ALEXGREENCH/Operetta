@@ -1,22 +1,16 @@
 package proxy
 
 import (
-	"encoding/base64"
 	"testing"
 
 	"operetta/protocol/operamini4"
 )
 
 func TestEmbeddedOM4StartupCanNavigateWithoutExternalCapture(t *testing.T) {
-	data, err := base64.StdEncoding.DecodeString(embeddedOM4StartupFrames)
+	request, err := operamini4.DefaultStartupRequest()
 	if err != nil {
 		t.Fatal(err)
 	}
-	frames, err := decodeEmbeddedOM4Frames(data)
-	if err != nil {
-		t.Fatal(err)
-	}
-	request := &operamini4.SessionRequest{Frames: frames}
 	const target = "https://example.com/om4"
 	if !replacePlainOM4Target(request, target) {
 		t.Fatal("embedded template has no replaceable navigation URL")

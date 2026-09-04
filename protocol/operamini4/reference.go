@@ -68,6 +68,11 @@ func (client *ReferenceClient) Exchange(ctx context.Context, source *SessionRequ
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/xml")
+	// Every Exchange creates fresh transport keys and therefore must also use a
+	// fresh HTTP carrier. Keeping the application POST alive makes a real OM4
+	// gateway hold it as a server-to-client tunnel, so reusing that connection
+	// deadlocks the next bootstrap request in batch comparison runs.
+	req.Close = true
 	resp, err := client.client.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("reference request: %w", err)

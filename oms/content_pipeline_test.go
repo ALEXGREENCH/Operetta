@@ -94,7 +94,7 @@ func TestRenderDocumentOM3StyleWidthAndPrimaryColors(t *testing.T) {
 }
 
 func TestTransformAndEncodeRemainSeparate(t *testing.T) {
-	body := []byte(`<html><body><a href="/next">Next</a></body></html>`)
+	body := []byte(`<html><head><title>Pipeline fixture</title></head><body><a href="/next">Next</a></body></html>`)
 	source := &UpstreamDocument{
 		URL:           "http://fixture.test/start",
 		Body:          body,
@@ -108,6 +108,9 @@ func TestTransformAndEncodeRemainSeparate(t *testing.T) {
 	}
 	if len(model.Operations) == 0 {
 		t.Fatal("transform returned no presentation operations")
+	}
+	if model.Title != "Pipeline fixture" {
+		t.Fatalf("presentation title = %q", model.Title)
 	}
 
 	for _, version := range []ClientVersion{ClientVersion1, ClientVersion2, ClientVersion3} {

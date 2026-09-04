@@ -86,8 +86,11 @@ sessions, fetches the same URLs through Operetta's protocol-neutral renderer and
 writes semantic, native-page and scene JSON reports. Reference and local
 exchanges for one case start together (with independent timeouts) to reduce
 dynamic-site drift; cases stay sequential so each session's navigation-token
-chain remains valid. Its default manifest contains world82, sefan, OpenNet and
-twenty high-traffic global/Russian sites:
+chain remains valid. A safe decrypted OM4 4.2 startup request is built in, so a
+clean checkout does not need private historical captures. Explicit
+`-bootstrap-request`, `-startup-request` and `-navigation-request` files remain
+available for protocol research. Its default manifest contains world82, sefan,
+OpenNet and twenty high-traffic global/Russian sites:
 
 ```powershell
 go run ./cmd/om4compare `
@@ -100,9 +103,12 @@ The collector uses an Opera Mini 4/Presto User-Agent for the origin side because
 several sites return materially different fallback HTML to legacy clients. It
 stores separate `.reference.frames.bin` / `.operetta.frames.bin` pages and
 matching `.reference.scene.json` / `.operetta.scene.json` files, then reports
-text, link, style, byte-size, document-height and per-side duration. Scene links
-drop wire-only `0/`/`1/` prefixes and leading NUL; relative targets are resolved
-through the document base URL while query parameters remain intact.
+missing/extra text and tokens, links, images, colors, geometry, byte-size,
+document-height deltas and per-side duration. If the official endpoint is
+temporarily unavailable, native collection continues; pass `-require-reference`
+to retain fail-fast behavior. Scene links drop wire-only `0/`/`1/` prefixes and
+leading NUL; relative targets are resolved through the document base URL while
+query parameters remain intact.
 
 `cmd/om4probe` can replay a complete captured OM4 wire request against a
 reference endpoint for isolated protocol analysis. Corpus frame files are the
@@ -134,7 +140,7 @@ JavaScript baking and site templates
 ------------------------------------
 
 Files in `config/sites` provide a small declarative replacer/template layer for
-modern pages before they are converted to OMS. A template can click controls,
+modern pages before they are converted to legacy OMS or native OM4. A template can click controls,
 keep the useful page subtree, remove or unwrap elements, inject compatibility
 CSS and run custom JavaScript. Page capture waits for both network and DOM
 quiet, with a bounded 1.5–2.5 second default grace period so long polls do not

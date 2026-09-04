@@ -60,6 +60,19 @@ func TestBuildSceneResolvesRelativeLinkAgainstDocumentURLFallback(t *testing.T) 
 	}
 }
 
+func TestBuildSceneUsesLargestPageBackground(t *testing.T) {
+	document := &ApplicationDocument{
+		Header: PageHeader{ViewportWidth: 231, DocumentHeight: 400},
+		Drawings: []DrawingElement{
+			{Kind: 'B', X: 0, Y: 0, Width: 231, Height: 400, Color: 0xffeeeeee},
+			{Kind: 'B', X: 0, Y: 0, Width: 231, Height: 6, Color: 0xff0000ad},
+		},
+	}
+	if got := BuildScene(document).Document.Background; got != "#eeeeee" {
+		t.Fatalf("document background = %s", got)
+	}
+}
+
 func TestMarshalSceneProducesJSONWithTrailingNewline(t *testing.T) {
 	data, err := MarshalScene(&ApplicationDocument{Header: PageHeader{ViewportWidth: 240}})
 	if err != nil {

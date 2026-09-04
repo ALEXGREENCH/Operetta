@@ -5064,6 +5064,7 @@ func TransformDocument(doc *UpstreamDocument, hdr http.Header, opts *RenderOptio
 		}
 	}
 	model := target.Document()
+	model.Title = extractTitle(parsed)
 	model.SetCookies = append([]string(nil), doc.SetCookies...)
 	model.Metrics.OriginTransferBytes = doc.TransferBytes
 	model.Metrics.OriginDecodedBytes = decodedLen

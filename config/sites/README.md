@@ -6,8 +6,9 @@ directory. For `m.example.com`, it tries `m.example.com.json`, then
 directory.
 
 The `rewrite` block is the declarative successor to Opera Mini's per-site
-replacer templates. It runs in Chromium after the page is loaded and before
-the bounded settle period:
+replacer templates. The same acquisition stage feeds legacy OMS and native
+OM4. It runs in Chromium after the page is loaded and before the bounded settle
+period:
 
 - `clickSelectors` clicks matching controls, useful for consent or “load more”;
 - `mainSelector` keeps one main subtree and discards the rest of the body;

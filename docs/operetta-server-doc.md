@@ -10,7 +10,7 @@ Operetta is a Go-based reimplementation of the Opera Mini 1.xвЂ“3.x gateway,
 - `internal/proxy/` вЂ“ Modular HTTP server: configuration (`config.go`), handlers (`handlers.go`), logging, render-preference store, per-client cookie jars, pagination cache, and site-config loader.
 - `internal/proxy/url.go` вЂ“ URL helpers (Opera-style /obml rewriting, action/build logic) with tests.
 - `oms/` вЂ“ Rendering engine split into focused files (`page.go`, `normalize.go`, `cache_disk.go`, etc.) covering HTML fetch, CSS heuristics, DOM walking, image pipeline and OMS finalisation.
-- `config/sites/` вЂ“ Host-specific overrides (`mode`, `headers`) loaded per target; override the directory via `OMS_SITES_DIR`.
+- `config/sites/` – Host-specific headers, JavaScript baking and declarative DOM rewrites shared by legacy OMS and native OM4; override the directory via `OMS_SITES_DIR`.
 - `docs/` вЂ“ Background notes (`OBML.md`, `oms_protocol.md`) plus this guide.
 - `dist/`, `build.ps1`, `build.sh`, `Makefile` вЂ“ Build artefacts and helper scripts.
 

@@ -106,7 +106,10 @@ func (s *siteConfigStore) Find(target string) *SiteConfig {
 	if err != nil || u.Host == "" {
 		return nil
 	}
-	host := u.Host
+	host := strings.ToLower(strings.TrimSpace(u.Hostname()))
+	if host == "" {
+		return nil
+	}
 	s.mu.RLock()
 	if cfg, ok := s.cache[host]; ok {
 		s.mu.RUnlock()
